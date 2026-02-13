@@ -9,60 +9,47 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
-	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/vishvananda/netlink"
 )
 
-// Use hex for egress handle
-const HANDLE_MINIGRESS = 0xFFF3
+// Configure your interface here!
+const IfaceName = "eth0" // e.g. wwan0
 
-// --- Updated Structs ---
-
-// Matches C struct glitch_event
 type GlitchEvent struct {
-	SrcIP   uint32
-	DstIP   uint32
-	DeltaNS uint64
-	Len     uint32
-	Proto   uint8
-}
-
-// Matches C struct global_metrics
-type GlobalMetrics struct {
-	TotalBytes uint64
-	TotalPkts  uint64
+	SrcIP uint32
+	DstIP uint32
+	Value uint64 // Duration (ns) OR Seq Diff
+	Type  uint32 // 1=Stall, 2=Retrans
+	Proto uint8
 }
 
 func main() {
+	// 1. Load BPF
 	spec, err := ebpf.LoadCollectionSpec("tc_glitch.o")
 	if err != nil {
-		log.Fatalf("Failed to load BPF spec: %v", err)
+		log.Fatalf("Failed to load BPF: %v", err)
 	}
-
-	// Define objects map: Program + 2 Maps
+	
 	objs := struct {
 		EgressMonitor *ebpf.Program `ebpf:"egress_monitor"`
 		Events        *ebpf.Map     `ebpf:"events"`
-		GlobalStats   *ebpf.Map     `ebpf:"global_stats"`
 	}{}
-
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		log.Fatalf("Failed to load objects: %v", err)
+		log.Fatalf("LoadAndAssign: %v", err)
 	}
 	defer objs.EgressMonitor.Close()
 	defer objs.Events.Close()
-	defer objs.GlobalStats.Close()
 
-	// --- Attach Logic (Same as before) ---
-	IfaceName := "eth1" // CHANGE THIS to wwan0 or eth0
+	// 2. Attach to Interface
 	link, err := netlink.LinkByName(IfaceName)
 	if err != nil {
 		log.Fatalf("Interface %s not found", IfaceName)
 	}
 
+	// Create qdisc (clsact)
 	qdisc := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{
 			LinkIndex: link.Attrs().Index,
@@ -71,13 +58,15 @@ func main() {
 		},
 		QdiscType: "clsact",
 	}
-	// Try adding qdisc, ignore if exists
-	netlink.QdiscAdd(qdisc)
+	if err := netlink.QdiscAdd(qdisc); err != nil && !os.IsExist(err) {
+		log.Printf("Warning creating qdisc: %v", err)
+	}
 
+	// Attach Filter
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: link.Attrs().Index,
-			Parent:    netlink.MakeHandle(0xffff, HANDLE_MINIGRESS),
+			Parent:    netlink.MakeHandle(0xffff, 0xfff3), // Egress Hook
 			Handle:    1,
 			Protocol:  syscall.ETH_P_ALL,
 			Priority:  1,
@@ -86,28 +75,27 @@ func main() {
 		Name:         "egress_monitor",
 		DirectAction: true,
 	}
-	netlink.FilterDel(filter) // Cleanup old
+	netlink.FilterDel(filter) // Clean old
 	if err := netlink.FilterAdd(filter); err != nil {
 		log.Fatalf("Failed to attach filter: %v", err)
 	}
-	fmt.Printf("Monitoring started on %s!\n", IfaceName)
+	
+	fmt.Printf("✅ Agent Running on %s\n", IfaceName)
+	fmt.Println("   - Watching for Time Gaps > 100ms")
+	fmt.Println("   - Watching for TCP Retransmissions")
+	fmt.Println("------------------------------------------------")
 
-	// --- Start Background Routines ---
-
-	// 1. Stats Monitor (Ticker)
-	go monitorThroughput(objs.GlobalStats)
-
-	// 2. Event Reader (Main Loop)
+	// 3. Read Events
 	rd, _ := ringbuf.NewReader(objs.Events)
 	defer rd.Close()
 
-	// Cleanup on Ctrl+C
+	// Handle Ctrl+C
 	go func() {
 		stop := make(chan os.Signal, 1)
 		signal.Notify(stop, os.Interrupt)
 		<-stop
-		fmt.Println("\nCleaning up...")
 		netlink.FilterDel(filter)
+		fmt.Println("\nDetached and exiting.")
 		os.Exit(0)
 	}()
 
@@ -119,44 +107,23 @@ func main() {
 		if err := binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event); err != nil {
 			continue
 		}
+		
+		dest := int2ip(event.DstIP)
 
-		// Pretty print glitch
-		protoStr := "TCP"
-		if event.Proto == 17 { protoStr = "UDP" }
-		latencyMs := float64(event.DeltaNS) / 1_000_000.0
+		if event.Type == 2 {
+			// RETRANSMISSION (Serious)
+			fmt.Printf("🔴 [LOSS]  TCP Retransmission! | Dest: %-15s\n", dest)
+		} else {
+			// STALL (Might be idle)
+			ms := float64(event.Value) / 1_000_000.0
+			proto := "TCP"
+			if event.Proto == 17 { proto = "UDP" }
+			
+			// Highlight major stalls
+			icon := "⚠️ "
+			if ms > 1000 { icon = "💤" } // Likely idle if > 1s
 
-		fmt.Printf("⚠️  [GLITCH] %s Packet | %d bytes | Gap: %.2f ms | IP: %s\n", 
-			protoStr, event.Len, latencyMs, int2ip(event.DstIP))
-	}
-}
-
-// Polling loop for Live Bandwidth
-func monitorThroughput(statsMap *ebpf.Map) {
-	ticker := time.NewTicker(1 * time.Second)
-	var prevBytes, prevPkts uint64
-	var metrics GlobalMetrics
-	key := uint32(0) // Map index 0
-
-	for range ticker.C {
-		if err := statsMap.Lookup(&key, &metrics); err != nil {
-			fmt.Printf("Error reading stats: %v\n", err)
-			continue
-		}
-
-		// Calculate Deltas
-		bytesDiff := metrics.TotalBytes - prevBytes
-		pktsDiff := metrics.TotalPkts - prevPkts
-
-		// Convert to Mbps
-		mbps := (float64(bytesDiff) * 8) / 1_000_000.0
-
-		// Update previous state
-		prevBytes = metrics.TotalBytes
-		prevPkts = metrics.TotalPkts
-
-		// Print Status Line (Overwrite line with \r for clean UI)
-		if mbps > 0.01 {
-			fmt.Printf("📊 [LIVE] Upload: %.2f Mbps | %d PPS\r", mbps, pktsDiff)
+			fmt.Printf("%s [STALL] %s Gap: %6.1f ms | Dest: %-15s\n", icon, proto, ms, dest)
 		}
 	}
 }
