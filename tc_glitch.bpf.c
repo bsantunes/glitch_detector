@@ -3,6 +3,7 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
+#include <linux/in.h>
 #include <linux/pkt_cls.h>
 #include <linux/types.h>
 #include <bpf/bpf_helpers.h>
