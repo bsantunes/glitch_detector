@@ -13,6 +13,7 @@
 #define EVENT_TYPE_STALL 1
 #define EVENT_TYPE_RETRANS 2
 
+// Key: The 5-Tuple (SrcIP, DstIP, Ports, Proto)
 struct flow_key {
     __u32 src_ip;
     __u32 dst_ip;
