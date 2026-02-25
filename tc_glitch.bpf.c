@@ -38,6 +38,7 @@ struct glitch_event {
     __u8  proto;
 };
 
+// The "Memory" (BPF Maps)
 struct {
     __uint(type, BPF_MAP_TYPE_LRU_HASH);
     __uint(max_entries, 10000);
@@ -50,16 +51,22 @@ struct {
     __uint(max_entries, 1 << 14); 
 } events SEC(".maps");
 
+// Tells the kernel to attach this to the Traffic Control (TC) layer
 SEC("tc")
+// skb: The "Socket Buffer." Linux Kernel's handle for a single network packet
 int egress_monitor(struct __sk_buff *skb) {
+    // data points to the start of the packet. data_end points to the end
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
     struct ethhdr *eth = data;
 
+    // Safety Check 1: Is the Ethernet header fully inside the buffer?
     if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
+    // Logic Check: Is this an IP packet? (Ignore ARP, IPv6, etc for now)
     if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
 
     struct iphdr *ip = (void *)(eth + 1);
+    // Safety Check 2: Is the IP header valid?
     if ((void *)(ip + 1) > data_end) return TC_ACT_OK;
 
     // Define Flow Key
@@ -75,20 +82,22 @@ int egress_monitor(struct __sk_buff *skb) {
         if ((void *)(tcp + 1) > data_end) tcp = NULL;
     }
 
+    // Get current time in nanoseconds
     __u64 ts = bpf_ktime_get_ns();
+    // Look up this flow in our "Memory" Map
     struct flow_state *state = bpf_map_lookup_elem(&flow_tracker, &key);
 
     if (state) {
         // 1. CHECK FOR STALL (Time Gap)
-        __u64 delta = ts - state->last_ts;
-        if (delta > GLITCH_THRESH_NS) {
+        __u64 delta = ts - state->last_ts;    // Current Time - Last Time
+        if (delta > GLITCH_THRESH_NS) {        // If gap > 100ms
             // Only report stall if NOT a retransmission (avoid double counting)
             struct glitch_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
             if (e) {
                 e->src_ip = key.src_ip;
                 e->dst_ip = key.dst_ip;
                 e->value = delta;
-                e->type = EVENT_TYPE_STALL;
+                e->type = EVENT_TYPE_STALL;    // Flag as STALL
                 e->proto = ip->protocol;
                 bpf_ringbuf_submit(e, 0);
             }
@@ -96,7 +105,7 @@ int egress_monitor(struct __sk_buff *skb) {
 
         // 2. CHECK FOR RETRANSMISSION (TCP Only)
         if (tcp) {
-            __u32 seq = bpf_ntohl(tcp->seq);
+            __u32 seq = bpf_ntohl(tcp->seq);    // Get Sequence Number
             
             // If current seq < max_seq, it's an old packet sent again
             if (seq < state->max_seq) {
@@ -105,6 +114,7 @@ int egress_monitor(struct __sk_buff *skb) {
                     e->src_ip = key.src_ip;
                     e->dst_ip = key.dst_ip;
                     e->value = state->max_seq - seq; // How far back did it jump?
+                    // ... It means we already saw this packet! It was RESENT.
                     e->type = EVENT_TYPE_RETRANS;
                     e->proto = ip->protocol;
                     bpf_ringbuf_submit(e, 0);
@@ -122,6 +132,7 @@ int egress_monitor(struct __sk_buff *skb) {
         bpf_map_update_elem(&flow_tracker, &key, &new_state, BPF_ANY);
     }
 
+    // TC_ACT_OK = "Let the packet pass normally"
     return TC_ACT_OK;
 }
 char __license[] SEC("license") = "GPL";
