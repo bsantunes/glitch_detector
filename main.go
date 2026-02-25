@@ -32,11 +32,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to load BPF: %v", err)
 	}
-	
+
+	// Create Go objects to hold the references
 	objs := struct {
 		EgressMonitor *ebpf.Program `ebpf:"egress_monitor"`
 		Events        *ebpf.Map     `ebpf:"events"`
 	}{}
+	// Actually load them into the Kernel
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		log.Fatalf("LoadAndAssign: %v", err)
 	}
@@ -71,7 +73,7 @@ func main() {
 			Protocol:  syscall.ETH_P_ALL,
 			Priority:  1,
 		},
-		Fd:           objs.EgressMonitor.FD(),
+		Fd:           objs.EgressMonitor.FD(),		// The File Descriptor of our C code
 		Name:         "egress_monitor",
 		DirectAction: true,
 	}
@@ -86,6 +88,7 @@ func main() {
 	fmt.Println("------------------------------------------------")
 
 	// 3. Read Events
+	// Open a reader on the "events" map
 	rd, _ := ringbuf.NewReader(objs.Events)
 	defer rd.Close()
 
@@ -101,6 +104,7 @@ func main() {
 
 	var event GlitchEvent
 	for {
+		// Block until data arrives
 		record, err := rd.Read()
 		if err != nil { continue }
 
@@ -111,15 +115,16 @@ func main() {
 		dest := int2ip(event.DstIP)
 
 		if event.Type == 2 {
-			// RETRANSMISSION (Serious)
+			// Type 2 = RETRANSMISSION (Serious)
 			fmt.Printf("🔴 [LOSS]  TCP Retransmission! | Dest: %-15s\n", dest)
 		} else {
-			// STALL (Might be idle)
+			// Type 1 = STALL (Might be idle)
 			ms := float64(event.Value) / 1_000_000.0
 			proto := "TCP"
 			if event.Proto == 17 { proto = "UDP" }
 			
 			// Highlight major stalls
+			// Visual logic: Is it a Micro-glitch or just Idle?
 			icon := "⚠️ "
 			if ms > 1000 { icon = "💤" } // Likely idle if > 1s
 
