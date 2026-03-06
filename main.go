@@ -96,6 +96,18 @@ func main() {
 	}
 }
 
+func handleRoaming(currentPLMN string) {
+    privatePLMN := "999-01" // Example Private 5G PLMN
+    
+    if currentPLMN == privatePLMN {
+        fmt.Println("🏰 [ROAMING] Connected to Private NPN. Activating Ultra-Low Latency Mode.")
+        // Here you might trigger higher-frequency telemetry
+    } else {
+        fmt.Println("🌐 [ROAMING] Connected to Public Carrier. Engaging Data Compression.")
+        // Here you might throttle non-essential traffic to save on roaming costs
+    }
+}
+
 func runActiveMonitoring(writeAPI api.WriteAPIBlocking) {
 	ticker := time.NewTicker(10 * time.Second)
 	profiles := []string{"be", "ef"}
