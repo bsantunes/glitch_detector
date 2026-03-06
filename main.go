@@ -125,7 +125,11 @@ func runActiveMonitoring(writeAPI api.WriteAPIBlocking) {
 
 			// C. PUSH CONSOLIDATED METRIC
 			p := influxdb2.NewPoint("network_health",
-				map[string]string{"profile": pStr},
+				map[string]string{
+					"profile": pStr,
+					"operator": metrics["modem.generic.operator-name"],
+					"cell_id":  metrics["modem.signal.5g.cell-id"],
+				},
 				map[string]interface{}{
 					"rtt": rtt, "jitter": jit, "loss": loss,
 					"rsrp": parseToFloat(metrics["modem.signal.5g.rsrp"]),
