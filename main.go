@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -32,6 +33,15 @@ type GlitchEvent struct {
 	Value uint64	// Duration (ns) OR Seq Diff
 	Type  uint32	// 1=Stall, 2=Retrans
 	Proto uint8
+}
+
+type UnifiedMetric struct {
+    Timestamp string  `json:"ts"`
+    Type      string  `json:"type"`      // "glitch", "twamp", or "radio"
+    RSRP      string  `json:"rsrp,omitempty"`
+    RTT       float64 `json:"rtt,omitempty"`
+    Loss      float64 `json:"loss,omitempty"`
+    Event     string  `json:"event,omitempty"` // "stall" or "loss"
 }
 
 func main() {
@@ -90,6 +100,15 @@ func main() {
 
 	<-stop
 	netlink.FilterDel(filter)
+}
+
+func logToDB(m UnifiedMetric) {
+    f, _ := os.OpenFile("gateway_metrics.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+    defer f.Close()
+
+    m.Timestamp = time.Now().Format(time.RFC3339)
+    jsonData, _ := json.Marshal(m)
+    f.WriteString(string(jsonData) + "\n")
 }
 
 func runActiveMonitoring() {
