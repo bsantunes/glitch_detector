@@ -3,8 +3,8 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 	"log"
 	"net"
@@ -15,46 +15,38 @@ import (
 	"strings"
 	"syscall"
 	"time"
-	"context"
-    influxdb2 "github.com/influxdata/influxdb-client-go/v2"
-    "github.com/influxdata/influxdb-client-go/v2/api"
+
+	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	"github.com/influxdata/influxdb-client-go/v2/api"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/vishvananda/netlink"
 )
 
 const (
-	IfaceName        = "eth0" // Change to wwan0 for 5G
+	IfaceName        = "wwan0" // 5G Interface
 	ReflectorAddress = "dawn6g.duckdns.org"
-	HANDLE_MINIGRESS = 0xFFF3
-)
-
-const (
-	influxURL   = "http://dawn6g.duckdns.org:8086"
-	influxToken = "YOUR_GENERATED_TOKEN" // Get this from InfluxDB UI
-	org         = "dawn6g"
-	bucket      = "gateway_telemetry"
+	InfluxURL        = "http://dawn6g.duckdns.org:8086"
+	InfluxToken      = "YOUR_TOKEN_HERE"
+	Org              = "dawn6g"
+	Bucket           = "gateway_telemetry"
 )
 
 type GlitchEvent struct {
 	SrcIP uint32
 	DstIP uint32
-	Value uint64	// Duration (ns) OR Seq Diff
-	Type  uint32	// 1=Stall, 2=Retrans
+	Value uint64
+	Type  uint32
 	Proto uint8
 }
 
-type UnifiedMetric struct {
-    Timestamp string  `json:"ts"`
-    Type      string  `json:"type"`      // "glitch", "twamp", or "radio"
-    RSRP      string  `json:"rsrp,omitempty"`
-    RTT       float64 `json:"rtt,omitempty"`
-    Loss      float64 `json:"loss,omitempty"`
-    Event     string  `json:"event,omitempty"` // "stall" or "loss"
-}
-
 func main() {
-	// 1. Load eBPF (Passive)
+	// --- 1. SETUP INFLUXDB ---
+	client := influxdb2.NewClient(InfluxURL, InfluxToken)
+	writeAPI := client.WriteAPIBlocking(Org, Bucket)
+	defer client.Close()
+
+	// --- 2. SETUP eBPF ---
 	spec, err := ebpf.LoadCollectionSpec("tc_glitch.o")
 	if err != nil {
 		log.Fatalf("Failed to load BPF: %v", err)
@@ -63,11 +55,9 @@ func main() {
 		EgressMonitor *ebpf.Program `ebpf:"egress_monitor"`
 		Events        *ebpf.Map     `ebpf:"events"`
 	}{}
-	if err := spec.LoadAndAssign(&objs, nil); err != nil {
-		log.Fatalf("LoadAndAssign: %v", err)
-	}
+	spec.LoadAndAssign(&objs, nil)
 
-	// 2. Attach to Interface
+	// --- 3. ATTACH TO INTERFACE ---
 	link, _ := netlink.LinkByName(IfaceName)
 	qdisc := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{LinkIndex: link.Attrs().Index, Handle: netlink.MakeHandle(0xffff, 0), Parent: netlink.HANDLE_CLSACT},
@@ -75,152 +65,92 @@ func main() {
 	}
 	netlink.QdiscAdd(qdisc)
 	filter := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Attrs().Index, Parent: netlink.MakeHandle(0xffff, HANDLE_MINIGRESS), Handle: 1, Protocol: syscall.ETH_P_ALL, Priority: 1},
+		FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Attrs().Index, Parent: netlink.MakeHandle(0xffff, 0xfff3), Handle: 1, Protocol: syscall.ETH_P_ALL, Priority: 1},
 		Fd:          objs.EgressMonitor.FD(),
-		Name:        "egress_monitor",
 		DirectAction: true,
 	}
 	netlink.FilterAdd(filter)
 
-	fmt.Printf("🚀 DAWN6G Gateway Active on %s\n", IfaceName)
+	fmt.Println("🛰️  DAWN6G Unified Agent Running...")
 
-	// 3. Start Multi-Sensor Loops
-	go runActiveMonitoring() // TWAMP & Radio metrics
+	// --- 4. START MULTI-SENSOR LOOPS ---
+	go runActiveMonitoring(writeAPI)
 	
-	// 4. Passive Event Loop (eBPF)
+	// eBPF Event Reader
 	rd, _ := ringbuf.NewReader(objs.Events)
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt)
-
-	go func() {
+	for {
+		record, err := rd.Read()
+		if err != nil { continue }
 		var event GlitchEvent
-		for {
-			record, err := rd.Read()
-			if err != nil { continue }
-			binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event)
-			
-			if event.Type == 2 {
-				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | Dest: %s\n", int2ip(event.DstIP))
-			} else {
-				fmt.Printf("⚠️  [KERNEL] Stall: %.1fms | Dest: %s\n", float64(event.Value)/1e6, int2ip(event.DstIP))
-			}
-		}
-	}()
-
-	<-stop
-	netlink.FilterDel(filter)
-}
-
-func pushToInflux(client influxdb2.Client, writeAPI api.WriteAPIBlocking, metric UnifiedMetric) {
-    // Create a point: Measurement Name, Tags (Metadata), Fields (Values)
-    p := influxdb2.NewPoint(
-        "gateway_metrics",
-        map[string]string{"type": metric.Type, "interface": IfaceName}, // Tags for indexing
-        map[string]interface{}{
-            "rtt":   metric.RTT,
-            "loss":  metric.Loss,
-            "rsrp":  parseSignalToFloat(metric.RSRP),
-            "event": metric.Event,
-        },
-        time.Now(),
-    )
-    
-    // Non-blocking write to keep networking performance high
-    writeAPI.WritePoint(context.Background(), p)
-}
-
-// Setup Influx Client
-func setupInflux() (influxdb2.Client, api.WriteAPI) {
-	client := influxdb2.NewClient(influxURL, influxToken)
-	// Non-blocking write API
-	writeAPI := client.WriteAPI(org, bucket)
-	return client, writeAPI
-}
-
-// Integrated Logging Function
-func logMetric(writeAPI api.WriteAPI, m UnifiedMetric) {
-	p := influxdb2.NewPointWithMeasurement("network_health").
-		AddTag("gateway_id", "cm5_alpha").
-		AddTag("metric_type", m.Type).
-		AddField("rtt", m.RTT).
-		AddField("loss", m.Loss).
-		AddField("jitter", m.Jitter).
-		AddField("rsrp", parseSignal(m.RSRP)).
-		SetTime(time.Now())
-
-	writeAPI.WritePoint(p)
-}
-
-func logToDB(m UnifiedMetric) {
-    f, _ := os.OpenFile("gateway_metrics.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-    defer f.Close()
-
-    m.Timestamp = time.Now().Format(time.RFC3339)
-    jsonData, _ := json.Marshal(m)
-    f.WriteString(string(jsonData) + "\n")
-}
-
-func runActiveMonitoring() {
-	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		// Sensor 1: Radio Metrics (via ModemManager)
-		rsrp, rsrq := getRadioMetrics()
+		binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event)
 		
-		// Sensor 2: TWAMP Metrics
-		avgRTT, jitter, loss := getTwampMetrics()
+		eventType := "stall"
+		if event.Type == 2 { eventType = "retrans" }
 
-		fmt.Printf("📊 [STATUS] Radio: %s RSRP / %s RSRQ | TWAMP: %.1fms RTT / %.1f%% Loss\n", 
-			rsrp, rsrq, avgRTT, loss)
+		// Log Glitch to Influx
+		p := influxdb2.NewPoint("glitch_events",
+			map[string]string{"type": eventType, "proto": fmt.Sprint(event.Proto)},
+			map[string]interface{}{"value": float64(event.Value)},
+			time.Now())
+		writeAPI.WritePoint(context.Background(), p)
 	}
 }
 
-func getRadioMetrics() (string, string) {
-	// Assumes ModemManager is running. Queries the first modem (0).
-	out, err := exec.Command("mmcli", "-m", "0", "--signal-get", "--output-keyvalue").Output()
-	if err != nil {
-		return "N/A", "N/A"
+func runActiveMonitoring(writeAPI api.WriteAPIBlocking) {
+	ticker := time.NewTicker(10 * time.Second)
+	profiles := []string{"be", "ef"}
+
+	for range ticker.C {
+		// A. Radio Metrics
+		out, _ := exec.Command("mmcli", "-m", "0", "--signal-get", "--output-keyvalue").Output()
+		metrics := parseKV(string(out))
+		
+		// B. TWAMP per Profile (Mapping to 5QI)
+		for _, pStr := range profiles {
+			cmd := exec.Command("twampy", "controller", ReflectorAddress, "--count", "5", "--dscp", pStr)
+			twOut, _ := cmd.Output()
+			rtt, jit, loss := parseTwamp(twOut)
+
+			// C. PUSH CONSOLIDATED METRIC
+			p := influxdb2.NewPoint("network_health",
+				map[string]string{"profile": pStr},
+				map[string]interface{}{
+					"rtt": rtt, "jitter": jit, "loss": loss,
+					"rsrp": parseToFloat(metrics["modem.signal.5g.rsrp"]),
+					"rsrq": parseToFloat(metrics["modem.signal.5g.rsrq"]),
+				}, time.Now())
+			writeAPI.WritePoint(context.Background(), p)
+		}
 	}
-	// Parse simple key-value output for RSRP and RSRQ
-	m := parseKeyValue(string(out))
-	return m["modem.signal.5g.rsrp"], m["modem.signal.5g.rsrq"]
 }
 
-func getTwampMetrics() (float64, float64, float64) {
-	cmd := exec.Command("twampy", "controller", ReflectorAddress, "--count", "5", "--interval", "100")
-	out, err := cmd.Output()
-	if err != nil { return 0, 0, 100 }
-
+// Helpers for parsing (Simplified for brevity)
+func parseTwamp(out []byte) (float64, float64, float64) {
 	scanner := bufio.NewScanner(bytes.NewReader(out))
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "Roundtrip:") {
-			f := strings.Fields(line)
+		if strings.HasPrefix(scanner.Text(), "Roundtrip:") {
+			f := strings.Fields(scanner.Text())
 			if len(f) >= 6 {
-				rtt, _ := time.ParseDuration(f[3])
-				jit, _ := time.ParseDuration(f[4])
-				lStr := strings.TrimSuffix(f[5], "%")
-				l, _ := strconv.ParseFloat(lStr, 64)
-				return float64(rtt.Milliseconds()), float64(jit.Microseconds()) / 1000.0, l
+				r, _ := time.ParseDuration(f[3])
+				j, _ := time.ParseDuration(f[4])
+				l, _ := strconv.ParseFloat(strings.TrimSuffix(f[5], "%"), 64)
+				return float64(r.Milliseconds()), float64(j.Microseconds()) / 1000.0, l
 			}
 		}
 	}
 	return 0, 0, 0
 }
 
-func parseKeyValue(input string) map[string]string {
+func parseKV(in string) map[string]string {
 	res := make(map[string]string)
-	lines := strings.Split(input, "\n")
-	for _, l := range lines {
+	for _, l := range strings.Split(in, "\n") {
 		parts := strings.Split(l, " : ")
-		if len(parts) == 2 {
-			res[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
+		if len(parts) == 2 { res[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1]) }
 	}
 	return res
 }
 
-func int2ip(nn uint32) net.IP {
-	ip := make(net.IP, 4)
-	binary.LittleEndian.PutUint32(ip, nn)
-	return ip
+func parseToFloat(s string) float64 {
+	f, _ := strconv.ParseFloat(strings.Trim(s, " dBm%"), 64)
+	return f
 }
