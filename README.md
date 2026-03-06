@@ -112,6 +112,7 @@ Initialize the Go module (if not done) and build the binary.
 go mod init dawn-agent
 go get github.com/cilium/ebpf
 go get github.com/vishvananda/netlink
+go get github.com/influxdata/influxdb-client-go/v2
 
 # Build binary
 go build -o dawn-agent
