@@ -1,0 +1,19 @@
+[Unit]
+Description=DAWN6G eBPF Gateway Agent
+After=network-online.target ModemManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/dawn
+# Run the init script before starting the agent
+ExecStartPre=/bin/bash /home/pi/dawn/init_gateway.sh
+# Start the Go Agent
+ExecStart=/home/pi/dawn/dawn-agent
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/dawn-agent.log
+StandardError=append:/var/log/dawn-agent.log
+
+[Install]
+WantedBy=multi-user.target
