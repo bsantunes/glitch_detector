@@ -96,6 +96,23 @@ func main() {
 	}
 }
 
+func monitorRoaming(writeAPI api.WriteAPIBlocking) {
+    ticker := time.NewTicker(30 * time.Second)
+    for range ticker.C {
+        out, _ := exec.Command("mmcli", "-m", "0", "--output-keyvalue").Output()
+        metrics := parseKV(string(out))
+        operator := metrics["modem.generic.operator-name"]
+
+        if strings.Contains(operator, "PRIVATE-5G") {
+            fmt.Println("🏰 Connected to Private NPN - QoS Guaranteed")
+            setPassengerBandwidth(100) // Full speed
+        } else {
+            fmt.Println("🌐 Roaming on Public Network - Enabling Protective Throttling")
+            setPassengerBandwidth(5)   // Protect 5G link by capping BE traffic
+        }
+    }
+}
+
 func handleRoaming(currentPLMN string) {
     privatePLMN := "999-01" // Example Private 5G PLMN
     
