@@ -141,6 +141,18 @@ func parseTwamp(out []byte) (float64, float64, float64) {
 	return 0, 0, 0
 }
 
+func getDetailedModemStats() (string, string) {
+    // Querying SIMCom specific QoS status
+    // AT+CGACT? shows which contexts are active
+    // AT+CGCONTRDP=2 shows the assigned QoS for context 2
+    out, _ := exec.Command("mmcli", "-m", "0", "--command=AT+CGCONTRDP=2").Output()
+    
+    // We look for the 5QI value in the response
+    // Response format: +CGCONTRDP: 2,5,"apn",...
+    // The second number (5) is often the assigned QCI/5QI
+    return parse5QI(string(out))
+}
+
 func parseKV(in string) map[string]string {
 	res := make(map[string]string)
 	for _, l := range strings.Split(in, "\n") {
