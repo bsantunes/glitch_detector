@@ -96,6 +96,55 @@ func main() {
 	}
 }
 
+func getRadioMetrics() (string, string) {
+	out, err := exec.Command("mmcli", "-m", "0", "--signal-get", "--output-keyvalue").Output()
+	if err != nil {
+		return "ERR", "ERR"
+	}
+	
+	m := parseKeyValue(string(out))
+	
+	// Try 5G first
+	rsrp := m["modem.signal.5g.rsrp"]
+	rsrq := m["modem.signal.5g.rsrq"]
+
+	// Fallback to LTE if 5G returns the "Unknown" code or is missing
+	if rsrp == "" || rsrp == "-32768" || rsrp == "-32768.00" {
+		rsrp = m["modem.signal.lte.rsrp"] + " (LTE)"
+		rsrq = m["modem.signal.lte.rsrq"] + " (LTE)"
+	}
+	
+	return rsrp, rsrq
+}
+
+func getTwampMetrics() (float64, float64, float64) {
+	// Use CombinedOutput to capture both standard output and error messages (stderr)
+	cmd := exec.Command("twampy", "controller", ReflectorAddress, "--count", "5", "--interval", "100")
+	out, err := cmd.CombinedOutput() 
+	
+	if err != nil { 
+		// Print EXACTLY why it failed directly to your terminal
+		fmt.Printf("🔴 [DEBUG] TWAMP Failed: %v | Output: %s\n", err, string(bytes.TrimSpace(out)))
+		return 0, 0, 100 
+	}
+
+	scanner := bufio.NewScanner(bytes.NewReader(out))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "Roundtrip:") {
+			f := strings.Fields(line)
+			if len(f) >= 6 {
+				rtt, _ := time.ParseDuration(f[3])
+				jit, _ := time.ParseDuration(f[4])
+				lStr := strings.TrimSuffix(f[5], "%")
+				l, _ := strconv.ParseFloat(lStr, 64)
+				return float64(rtt.Milliseconds()), float64(jit.Microseconds()) / 1000.0, l
+			}
+		}
+	}
+	return 0, 0, 100
+}
+
 func monitorRoaming(writeAPI api.WriteAPIBlocking) {
     ticker := time.NewTicker(30 * time.Second)
     for range ticker.C {
