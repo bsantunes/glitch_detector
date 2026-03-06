@@ -29,8 +29,8 @@ const (
 type GlitchEvent struct {
 	SrcIP uint32
 	DstIP uint32
-	Value uint64
-	Type  uint32
+	Value uint64	// Duration (ns) OR Seq Diff
+	Type  uint32	// 1=Stall, 2=Retrans
 	Proto uint8
 }
 
