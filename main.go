@@ -15,7 +15,9 @@ import (
 	"strings"
 	"syscall"
 	"time"
-
+	"context"
+    influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+    "github.com/influxdata/influxdb-client-go/v2/api"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/vishvananda/netlink"
@@ -100,6 +102,24 @@ func main() {
 
 	<-stop
 	netlink.FilterDel(filter)
+}
+
+func pushToInflux(client influxdb2.Client, writeAPI api.WriteAPIBlocking, metric UnifiedMetric) {
+    // Create a point: Measurement Name, Tags (Metadata), Fields (Values)
+    p := influxdb2.NewPoint(
+        "gateway_metrics",
+        map[string]string{"type": metric.Type, "interface": IfaceName}, // Tags for indexing
+        map[string]interface{}{
+            "rtt":   metric.RTT,
+            "loss":  metric.Loss,
+            "rsrp":  parseSignalToFloat(metric.RSRP),
+            "event": metric.Event,
+        },
+        time.Now(),
+    )
+    
+    // Non-blocking write to keep networking performance high
+    writeAPI.WritePoint(context.Background(), p)
 }
 
 func logToDB(m UnifiedMetric) {
