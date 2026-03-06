@@ -29,6 +29,13 @@ const (
 	HANDLE_MINIGRESS = 0xFFF3
 )
 
+const (
+	influxURL   = "http://dawn6g.duckdns.org:8086"
+	influxToken = "YOUR_GENERATED_TOKEN" // Get this from InfluxDB UI
+	org         = "dawn6g"
+	bucket      = "gateway_telemetry"
+)
+
 type GlitchEvent struct {
 	SrcIP uint32
 	DstIP uint32
@@ -120,6 +127,28 @@ func pushToInflux(client influxdb2.Client, writeAPI api.WriteAPIBlocking, metric
     
     // Non-blocking write to keep networking performance high
     writeAPI.WritePoint(context.Background(), p)
+}
+
+// Setup Influx Client
+func setupInflux() (influxdb2.Client, api.WriteAPI) {
+	client := influxdb2.NewClient(influxURL, influxToken)
+	// Non-blocking write API
+	writeAPI := client.WriteAPI(org, bucket)
+	return client, writeAPI
+}
+
+// Integrated Logging Function
+func logMetric(writeAPI api.WriteAPI, m UnifiedMetric) {
+	p := influxdb2.NewPointWithMeasurement("network_health").
+		AddTag("gateway_id", "cm5_alpha").
+		AddTag("metric_type", m.Type).
+		AddField("rtt", m.RTT).
+		AddField("loss", m.Loss).
+		AddField("jitter", m.Jitter).
+		AddField("rsrp", parseSignal(m.RSRP)).
+		SetTime(time.Now())
+
+	writeAPI.WritePoint(p)
 }
 
 func logToDB(m UnifiedMetric) {
