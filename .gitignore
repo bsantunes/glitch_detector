@@ -1,0 +1,11 @@
+# build artifacts
+
+tc_glitch.o
+$dawn-agent
+# Go build cache and modules
+*.mod
+*.sum
+
+# Editor/temp files
+*~
+*.swp
