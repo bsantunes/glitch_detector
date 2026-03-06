@@ -1,5 +1,25 @@
 # 5G-Glitch-Monitor (eBPF + Go)
 
+## DAWN6G Smart Gateway 🛰️
+
+A high-performance, eBPF-powered 5G gateway agent designed for **SIMCom SIM8202G-M2** modules. It provides active/passive network monitoring, 5QI QoS enforcement, and cloud-based telemetry.
+
+## 🌟 Features
+- **Passive Monitoring:** eBPF-based detection of TCP retransmissions and micro-stalls (>100ms).
+- **Active Auditing:** Multi-profile TWAMP (RFC 5357) to measure 5QI slice performance.
+- **Hardware Integration:** Real-time RSRP/RSRQ extraction via ModemManager.
+- **QoS Enforcement:** Dynamic traffic shaping (HTB) to protect critical flows (DSCP EF) during congestion.
+- **Telemetry:** Asynchronous data push to InfluxDB 2.x with Grafana visualization.
+- **Roaming Aware:** Intelligent behavior switching between Private NPN and Public carriers.
+
+## 🛠️ Installation
+
+### 1. Prerequisites (Raspberry Pi CM5)
+```bash
+sudo apt update
+sudo apt install clang llvm libbpf-dev golang modemmanager python3-pip -y
+pip3 install twampy --break-system-packages
+
 **A high-precision network diagnostic tool for 5G Gateways and Embedded Linux.**
 
 ## 📖 Overview
