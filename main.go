@@ -96,10 +96,11 @@ func main() {
 	}
 }
 
-func getRadioMetrics() (string, string) {
+// Now returns 3 strings: RSRP, RSRQ, RSSI
+func getRadioMetrics() (string, string, string) {
 	out, err := exec.Command("mmcli", "-m", "0", "--signal-get", "--output-keyvalue").Output()
 	if err != nil {
-		return "ERR", "ERR"
+		return "ERR", "ERR", "ERR"
 	}
 	
 	m := parseKeyValue(string(out))
@@ -107,14 +108,21 @@ func getRadioMetrics() (string, string) {
 	// Try 5G first
 	rsrp := m["modem.signal.5g.rsrp"]
 	rsrq := m["modem.signal.5g.rsrq"]
+	rssi := m["modem.signal.5g.rssi"] 
 
-	// Fallback to LTE if 5G returns the "Unknown" code or is missing
+	// Fallback to LTE
 	if rsrp == "" || rsrp == "-32768" || rsrp == "-32768.00" {
 		rsrp = m["modem.signal.lte.rsrp"] + " (LTE)"
 		rsrq = m["modem.signal.lte.rsrq"] + " (LTE)"
+		rssi = m["modem.signal.lte.rssi"] + " (LTE)"
 	}
 	
-	return rsrp, rsrq
+	// Clean up empty RSSI values (5G often doesn't report traditional RSSI)
+	if rssi == "" || strings.HasPrefix(rssi, "-32768") {
+		rssi = "N/A"
+	}
+	
+	return rsrp, rsrq, rssi
 }
 
 func getTwampMetrics() (float64, float64, float64) {
