@@ -69,7 +69,7 @@ type bpfObjects struct {
 func main() {
 	// command-line options
 	iface := flag.String("iface", "wwan0", "network interface to attach to")
-	rfl := flag.String("reflector", "dawn6g.duckdns.org", "TWAMP reflector address")
+	rfl := flag.String("reflector", "10.30.30.1:862", "TWAMP reflector address")
 	flag.Parse()
 
 	// convert interrupt signals into context cancellation
@@ -118,7 +118,7 @@ func main() {
 	}
 	defer netlink.FilterDel(filter)
 
-	fmt.Printf("🚀 DAWN6G Gateway Active on %s\n", *iface)
+	fmt.Printf("🚀 DAWN6G Gateway Active on %s to %s\n", *iface, *rfl)
 
 	// Ensure ModemManager has been asked to enable signal reporting
 	// (running with sudo is normally required; the agent itself is
@@ -192,7 +192,7 @@ func runActiveMonitoring(ctx context.Context, reflector string) {
 	}
 }
 
-// Now returns 3 strings: RSRP, RSRQ, RSSI
+// Returns 3 strings: RSRP, RSRQ, RSSI
 // getRadioMetrics queries ModemManager for signal strength values.
 // It prefers 5G metrics, falling back to LTE if the 5G fields are
 // empty or contain the -32768 sentinel value (meaning "no data").
