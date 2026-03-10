@@ -74,8 +74,8 @@ ls -d /usr/include/$(uname -m)-linux-gnu
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/your-username/5g-glitch-monitor.git
-cd 5g-glitch-monitor
+git clone git@github.com:bsantunes/glitch_detector.git
+cd glitch-detector
 
 ```
 
