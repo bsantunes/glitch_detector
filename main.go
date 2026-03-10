@@ -95,7 +95,11 @@ func main() {
 		QdiscType:  "clsact",
 	}
 	if err := netlink.QdiscAdd(qdisc); err != nil {
-		log.Fatalf("QdiscAdd: %v", err)
+		// ignore "file exists" since the qdisc may already be present
+		if !errors.Is(err, syscall.EEXIST) {
+			log.Fatalf("QdiscAdd: %v", err)
+		}
+		log.Printf("note: qdisc already exists, continuing")
 	}
 	defer netlink.QdiscDel(qdisc)
 
@@ -106,7 +110,10 @@ func main() {
 		DirectAction: true,
 	}
 	if err := netlink.FilterAdd(filter); err != nil {
-		log.Fatalf("FilterAdd: %v", err)
+		if !errors.Is(err, syscall.EEXIST) {
+			log.Fatalf("FilterAdd: %v", err)
+		}
+		log.Printf("note: filter already exists, continuing")
 	}
 	defer netlink.FilterDel(filter)
 

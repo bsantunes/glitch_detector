@@ -26,8 +26,6 @@ $(BPF_OBJ): $(BPF_SRC)
 	    -I/usr/include/$(shell uname -m)-linux-gnu \
 	    -c $< -o $@
 
-$(GO_BIN):
-	go build -o $(GO_BIN)
 
 clean:
 	rm -f $(BPF_OBJ) $(GO_BIN)
