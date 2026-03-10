@@ -90,6 +90,13 @@ func main() {
 
 	fmt.Printf("🚀 DAWN6G Gateway Active on %s\n", IfaceName)
 
+	// Ensure ModemManager has been asked to enable signal reporting
+	// (running with sudo is normally required; the agent itself is
+	// usually executed as root, so we omit sudo here).
+	if err := exec.Command("mmcli", "-m", "0", "--signal-setup=1").Run(); err != nil {
+		log.Printf("warning: failed to enable mmcli signal-setup: %v", err)
+	}
+
 	// 3. Start Multi-Sensor Loops
 	go runActiveMonitoring() // TWAMP & Radio metrics
 	
