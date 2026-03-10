@@ -25,6 +25,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -187,44 +188,54 @@ func runActiveMonitoring(ctx context.Context, reflector string) {
 			avgRTT, jitter, loss := getTwampMetrics(ctx, reflector)
 
 			fmt.Printf("📊 [STATUS] Radio: %s RSRP / %s RSRQ / %s RSSI | TWAMP: %.1fms RTT / %.1fms Jitter / %.1f%% Loss\n",
-				rsrp, rsrq, rssi, avgRTT, jitter, loss)
+				formatSignal(rsrp), formatSignal(rsrq), formatSignal(rssi), avgRTT, jitter, loss)
 		}
 	}
 }
 
-// Returns 3 strings: RSRP, RSRQ, RSSI
 // getRadioMetrics queries ModemManager for signal strength values.
-// It prefers 5G metrics, falling back to LTE if the 5G fields are
-// empty or contain the -32768 sentinel value (meaning "no data").
-// RSSI is optional on 5G and may be reported as -32768 as well.
-// Returns three user-facing strings for RSRP, RSRQ, and RSSI.
-func getRadioMetrics(ctx context.Context) (string, string, string) {
+	// It prefers 5G metrics, falling back to LTE if the 5G fields are
+	// empty or contain the -32768 sentinel value (meaning "no data").
+	// RSSI is optional on 5G and may be reported as -32768 as well.
+	//
+	// The function now returns three float64 values (RSRP, RSRQ, RSSI).
+	// A missing or invalid measurement is represented by math.NaN().
+	// Earlier versions returned strings; the caller is responsible for
+	// formatting the values for user output.
+func getRadioMetrics(ctx context.Context) (float64, float64, float64) {
 	cmd := exec.CommandContext(ctx, "mmcli", "-m", "0", "--signal-get", "--output-keyvalue")
 	out, err := cmd.Output()
 	if err != nil {
 		log.Printf("mmcli error: %v", err)
-		return "ERR", "ERR", "ERR"
+		return math.NaN(), math.NaN(), math.NaN()
 	}
-	
-	m := parseKeyValue(string(out))
-	
-	// Try 5G first
-	rsrp := m["modem.signal.5g.rsrp"]
-	rsrq := m["modem.signal.5g.rsrq"]
-	rssi := m["modem.signal.5g.rssi"] 
 
-	// Fallback to LTE
-	if rsrp == "" || rsrp == "-32768" || rsrp == "-32768.00" {
-		rsrp = m["modem.signal.lte.rsrp"] + " (LTE)"
-		rsrq = m["modem.signal.lte.rsrq"] + " (LTE)"
-		rssi = m["modem.signal.lte.rssi"] + " (LTE)"
+	m := parseKeyValue(string(out))
+
+	// helper to parse and treat sentinel values as NaN
+	parse := func(s string) float64 {
+		if s == "" || s == "-32768" || s == "-32768.00" {
+			return math.NaN()
+		}
+		v, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return math.NaN()
+		}
+		return v
 	}
-	
-	// Clean up empty RSSI values (5G often doesn't report traditional RSSI)
-	if rssi == "" || strings.HasPrefix(rssi, "-32768") {
-		rssi = "N/A"
+
+	// Try 5G first
+	rsrp := parse(m["modem.signal.5g.rsrp"])
+	rsrq := parse(m["modem.signal.5g.rsrq"])
+	rssi := parse(m["modem.signal.5g.rssi"])
+
+	// Fallback to LTE if we didn't get a valid 5G RSRP
+	if math.IsNaN(rsrp) {
+		rsrp = parse(m["modem.signal.lte.rsrp"])
+		rsrq = parse(m["modem.signal.lte.rsrq"])
+		rssi = parse(m["modem.signal.lte.rssi"])
 	}
-	
+
 	return rsrp, rsrq, rssi
 }
 
@@ -271,6 +282,16 @@ func parseKeyValue(input string) map[string]string {
 		}
 	}
 	return res
+}
+
+// formatSignal returns a human-readable string for a radio metric.
+// NaN values are shown as "N/A" while valid numbers are formatted
+// with one decimal place.
+func formatSignal(v float64) string {
+	if math.IsNaN(v) {
+		return "N/A"
+	}
+	return fmt.Sprintf("%.1f", v)
 }
 
 // int2ip converts a little‑endian 32‑bit integer (as produced by the
