@@ -69,7 +69,7 @@ type bpfObjects struct {
 func main() {
 	// command-line options
 	iface := flag.String("iface", "wwan0", "network interface to attach to")
-	rfl := flag.String("reflector", "10.30.30.1:862", "TWAMP reflector address")
+	rfl := flag.String("sender", "10.30.30.1:862", "TWAMP reflector address")
 	flag.Parse()
 
 	// convert interrupt signals into context cancellation
@@ -228,12 +228,12 @@ func getRadioMetrics(ctx context.Context) (string, string, string) {
 	return rsrp, rsrq, rssi
 }
 
-// getTwampMetrics runs a TWAMP controller against our reflector and
+// getTwampMetrics runs a TWAMP sender against our reflector and
 // parses the printed summary line.  On error it reports 100% loss so
 // that the status output clearly indicates a problem.
 func getTwampMetrics(ctx context.Context, reflector string) (float64, float64, float64) {
 	// Use CombinedOutput to capture both standard output and error messages (stderr)
-	cmd := exec.CommandContext(ctx, "twampy", "controller", reflector, "--count", "5", "--interval", "100")
+	cmd := exec.CommandContext(ctx, "twampy", "sender", reflector, "--count", "5", "--interval", "100")
 	out, err := cmd.CombinedOutput() 
 	
 	if err != nil { 
