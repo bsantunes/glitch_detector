@@ -136,24 +136,35 @@ func main() {
 		log.Fatalf("ringbuf.NewReader: %v", err)
 	}
 
+	// send decoded events into a channel so we can select on ctx.Done()
+	eventCh := make(chan GlitchEvent)
+	errCh := make(chan error, 1)
+	go func() {
+		for {
+			rec, err := rd.Read()
+			if err != nil {
+				errCh <- err
+				return
+			}
+			var ev GlitchEvent
+			binary.Read(bytes.NewBuffer(rec.RawSample), binary.LittleEndian, &ev)
+			eventCh <- ev
+		}
+	}()
+
 	for {
 		select {
 		case <-ctx.Done():
-			// cleanup happens via deferred calls and return
 			return
-		default:
-			record, err := rd.Read()
-			if err != nil {
-				log.Printf("ringbuf read: %v", err)
-				continue
-			}
-			var event GlitchEvent
-			binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event)
-			if event.Type == GlitchTypeTCPLoss {
-				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | Dest: %s\n", int2ip(event.DstIP))
+		case ev := <-eventCh:
+			if ev.Type == GlitchTypeTCPLoss {
+				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | Dest: %s\n", int2ip(ev.DstIP))
 			} else {
-				fmt.Printf("⚠️  [KERNEL] Stall: %.1fms | Dest: %s\n", float64(event.Value)/1e6, int2ip(event.DstIP))
+				fmt.Printf("⚠️  [KERNEL] Stall: %.1fms | Dest: %s\n", float64(ev.Value)/1e6, int2ip(ev.DstIP))
 			}
+		case e := <-errCh:
+			log.Printf("ringbuf reader error: %v", e)
+			return
 		}
 	}
 }
