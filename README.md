@@ -90,48 +90,38 @@ mkdir -p bpf_src
 
 ```
 
-### 3. Compile the eBPF Kernel Program
+### 3. Build Everything with Make
 
-We use `clang` with the specific include path for ARM64 headers.
-
-```bash
-clang -O2 -g -target bpf \
-    -I/usr/include/$(uname -m)-linux-gnu \
-    -c bpf_src/tc_glitch.bpf.c -o tc_glitch.o
-
-```
-
-*Output: This generates `tc_glitch.o` in your root directory.*
-
-### 4. Build the User-Space Agent
-
-Initialize the Go module (if not done) and build the binary.
+A `Makefile` is provided so you don’t need to manually compile the C program or
+invoke the Go toolchain. From the project root:
 
 ```bash
-# Initialize module
-go mod init dawn-agent
-go get github.com/cilium/ebpf
-go get github.com/vishvananda/netlink
-go get github.com/influxdata/influxdb-client-go/v2
+# compile the eBPF object and build the agent
+make
 
-# Build binary
-go build -o dawn-agent
-
+# clean build artifacts if needed
+make clean
 ```
 
 ---
 
 ## 🚦 Usage
 
-### 1. Configure the Interface
+### 1. Configure and Run the Agent
 
-By default, the agent attaches to `eth0`. If you are using a cellular modem (e.g., `wwan0` or `usb0`), edit `main.go` before building:
+The agent defaults to the `wwan0` interface (appropriate for most cellular modems)
+and the TWAMP reflector is set to `dawn6g.duckdns.org`. You can override both
+parameters at runtime with command-line flags:
 
-```go
-// main.go
-const IfaceName = "wwan0" // Change this to your interface
-
+```bash
+sudo ./dawn-agent -iface wwan0 -reflector my.reflector.example.com
 ```
+
+There’s no longer a need to edit source code for these values; the flags make the
+behavior flexible. If you prefer different compile‑time defaults, modify the
+constants in `main.go` and rebuild using `make`.  
+
+(Flags are parsed by Go's `flag` package; run `./dawn-agent -h` for help.)
 
 ### 2. Run the Monitor
 
