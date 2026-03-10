@@ -1,18 +1,3 @@
-package main
-// Package main implements the DAWN6G glitch‑detector gateway.
-// It attaches an eBPF program to a network interface to passively
-// detect stalls and losses, and concurrently runs “active” probes
-// (TWAMP and modem radio metrics) for richer telemetry.
-//
-// Usage:
-//   go run main.go
-//
-// The eBPF object (tc_glitch.o) must be built beforehand; see
-// the project README for build instructions.
-//
-// The default interface is wwan0; change IfaceName to suit your
-// environment.  Passive events are logged with emojis, active
-// stats are printed every 5 seconds.
 // Package main implements the DAWN6G glitch-detector gateway.
 // It combines passive kernel instrumentation via an eBPF program
 // with active measurements (TWAMP and radio signal metrics) to
