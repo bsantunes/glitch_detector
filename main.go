@@ -6,8 +6,8 @@
 //
 // The eBPF object (tc_glitch.o) must be built beforehand; see the
 // project README for build instructions. By default the code
-// attaches to interface "wwan0" (a 5G modem); change IfaceName as
-// necessary for your environment.
+// attaches to interface "wwan0" (a 5G modem); supply a different
+// interface with the -iface flag when starting the agent.
 //
 // Running:
 //   go run main.go
@@ -19,7 +19,9 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"log"
 	"net"
@@ -36,109 +38,138 @@ import (
 	"github.com/vishvananda/netlink"
 )
 
+// default constants; overridden by flags if provided
 const (
-	// IfaceName is the network interface the eBPF program will
-	// attach to. On a cellular gateway this is usually the modem
-	// interface (wwan0 for 5G). Change this if your device differs.
-	IfaceName        = "wwan0" // Change to wwan0 for 5G
-
-	// Address of the TWAMP reflector we probe for active RTT
-	// measurements.
-	ReflectorAddress = "dawn6g.duckdns.org"
-
 	// Magic handle number used when installing the clsact ingress
 	// filter for eBPF. This value comes from the BPF program logic.
 	HANDLE_MINIGRESS = 0xFFF3
+)
+
+// glitch types as seen in the event structure
+const (
+	GlitchTypeStall   = 1
+	GlitchTypeTCPLoss = 2
 )
 
 type GlitchEvent struct {
 	SrcIP uint32
 	DstIP uint32
 	Value uint64
-	Type  uint32
+	Type  uint32 // one of GlitchType*
 	Proto uint8
 }
 
+// bpfObjects holds the programs/maps we load from the object file.
+type bpfObjects struct {
+	EgressMonitor *ebpf.Program `ebpf:"egress_monitor"`
+	Events        *ebpf.Map     `ebpf:"events"`
+}
+
 func main() {
+	// command-line options
+	iface := flag.String("iface", "wwan0", "network interface to attach to")
+	rfl := flag.String("reflector", "dawn6g.duckdns.org", "TWAMP reflector address")
+	flag.Parse()
+
+	// convert interrupt signals into context cancellation
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
 	// 1. Load eBPF (Passive)
 	spec, err := ebpf.LoadCollectionSpec("tc_glitch.o")
 	if err != nil {
 		log.Fatalf("Failed to load BPF: %v", err)
 	}
-	objs := struct {
-		EgressMonitor *ebpf.Program `ebpf:"egress_monitor"`
-		Events        *ebpf.Map     `ebpf:"events"`
-	}{}
+	objs := bpfObjects{}
 	if err := spec.LoadAndAssign(&objs, nil); err != nil {
 		log.Fatalf("LoadAndAssign: %v", err)
 	}
 
 	// 2. Attach to Interface
-	link, _ := netlink.LinkByName(IfaceName)
+	link, err := netlink.LinkByName(*iface)
+	if err != nil {
+		log.Fatalf("LinkByName(%s): %v", *iface, err)
+	}
 	qdisc := &netlink.GenericQdisc{
 		QdiscAttrs: netlink.QdiscAttrs{LinkIndex: link.Attrs().Index, Handle: netlink.MakeHandle(0xffff, 0), Parent: netlink.HANDLE_CLSACT},
 		QdiscType:  "clsact",
 	}
-	netlink.QdiscAdd(qdisc)
+	if err := netlink.QdiscAdd(qdisc); err != nil {
+		log.Fatalf("QdiscAdd: %v", err)
+	}
+	defer netlink.QdiscDel(qdisc)
+
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Attrs().Index, Parent: netlink.MakeHandle(0xffff, HANDLE_MINIGRESS), Handle: 1, Protocol: syscall.ETH_P_ALL, Priority: 1},
 		Fd:          objs.EgressMonitor.FD(),
 		Name:        "egress_monitor",
 		DirectAction: true,
 	}
-	netlink.FilterAdd(filter)
+	if err := netlink.FilterAdd(filter); err != nil {
+		log.Fatalf("FilterAdd: %v", err)
+	}
+	defer netlink.FilterDel(filter)
 
-	fmt.Printf("🚀 DAWN6G Gateway Active on %s\n", IfaceName)
+	fmt.Printf("🚀 DAWN6G Gateway Active on %s\n", *iface)
 
 	// Ensure ModemManager has been asked to enable signal reporting
 	// (running with sudo is normally required; the agent itself is
 	// usually executed as root, so we omit sudo here).
-	if err := exec.Command("mmcli", "-m", "0", "--signal-setup=1").Run(); err != nil {
+	if err := exec.CommandContext(ctx, "mmcli", "-m", "0", "--signal-setup=1").Run(); err != nil {
 		log.Printf("warning: failed to enable mmcli signal-setup: %v", err)
 	}
 
 	// 3. Start Multi-Sensor Loops
-	go runActiveMonitoring() // TWAMP & Radio metrics
+	go runActiveMonitoring(ctx, *rfl) // TWAMP & Radio metrics
 	
 	// 4. Passive Event Loop (eBPF)
-	rd, _ := ringbuf.NewReader(objs.Events)
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt)
+	rd, err := ringbuf.NewReader(objs.Events)
+	if err != nil {
+		log.Fatalf("ringbuf.NewReader: %v", err)
+	}
 
-	go func() {
-		var event GlitchEvent
-		for {
+	for {
+		select {
+		case <-ctx.Done():
+			// cleanup happens via deferred calls and return
+			return
+		default:
 			record, err := rd.Read()
-			if err != nil { continue }
+			if err != nil {
+				log.Printf("ringbuf read: %v", err)
+				continue
+			}
+			var event GlitchEvent
 			binary.Read(bytes.NewBuffer(record.RawSample), binary.LittleEndian, &event)
-			
-			if event.Type == 2 {
+			if event.Type == GlitchTypeTCPLoss {
 				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | Dest: %s\n", int2ip(event.DstIP))
 			} else {
 				fmt.Printf("⚠️  [KERNEL] Stall: %.1fms | Dest: %s\n", float64(event.Value)/1e6, int2ip(event.DstIP))
 			}
 		}
-	}()
-
-	<-stop
-	netlink.FilterDel(filter)
+	}
 }
 
 // runActiveMonitoring periodically gathers active telemetry from
 // the modem (rsrp/rsrq/rssi) and from a TWAMP reflector.  It
 // prints a human-readable status line every 5 seconds.
-func runActiveMonitoring() {
+func runActiveMonitoring(ctx context.Context, reflector string) {
 	ticker := time.NewTicker(5 * time.Second)
-	for range ticker.C {
-		// Sensor 1: Radio Metrics (via ModemManager)
-		rsrp, rsrq, rssi := getRadioMetrics()
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			// Sensor 1: Radio Metrics (via ModemManager)
+			rsrp, rsrq, rssi := getRadioMetrics(ctx)
 
-		// Sensor 2: TWAMP Metrics
-		avgRTT, jitter, loss := getTwampMetrics()
+			// Sensor 2: TWAMP Metrics
+			avgRTT, jitter, loss := getTwampMetrics(ctx, reflector)
 
-		fmt.Printf("📊 [STATUS] Radio: %s RSRP / %s RSRQ / %s RSSI | TWAMP: %.1fms RTT / %.1fms Jitter / %.1f%% Loss\n",
-			rsrp, rsrq, rssi, avgRTT, jitter, loss)
-
+			fmt.Printf("📊 [STATUS] Radio: %s RSRP / %s RSRQ / %s RSSI | TWAMP: %.1fms RTT / %.1fms Jitter / %.1f%% Loss\n",
+				rsrp, rsrq, rssi, avgRTT, jitter, loss)
+		}
 	}
 }
 
@@ -148,9 +179,11 @@ func runActiveMonitoring() {
 // empty or contain the -32768 sentinel value (meaning "no data").
 // RSSI is optional on 5G and may be reported as -32768 as well.
 // Returns three user-facing strings for RSRP, RSRQ, and RSSI.
-func getRadioMetrics() (string, string, string) {
-	out, err := exec.Command("mmcli", "-m", "0", "--signal-get", "--output-keyvalue").Output()
+func getRadioMetrics(ctx context.Context) (string, string, string) {
+	cmd := exec.CommandContext(ctx, "mmcli", "-m", "0", "--signal-get", "--output-keyvalue")
+	out, err := cmd.Output()
 	if err != nil {
+		log.Printf("mmcli error: %v", err)
 		return "ERR", "ERR", "ERR"
 	}
 	
@@ -179,14 +212,14 @@ func getRadioMetrics() (string, string, string) {
 // getTwampMetrics runs a TWAMP controller against our reflector and
 // parses the printed summary line.  On error it reports 100% loss so
 // that the status output clearly indicates a problem.
-func getTwampMetrics() (float64, float64, float64) {
+func getTwampMetrics(ctx context.Context, reflector string) (float64, float64, float64) {
 	// Use CombinedOutput to capture both standard output and error messages (stderr)
-	cmd := exec.Command("twampy", "controller", ReflectorAddress, "--count", "5", "--interval", "100")
+	cmd := exec.CommandContext(ctx, "twampy", "controller", reflector, "--count", "5", "--interval", "100")
 	out, err := cmd.CombinedOutput() 
 	
 	if err != nil { 
 		// Print EXACTLY why it failed directly to your terminal
-		fmt.Printf("🔴 [DEBUG] TWAMP Failed: %v | Output: %s\n", err, string(bytes.TrimSpace(out)))
+		log.Printf("🔴 [DEBUG] TWAMP Failed: %v | Output: %s", err, string(bytes.TrimSpace(out)))
 		return 0, 0, 100 
 	}
 

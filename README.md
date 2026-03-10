@@ -192,7 +192,7 @@ ping -i 1.5 8.8.8.8
 
 **Error: `Link not found**`
 
-* **Fix:** Update `IfaceName` in `main.go` to match your actual network interface (check with `ip link`).
+* **Fix:** Run the agent with `-iface <name>` to match your actual network interface (check with `ip link`).
 
 ---
 
