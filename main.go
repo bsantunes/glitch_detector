@@ -1,4 +1,35 @@
 package main
+// Package main implements the DAWN6G glitch‑detector gateway.
+// It attaches an eBPF program to a network interface to passively
+// detect stalls and losses, and concurrently runs “active” probes
+// (TWAMP and modem radio metrics) for richer telemetry.
+//
+// Usage:
+//   go run main.go
+//
+// The eBPF object (tc_glitch.o) must be built beforehand; see
+// the project README for build instructions.
+//
+// The default interface is wwan0; change IfaceName to suit your
+// environment.  Passive events are logged with emojis, active
+// stats are printed every 5 seconds.
+// Package main implements the DAWN6G glitch-detector gateway.
+// It combines passive kernel instrumentation via an eBPF program
+// with active measurements (TWAMP and radio signal metrics) to
+// provide real-time telemetry and alerting when the 5G link
+// exhibits stalls or packet loss.
+//
+// The eBPF object (tc_glitch.o) must be built beforehand; see the
+// project README for build instructions. By default the code
+// attaches to interface "wwan0" (a 5G modem); change IfaceName as
+// necessary for your environment.
+//
+// Running:
+//   go run main.go
+//
+// Passive events are logged with emojis, and active statistics are
+// printed every 5 seconds.
+package main
 
 import (
 	"bufio"
@@ -21,8 +52,17 @@ import (
 )
 
 const (
+	// IfaceName is the network interface the eBPF program will
+	// attach to. On a cellular gateway this is usually the modem
+	// interface (wwan0 for 5G). Change this if your device differs.
 	IfaceName        = "wwan0" // Change to wwan0 for 5G
+
+	// Address of the TWAMP reflector we probe for active RTT
+	// measurements.
 	ReflectorAddress = "dawn6g.duckdns.org"
+
+	// Magic handle number used when installing the clsact ingress
+	// filter for eBPF. This value comes from the BPF program logic.
 	HANDLE_MINIGRESS = 0xFFF3
 )
 
@@ -92,6 +132,9 @@ func main() {
 	netlink.FilterDel(filter)
 }
 
+// runActiveMonitoring periodically gathers active telemetry from
+// the modem (rsrp/rsrq/rssi) and from a TWAMP reflector.  It
+// prints a human-readable status line every 5 seconds.
 func runActiveMonitoring() {
 	ticker := time.NewTicker(5 * time.Second)
 	for range ticker.C {
@@ -108,6 +151,11 @@ func runActiveMonitoring() {
 }
 
 // Now returns 3 strings: RSRP, RSRQ, RSSI
+// getRadioMetrics queries ModemManager for signal strength values.
+// It prefers 5G metrics, falling back to LTE if the 5G fields are
+// empty or contain the -32768 sentinel value (meaning "no data").
+// RSSI is optional on 5G and may be reported as -32768 as well.
+// Returns three user-facing strings for RSRP, RSRQ, and RSSI.
 func getRadioMetrics() (string, string, string) {
 	out, err := exec.Command("mmcli", "-m", "0", "--signal-get", "--output-keyvalue").Output()
 	if err != nil {
@@ -136,6 +184,9 @@ func getRadioMetrics() (string, string, string) {
 	return rsrp, rsrq, rssi
 }
 
+// getTwampMetrics runs a TWAMP controller against our reflector and
+// parses the printed summary line.  On error it reports 100% loss so
+// that the status output clearly indicates a problem.
 func getTwampMetrics() (float64, float64, float64) {
 	// Use CombinedOutput to capture both standard output and error messages (stderr)
 	cmd := exec.Command("twampy", "controller", ReflectorAddress, "--count", "5", "--interval", "100")
@@ -163,6 +214,9 @@ func getTwampMetrics() (float64, float64, float64) {
 	}
 	return 0, 0, 100
 }
+// parseKeyValue converts lines of the form "key : value" (as
+// emitted by mmcli with --output-keyvalue) into a map.  Blank lines
+// and malformed entries are ignored.
 func parseKeyValue(input string) map[string]string {
 	res := make(map[string]string)
 	lines := strings.Split(input, "\n")
@@ -175,6 +229,8 @@ func parseKeyValue(input string) map[string]string {
 	return res
 }
 
+// int2ip converts a little‑endian 32‑bit integer (as produced by the
+// BPF program) into a standard net.IP value.
 func int2ip(nn uint32) net.IP {
 	ip := make(net.IP, 4)
 	binary.LittleEndian.PutUint32(ip, nn)
