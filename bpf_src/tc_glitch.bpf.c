@@ -58,16 +58,19 @@ int egress_monitor(struct __sk_buff *skb) {
     // data points to the start of the packet. data_end points to the end
     void *data_end = (void *)(long)skb->data_end;
     void *data = (void *)(long)skb->data;
-    struct ethhdr *eth = data;
+    // 5G Modems are RAW IP. There is no Ethernet header!
+    // Map the start of the data directly to the IP header.
+    struct iphdr *ip = data;
+    // struct ethhdr *eth = data;
 
     // Safety Check 1: Is the Ethernet header fully inside the buffer?
-    if ((void *)(eth + 1) > data_end) return TC_ACT_OK;
-    // Logic Check: Is this an IP packet? (Ignore ARP, IPv6, etc for now)
-    if (eth->h_proto != bpf_htons(ETH_P_IP)) return TC_ACT_OK;
-
-    struct iphdr *ip = (void *)(eth + 1);
-    // Safety Check 2: Is the IP header valid?
     if ((void *)(ip + 1) > data_end) return TC_ACT_OK;
+    // Logic Check: Is this an IP packet? (Ignore ARP, IPv6, etc for now)
+    if (ip->version != 4) return TC_ACT_OK;
+
+    //struct iphdr *ip = (void *)(eth + 1);
+    // Safety Check 2: Is the IP header valid?
+    //if ((void *)(ip + 1) > data_end) return TC_ACT_OK;
 
     // Define Flow Key
     struct flow_key key = {};

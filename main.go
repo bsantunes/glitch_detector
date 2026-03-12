@@ -44,7 +44,9 @@ import (
 const (
 	// Magic handle number used when installing the clsact ingress
 	// filter for eBPF. This value comes from the BPF program logic.
-	HANDLE_MINIGRESS = 0xFFF3
+	// HANDLE_MINIGRESS = 0xFFF3
+	// Change HANDLE_MINIGRESS (0xFFF3) to HANDLE_MINEGRESS (0xFFF2)
+	HANDLE_MINEGRESS = 0xFFF2
 )
 
 // glitch types as seen in the event structure
@@ -106,7 +108,7 @@ func main() {
 	defer netlink.QdiscDel(qdisc)
 
 	filter := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Attrs().Index, Parent: netlink.MakeHandle(0xffff, HANDLE_MINIGRESS), Handle: 1, Protocol: syscall.ETH_P_ALL, Priority: 1},
+		FilterAttrs: netlink.FilterAttrs{LinkIndex: link.Attrs().Index, Parent: netlink.MakeHandle(0xffff, HANDLE_MINEGRESS), Handle: 1, Protocol: syscall.ETH_P_ALL, Priority: 1},
 		Fd:          objs.EgressMonitor.FD(),
 		Name:        "egress_monitor",
 		DirectAction: true,
