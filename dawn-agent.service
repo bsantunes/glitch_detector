@@ -5,11 +5,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/pi/dawn
+WorkingDirectory=/opt/dawn
 # Run the init script before starting the agent
-ExecStartPre=/bin/bash /home/pi/dawn/init_gateway.sh
+ExecStartPre=/bin/bash /opt/dawn/init_gateway.sh
 # Start the Go Agent
-ExecStart=/home/pi/dawn/dawn-agent
+ExecStart=/opt/dawn/dawn-agent
 Restart=always
 RestartSec=5
 StandardOutput=append:/var/log/dawn-agent.log

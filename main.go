@@ -72,7 +72,7 @@ type bpfObjects struct {
 func main() {
 	// command-line options
 	iface := flag.String("iface", "wwan0", "network interface to attach to")
-	rfl := flag.String("sender", "10.30.30.1:862", "TWAMP reflector address")
+	rfl := flag.String("reflector", "10.30.30.1:862", "TWAMP reflector address")
 	flag.Parse()
 
 	// convert interrupt signals into context cancellation

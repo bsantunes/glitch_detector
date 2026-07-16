@@ -4,6 +4,7 @@ BPF_SRC := bpf_src/tc_glitch.bpf.c
 BPF_OBJ := tc_glitch.o
 GO_BIN  := dawn-agent
 GO_MOD  := go.mod
+INSTALL_DIR := /opt/dawn
 
 all: $(BPF_OBJ) $(GO_BIN)
 
@@ -30,4 +31,15 @@ $(BPF_OBJ): $(BPF_SRC)
 clean:
 	rm -f $(BPF_OBJ) $(GO_BIN)
 
-.PHONY: all clean
+# install the agent, BPF object and init script into $(INSTALL_DIR)
+# (creates the directory if needed) and register the systemd unit.
+# Run with sudo: sudo make install
+install: all
+	install -d $(INSTALL_DIR)
+	install -m 755 $(GO_BIN) init_gateway.sh $(INSTALL_DIR)/
+	install -m 644 $(BPF_OBJ) $(INSTALL_DIR)/
+	install -m 644 dawn-agent.service /etc/systemd/system/
+	systemctl daemon-reload
+	@echo "✅ Installed to $(INSTALL_DIR). Enable with: sudo systemctl enable --now dawn-agent"
+
+.PHONY: all clean install

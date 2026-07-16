@@ -14,7 +14,7 @@ A high-performance, eBPF-powered 5G gateway agent designed for **SIMCom SIM8202G
 
 ## 🛠️ Installation
 
-### 1. Prerequisites (Raspberry Pi CM5)
+### 1. Prerequisites (x86 Linux gateway)
 ```bash
 sudo apt update
 sudo apt install clang llvm libbpf-dev golang modemmanager python3-pip -y
@@ -41,11 +41,13 @@ The project consists of two components:
 1. **Kernel Space (C):** A lightweight eBPF program (`tc_glitch.bpf.c`) that attaches to the egress path. It calculates Inter-Packet Arrival Time (IPAT) and tracks TCP flows.
 2. **User Space (Go):** A high-performance agent (`dawn-agent`) that loads the BPF program, reads events from a Ring Buffer, and prints human-readable diagnostics.
 
+See [ARCHITECTURE.md](ARCHITECTURE.md) for a full component diagram covering both the gateway and the server side.
+
 ---
 
 ## 🛠️ Prerequisites
 
-This guide assumes you are running on a **Raspberry Pi (CM4/CM5)** or similar Debian-based ARM64 system.
+This guide assumes you are running on an **x86 gateway board** (or similar Debian-based Linux system) with a 5G modem attached. ARM64 boards (e.g. Raspberry Pi CM4/CM5) also work — the Makefile resolves the architecture automatically.
 
 ### 1. System Dependencies
 
@@ -102,6 +104,20 @@ make
 # clean build artifacts if needed
 make clean
 ```
+
+### 4. Install as a Service (optional)
+
+To deploy the agent permanently on the gateway, install it into `/opt/dawn`
+(the directory is created if it doesn't exist) and register the systemd unit:
+
+```bash
+sudo make install
+sudo systemctl enable --now dawn-agent
+```
+
+This copies `dawn-agent`, `tc_glitch.o` and `init_gateway.sh` into `/opt/dawn`
+and installs `dawn-agent.service` into `/etc/systemd/system/`. Logs go to
+`/var/log/dawn-agent.log`.
 
 ---
 
