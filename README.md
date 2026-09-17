@@ -7,7 +7,7 @@ A high-performance, eBPF-powered 5G gateway agent designed for **SIMCom SIM8202G
 ## 🌟 Features
 - **Passive Monitoring:** eBPF-based detection of TCP retransmissions and micro-stalls (>100ms).
 - **Active Auditing:** Multi-profile TWAMP (RFC 5357) to measure 5QI slice performance.
-- **Hardware Integration:** Real-time RSRP/RSRQ extraction via ModemManager.
+- **Hardware Integration:** Real-time RSRP/RSRQ/RSSI/SINR extraction with automatic modem detection — tries ModemManager, then QMI/MBIM, then raw AT, so it isn't locked to one modem vendor.
 - **QoS Enforcement:** Dynamic traffic shaping (HTB) to protect critical flows (DSCP EF) during congestion.
 - **Telemetry:** Asynchronous data push to InfluxDB 2.x with Grafana visualization.
 - **Roaming Aware:** Intelligent behavior switching between Private NPN and Public carriers.
@@ -156,6 +156,39 @@ sudo ./dawn-agent
 | ⚠️ | **Micro-Stall** | Gap 100ms - 1000ms during active flow. | Monitor. Indicates jitter/bufferbloat. |
 | 🔴 | **LOSS** | TCP Retransmission detected. | **Critical.** Radio link quality is poor. |
 
+### 4. Modem Detection
+
+On startup, `dawn-agent` auto-detects whatever modem is present instead of
+assuming a fixed ModemManager index. It tries, in order, **ModemManager**
+(`mmcli`), then **QMI/MBIM** (`qmicli`/`mbimcli`), then raw **AT** commands
+over serial — stopping at the first backend that finds a modem. You'll see
+what it found logged at startup:
+
+```
+📶 Modem detected: [0] QUALCOMM INCORPORATED 0 (via ModemManager)
+📊 [STATUS] Modem[0/lte] Radio: -86.0 RSRP / -10.0 RSRQ / -55.0 RSSI | TWAMP: ...
+```
+
+(The model showing as `0` above is real, captured output — the SIM8202G-M2's
+ModemManager plugin genuinely reports `"0"` as `modem.generic.model`, not a
+parsing bug.)
+
+If no modem is found at all, the agent logs a warning and keeps running —
+the eBPF/TWAMP paths don't depend on radio metrics being available.
+
+To detect and poll modem signal quality on its own, without the eBPF/TWAMP
+side (e.g. while bringing up support for a new modem model), use the
+standalone CLI built from the same code:
+
+```bash
+make modem-tool
+sudo ./modem-tool                # detect, then poll every 5s
+sudo ./modem-tool -interval 10s  # custom poll interval
+```
+
+See [ARCHITECTURE.md](ARCHITECTURE.md#modem-detection-modem-package) for how
+the detection cascade and each backend work.
+
 ---
 
 ## 🧪 Testing
@@ -199,6 +232,14 @@ ping -i 1.5 8.8.8.8
 **Error: `Link not found**`
 
 * **Fix:** Run the agent with `-iface <name>` to match your actual network interface (check with `ip link`).
+
+**Warning: `no modems detected (tried ModemManager, QMI/MBIM, AT)`**
+
+* **Fix:** Confirm the modem shows up at all — `mmcli -L`, or `ls /dev/cdc-wdm* /dev/ttyUSB*` if ModemManager isn't managing it. Radio metrics are simply unavailable until a modem is found; the rest of the agent keeps running.
+
+**Radio values stay `N/A` even though a modem was detected (ModemManager path)**
+
+* **Fix:** `mmcli --signal-setup` (which starts ModemManager's radio polling) needs root/PolicyKit authorization — run `dawn-agent`/`modem-tool` with `sudo`, not as an unprivileged user.
 
 ---
 

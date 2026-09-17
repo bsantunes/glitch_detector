@@ -25,7 +25,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"math"
 	"net"
 	"os"
 	"os/exec"
@@ -38,6 +37,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/vishvananda/netlink"
+
+	"dawn-agent/modem"
 )
 
 // default constants; overridden by flags if provided
@@ -123,15 +124,23 @@ func main() {
 
 	fmt.Printf("🚀 DAWN6G Gateway Active on %s to %s\n", *iface, *rfl)
 
-	// Ensure ModemManager has been asked to enable signal reporting
-	// (running with sudo is normally required; the agent itself is
-	// usually executed as root, so we omit sudo here).
-	if err := exec.CommandContext(ctx, "mmcli", "-m", "0", "--signal-setup=1").Run(); err != nil {
-		log.Printf("warning: failed to enable mmcli signal-setup: %v", err)
+	// Detect whatever modem(s) are present, trying ModemManager first,
+	// then QMI/MBIM, then raw AT — this replaces the previous hardcoded
+	// assumption of a single ModemManager modem at index 0, so different
+	// modem models/vendors are picked up automatically.
+	modems, err := modem.Detect(ctx)
+	if err != nil {
+		log.Printf("modem detection error: %v", err)
+	}
+	if len(modems) == 0 {
+		log.Printf("warning: no modems detected (tried ModemManager, QMI/MBIM, AT); radio metrics will be unavailable")
+	}
+	for _, m := range modems {
+		fmt.Printf("📶 Modem detected: [%s] %s %s (via %s)\n", m.ID, m.Manufacturer, m.Model, m.Method)
 	}
 
 	// 3. Start Multi-Sensor Loops
-	go runActiveMonitoring(ctx, *rfl) // TWAMP & Radio metrics
+	go runActiveMonitoring(ctx, *rfl, modems) // TWAMP & Radio metrics
 	
 	// 4. Passive Event Loop (eBPF)
 	rd, err := ringbuf.NewReader(objs.Events)
@@ -173,9 +182,9 @@ func main() {
 }
 
 // runActiveMonitoring periodically gathers active telemetry from
-// the modem (rsrp/rsrq/rssi) and from a TWAMP reflector.  It
-// prints a human-readable status line every 5 seconds.
-func runActiveMonitoring(ctx context.Context, reflector string) {
+// each detected modem (rsrp/rsrq/rssi) and from a TWAMP reflector. It
+// prints a human-readable status line per modem every 5 seconds.
+func runActiveMonitoring(ctx context.Context, reflector string, modems []modem.Modem) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 	for {
@@ -183,62 +192,21 @@ func runActiveMonitoring(ctx context.Context, reflector string) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// Sensor 1: Radio Metrics (via ModemManager)
-			rsrp, rsrq, rssi := getRadioMetrics(ctx)
-
-			// Sensor 2: TWAMP Metrics
+			// Sensor 1: TWAMP Metrics
 			avgRTT, jitter, loss := getTwampMetrics(ctx, reflector)
 
-			fmt.Printf("📊 [STATUS] Radio: %s RSRP / %s RSRQ / %s RSSI | TWAMP: %.1fms RTT / %.1fms Jitter / %.1f%% Loss\n",
-				formatSignal(rsrp), formatSignal(rsrq), formatSignal(rssi), avgRTT, jitter, loss)
+			// Sensor 2: Radio Metrics, per detected modem
+			for _, m := range modems {
+				sig, err := modem.GetSignal(ctx, m)
+				if err != nil {
+					log.Printf("modem [%s]: signal read failed: %v", m.ID, err)
+					continue
+				}
+				fmt.Printf("📊 [STATUS] Modem[%s/%s] Radio: %s RSRP / %s RSRQ / %s RSSI | TWAMP: %.1fms RTT / %.1fms Jitter / %.1f%% Loss\n",
+					m.ID, sig.Technology, modem.FormatValue(sig.RSRP), modem.FormatValue(sig.RSRQ), modem.FormatValue(sig.RSSI), avgRTT, jitter, loss)
+			}
 		}
 	}
-}
-
-// getRadioMetrics queries ModemManager for signal strength values.
-	// It prefers 5G metrics, falling back to LTE if the 5G fields are
-	// empty or contain the -32768 sentinel value (meaning "no data").
-	// RSSI is optional on 5G and may be reported as -32768 as well.
-	//
-	// The function now returns three float64 values (RSRP, RSRQ, RSSI).
-	// A missing or invalid measurement is represented by math.NaN().
-	// Earlier versions returned strings; the caller is responsible for
-	// formatting the values for user output.
-func getRadioMetrics(ctx context.Context) (float64, float64, float64) {
-	cmd := exec.CommandContext(ctx, "mmcli", "-m", "0", "--signal-get", "--output-keyvalue")
-	out, err := cmd.Output()
-	if err != nil {
-		log.Printf("mmcli error: %v", err)
-		return math.NaN(), math.NaN(), math.NaN()
-	}
-
-	m := parseKeyValue(string(out))
-
-	// helper to parse and treat sentinel values as NaN
-	parse := func(s string) float64 {
-		if s == "" || s == "-32768" || s == "-32768.00" {
-			return math.NaN()
-		}
-		v, err := strconv.ParseFloat(s, 64)
-		if err != nil {
-			return math.NaN()
-		}
-		return v
-	}
-
-	// Try 5G first
-	rsrp := parse(m["modem.signal.5g.rsrp"])
-	rsrq := parse(m["modem.signal.5g.rsrq"])
-	rssi := parse(m["modem.signal.5g.rssi"])
-
-	// Fallback to LTE if we didn't get a valid 5G RSRP
-	if math.IsNaN(rsrp) {
-		rsrp = parse(m["modem.signal.lte.rsrp"])
-		rsrq = parse(m["modem.signal.lte.rsrq"])
-		rssi = parse(m["modem.signal.lte.rssi"])
-	}
-
-	return rsrp, rsrq, rssi
 }
 
 // getTwampMetrics runs a TWAMP sender against our reflector and
@@ -271,31 +239,6 @@ func getTwampMetrics(ctx context.Context, reflector string) (float64, float64, f
 	}
 	return 0, 0, 100
 }
-// parseKeyValue converts lines of the form "key : value" (as
-// emitted by mmcli with --output-keyvalue) into a map.  Blank lines
-// and malformed entries are ignored.
-func parseKeyValue(input string) map[string]string {
-	res := make(map[string]string)
-	lines := strings.Split(input, "\n")
-	for _, l := range lines {
-		parts := strings.Split(l, " : ")
-		if len(parts) == 2 {
-			res[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
-	}
-	return res
-}
-
-// formatSignal returns a human-readable string for a radio metric.
-// NaN values are shown as "N/A" while valid numbers are formatted
-// with one decimal place.
-func formatSignal(v float64) string {
-	if math.IsNaN(v) {
-		return "N/A"
-	}
-	return fmt.Sprintf("%.1f", v)
-}
-
 // int2ip converts a little‑endian 32‑bit integer (as produced by the
 // BPF program) into a standard net.IP value.
 func int2ip(nn uint32) net.IP {

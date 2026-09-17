@@ -3,10 +3,17 @@
 BPF_SRC := bpf_src/tc_glitch.bpf.c
 BPF_OBJ := tc_glitch.o
 GO_BIN  := dawn-agent
+MODEM_BIN := modem-tool
 GO_MOD  := go.mod
 INSTALL_DIR := /opt/dawn
 
 all: $(BPF_OBJ) $(GO_BIN)
+
+# standalone modem detection/signal-quality CLI (modem/ package) — not
+# part of the default build, since it's for developing modem support
+# independently of the eBPF/TWAMP agent.
+modem-tool: deps
+	go build -o $(MODEM_BIN) ./cmd/modem-tool
 
 # ensure go.mod exists and dependencies are fetched
 $(GO_MOD):
@@ -29,7 +36,7 @@ $(BPF_OBJ): $(BPF_SRC)
 
 
 clean:
-	rm -f $(BPF_OBJ) $(GO_BIN)
+	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN)
 
 # install the agent, BPF object and init script into $(INSTALL_DIR)
 # (creates the directory if needed) and register the systemd unit.
@@ -42,4 +49,4 @@ install: all
 	systemctl daemon-reload
 	@echo "✅ Installed to $(INSTALL_DIR). Enable with: sudo systemctl enable --now dawn-agent"
 
-.PHONY: all clean install
+.PHONY: all clean install modem-tool
