@@ -59,6 +59,22 @@ func main() {
 					m.ID, orUnknown(sig.Technology),
 					modem.FormatValue(sig.RSRP), modem.FormatValue(sig.RSRQ),
 					modem.FormatValue(sig.RSSI), modem.FormatValue(sig.SINR))
+
+				// Skip quietly for backends without cell info support,
+				// instead of logging the same "not implemented" error
+				// every tick.
+				if !modem.SupportsCellInfo(m.Method) {
+					continue
+				}
+				cell, err := modem.GetCellInfo(ctx, m)
+				if err != nil {
+					log.Printf("[%s] cell info read failed: %v", m.ID, err)
+					continue
+				}
+				fmt.Printf("[%s] PLMN=%s (%s) reg=%s pkt=%s TAC=%s CellID=%s\n",
+					m.ID, orUnknown(cell.PLMN), orUnknown(cell.OperatorName),
+					orUnknown(cell.RegistrationState), orUnknown(cell.PacketServiceState),
+					orUnknown(cell.TAC), orUnknown(cell.CellID))
 			}
 		}
 	}

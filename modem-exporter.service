@@ -1,0 +1,17 @@
+[Unit]
+Description=DAWN6G Modem Exporter (push signal/cell info to InfluxDB)
+After=network-online.target ModemManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dawn
+EnvironmentFile=/opt/dawn/modem-exporter.env
+ExecStart=/opt/dawn/modem-exporter -interval 30s -influx-url https://wservices.wavesys.pt:8086 -influx-org wavecom -influx-bucket radio -device-id aaeon
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

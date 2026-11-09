@@ -1,0 +1,15 @@
+apiVersion: 1
+datasources:
+  - name: InfluxDB
+    uid: influxdb-flux
+    type: influxdb
+    access: proxy
+    url: http://influxdb:8086        # internal network, no TLS hop needed
+    isDefault: true
+    editable: false
+    jsonData:
+      version: Flux
+      organization: $INFLUX_ORG
+      defaultBucket: radio
+    secureJsonData:
+      token: $__file{/run/secrets/grafana_influx_token}

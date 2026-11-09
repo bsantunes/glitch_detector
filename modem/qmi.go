@@ -3,6 +3,7 @@ package modem
 import (
 	"context"
 	"fmt"
+	"math"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -111,27 +112,142 @@ func parseCLIKeyValue(s string) map[string]string {
 	return res
 }
 
-func getSignalQMI(ctx context.Context, m Modem) (Signal, error) {
+func getSignalsQMI(ctx context.Context, m Modem) ([]Signal, error) {
 	out, err := exec.CommandContext(ctx, "qmicli", "-d", m.Port, "--nas-get-signal-info").CombinedOutput()
 	if err == nil {
-		return parseQMISignalOutput(string(out)), nil
+		return parseQMISignalsOutput(string(out)), nil
 	}
 	// Older libqmi versions only have the coarser --nas-get-signal-strength,
 	// which is structured differently (metric-name sections containing
-	// "Network '<tech>': 'value'" lines, rather than technology sections).
+	// "Network '<tech>': 'value'" lines, rather than technology sections)
+	// and never reports more than one leg at a time.
 	out, err = exec.CommandContext(ctx, "qmicli", "-d", m.Port, "--nas-get-signal-strength").CombinedOutput()
 	if err != nil {
-		return NaNSignal(), fmt.Errorf("qmicli signal query on %s: %w", m.Port, err)
+		return nil, fmt.Errorf("qmicli signal query on %s: %w", m.Port, err)
 	}
-	return parseQMISignalStrengthOutput(string(out)), nil
+	sig := parseQMISignalStrengthOutput(string(out))
+	sig.Role = "anchor"
+	return []Signal{sig}, nil
+}
+
+func getCellInfoQMI(ctx context.Context, m Modem) (CellInfo, error) {
+	out, err := exec.CommandContext(ctx, "qmicli", "-d", m.Port, "--nas-get-serving-system").CombinedOutput()
+	if err != nil {
+		return CellInfo{}, fmt.Errorf("qmicli -d %s --nas-get-serving-system: %w", m.Port, err)
+	}
+	ci := cellInfoFromQMIServingSystem(string(out))
+
+	// --nas-get-system-info failing shouldn't drop the PLMN/registration
+	// info already gathered above.
+	if out, err := exec.CommandContext(ctx, "qmicli", "-d", m.Port, "--nas-get-system-info").CombinedOutput(); err == nil {
+		applyQMISystemInfo(&ci, string(out))
+	}
+
+	return ci, nil
+}
+
+var qmiRegStateRe = regexp.MustCompile(`Registration state:\s*'([^']*)'`)
+var qmiCurrentPLMNRe = regexp.MustCompile(`^Current PLMN:\s*$`)
+var qmiMCCRe = regexp.MustCompile(`MCC:\s*'(\d+)'`)
+var qmiMNCRe = regexp.MustCompile(`MNC:\s*'(\d+)'`)
+
+// cellInfoFromQMIServingSystem parses `qmicli --nas-get-serving-system`
+// text output. PLMN is taken only from the "Current PLMN:" block (the
+// output repeats MCC/MNC again later under "Full operator code info:",
+// which is ignored once Current PLMN's values are captured). Pure/
+// testable: no exec involved.
+func cellInfoFromQMIServingSystem(out string) CellInfo {
+	var ci CellInfo
+	if m := qmiRegStateRe.FindStringSubmatch(out); m != nil {
+		ci.RegistrationState = m[1]
+	}
+
+	inPLMN := false
+	var mcc, mnc string
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if qmiCurrentPLMNRe.MatchString(trimmed) {
+			inPLMN = true
+			continue
+		}
+		if !inPLMN {
+			continue
+		}
+		if mc := qmiMCCRe.FindStringSubmatch(trimmed); mc != nil && mcc == "" {
+			mcc = mc[1]
+		}
+		if mn := qmiMNCRe.FindStringSubmatch(trimmed); mn != nil && mnc == "" {
+			mnc = mn[1]
+		}
+		if mcc != "" && mnc != "" {
+			break
+		}
+	}
+	if mcc != "" && mnc != "" {
+		mccInt, _ := strconv.Atoi(mcc)
+		mncInt, _ := strconv.Atoi(mnc)
+		ci.PLMN = fmt.Sprintf("%d%02d", mccInt, mncInt)
+	}
+	return ci
+}
+
+var qmiServiceHeaderRe = regexp.MustCompile(`^([A-Za-z0-9 ]+) service:\s*$`)
+var qmiCellIDRe = regexp.MustCompile(`^Cell ID:\s*'(\d+)'`)
+var qmiTACRe = regexp.MustCompile(`^Tracking Area Code:\s*'(\d+)'`)
+
+// applyQMISystemInfo fills TAC/CellID from `qmicli --nas-get-system-info`,
+// scanning technology sections (e.g. "LTE service:") in the same
+// 5g->lte->umts->gsm priority order used elsewhere, via the shared
+// normalizeTechnology/mmcliTechnologies helpers. Unlike ModemManager/
+// uqmi, qmicli already reports a single composite Cell ID directly (no
+// eNB-ID/local-cell-ID combining needed). Pure/testable.
+func applyQMISystemInfo(ci *CellInfo, out string) {
+	type cellTAC struct{ cellID, tac string }
+	sections := map[string]cellTAC{}
+	currentTech := ""
+	for _, line := range strings.Split(out, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if h := qmiServiceHeaderRe.FindStringSubmatch(trimmed); h != nil {
+			currentTech = normalizeTechnology(h[1])
+			continue
+		}
+		if currentTech == "" {
+			continue
+		}
+		e := sections[currentTech]
+		if m := qmiCellIDRe.FindStringSubmatch(trimmed); m != nil {
+			e.cellID = m[1]
+		}
+		if m := qmiTACRe.FindStringSubmatch(trimmed); m != nil {
+			e.tac = m[1]
+		}
+		sections[currentTech] = e
+	}
+	for _, tech := range mmcliTechnologies {
+		e, ok := sections[tech]
+		if !ok || e.tac == "" {
+			continue
+		}
+		ci.TAC = e.tac
+		ci.CellID = e.cellID
+		return
+	}
 }
 
 var qmiTechHeaderRe = regexp.MustCompile(`^([A-Za-z0-9/ -]+):\s*$`)
 var qmiMetricRe = regexp.MustCompile(`(?i)^\s*(RSSI|RSRQ|RSRP|SNR|SINR|ECIO|RSCP)\s*:\s*'?(-?[0-9.]+)`)
 
-func parseQMISignalOutput(s string) Signal {
-	sig := NaNSignal()
+// parseQMISignalsOutput parses `qmicli --nas-get-signal-info`,
+// accumulating one Signal per technology section (e.g. "LTE:", "5G:")
+// that has at least one real (non-NaN) value — the real capture shows
+// e.g. a "5G:" section with all "n/a" fields when 5G isn't actually
+// active alongside LTE, which is filtered out here rather than
+// reported as a bogus all-NaN leg. Roles assigned via assignRoles.
+func parseQMISignalsOutput(s string) []Signal {
+	bySection := map[string]Signal{}
+	var order []string
 	currentTech := ""
+
 	for _, raw := range strings.Split(s, "\n") {
 		line := strings.TrimRight(raw, "\r")
 		trimmed := strings.TrimSpace(line)
@@ -141,8 +257,17 @@ func parseQMISignalOutput(s string) Signal {
 		if !strings.HasPrefix(line, "\t") && !strings.HasPrefix(line, " ") {
 			if h := qmiTechHeaderRe.FindStringSubmatch(trimmed); h != nil {
 				currentTech = normalizeTechnology(h[1])
+				if currentTech != "" {
+					if _, seen := bySection[currentTech]; !seen {
+						bySection[currentTech] = NaNSignal()
+						order = append(order, currentTech)
+					}
+				}
 				continue
 			}
+		}
+		if currentTech == "" {
+			continue
 		}
 
 		mm := qmiMetricRe.FindStringSubmatch(trimmed)
@@ -153,6 +278,7 @@ func parseQMISignalOutput(s string) Signal {
 		if err != nil {
 			continue
 		}
+		sig := bySection[currentTech]
 		switch strings.ToUpper(mm[1]) {
 		case "RSSI":
 			sig.RSSI = v
@@ -163,11 +289,19 @@ func parseQMISignalOutput(s string) Signal {
 		case "SNR", "SINR":
 			sig.SINR = v
 		}
-		// Track whichever section's metrics most recently updated sig, so
-		// Technology stays consistent with the fields it's paired with.
 		sig.Technology = currentTech
+		bySection[currentTech] = sig
 	}
-	return sig
+
+	var candidates []Signal
+	for _, tech := range order {
+		sig := bySection[tech]
+		if math.IsNaN(sig.RSRP) && math.IsNaN(sig.RSSI) {
+			continue
+		}
+		candidates = append(candidates, sig)
+	}
+	return assignRoles(candidates)
 }
 
 var qmiSSMetricHeaderRe = regexp.MustCompile(`^(RSSI|RSRQ|SNR|ECIO)\s*:\s*$`)
@@ -249,6 +383,13 @@ func normalizeTechnology(h string) string {
 		return "umts"
 	case strings.Contains(h, "gsm"):
 		return "gsm"
+	case h == "none":
+		// qmicli reports the network as 'none' (via --nas-get-signal-strength's
+		// "Network 'none': ..." lines) when the modem has no serving cell at
+		// all — observed live on a Quectel RM520N-GL in power-save/
+		// not-registered state. Not a real technology, so leave it unknown
+		// rather than surfacing the literal string.
+		return ""
 	default:
 		return h
 	}

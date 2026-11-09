@@ -204,6 +204,18 @@ func runActiveMonitoring(ctx context.Context, reflector string, modems []modem.M
 				}
 				fmt.Printf("📊 [STATUS] Modem[%s/%s] Radio: %s RSRP / %s RSRQ / %s RSSI | TWAMP: %.1fms RTT / %.1fms Jitter / %.1f%% Loss\n",
 					m.ID, sig.Technology, modem.FormatValue(sig.RSRP), modem.FormatValue(sig.RSRQ), modem.FormatValue(sig.RSSI), avgRTT, jitter, loss)
+
+				// Skip quietly for backends without cell info support.
+				if !modem.SupportsCellInfo(m.Method) {
+					continue
+				}
+				cell, err := modem.GetCellInfo(ctx, m)
+				if err != nil {
+					log.Printf("modem [%s]: cell info read failed: %v", m.ID, err)
+					continue
+				}
+				fmt.Printf("📡 [CELL] Modem[%s] PLMN=%s (%s) reg=%s pkt=%s TAC=%s CellID=%s\n",
+					m.ID, cell.PLMN, cell.OperatorName, cell.RegistrationState, cell.PacketServiceState, cell.TAC, cell.CellID)
 			}
 		}
 	}

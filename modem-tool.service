@@ -1,0 +1,16 @@
+[Unit]
+Description=DAWN6G Modem Tool (continuous signal/cell-info logging)
+After=network-online.target ModemManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dawn
+ExecStart=/opt/dawn/modem-tool -interval 30s
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

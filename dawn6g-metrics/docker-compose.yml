@@ -1,0 +1,82 @@
+# DAWN6G metrics endpoint: InfluxDB 2.7 + Grafana behind the host's Apache (TLS).
+#   Grafana  -> https://${DOMAIN}/grafana/   (Apache :443  -> 127.0.0.1:3000)
+#   InfluxDB -> https://${DOMAIN}:8086       (Apache :8086 -> 127.0.0.1:18086)
+# Containers listen on loopback only; Apache is the single public entry point.
+name: dawn6g-metrics
+
+services:
+  influxdb:
+    image: influxdb:${INFLUXDB_VERSION:-2.7}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: ${INFLUX_ADMIN_USER:-admin}
+      DOCKER_INFLUXDB_INIT_PASSWORD_FILE: /run/secrets/influxdb_admin_password
+      DOCKER_INFLUXDB_INIT_ADMIN_TOKEN_FILE: /run/secrets/influxdb_admin_token
+      DOCKER_INFLUXDB_INIT_ORG: ${INFLUX_ORG:?set INFLUX_ORG in .env}
+      DOCKER_INFLUXDB_INIT_BUCKET: radio
+      DOCKER_INFLUXDB_INIT_RETENTION: ${RETENTION_RADIO:-90d}
+      INFLUXD_REPORTING_DISABLED: "true"
+    secrets:
+      - influxdb_admin_password
+      - influxdb_admin_token
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+      - influxdb-config:/etc/influxdb2
+    networks: [metrics]
+    healthcheck:
+      test: ["CMD", "influx", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
+
+  grafana:
+    image: grafana/grafana:${GRAFANA_VERSION:-12.0.0}
+    restart: unless-stopped
+    depends_on:
+      influxdb:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      GF_SERVER_DOMAIN: ${DOMAIN}
+      GF_SERVER_ROOT_URL: https://${DOMAIN}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_SECURITY_COOKIE_SECURE: "true"
+      GF_SECURITY_DISABLE_GRAVATAR: "true"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      INFLUX_ORG: ${INFLUX_ORG}           # used by datasource provisioning
+    secrets:
+      - grafana_admin_password
+      - grafana_influx_token
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+    networks: [metrics]
+
+networks:
+  metrics:
+    name: metrics-backend
+
+volumes:
+  influxdb-data:
+  influxdb-config:
+  grafana-data:
+
+secrets:
+  influxdb_admin_password:
+    file: ./secrets/influxdb_admin_password
+  influxdb_admin_token:
+    file: ./secrets/influxdb_admin_token
+  grafana_admin_password:
+    file: ./secrets/grafana_admin_password
+  grafana_influx_token:
+    file: ./secrets/grafana_influx_token   # filled by bootstrap.sh

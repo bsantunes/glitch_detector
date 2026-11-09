@@ -4,6 +4,7 @@ BPF_SRC := bpf_src/tc_glitch.bpf.c
 BPF_OBJ := tc_glitch.o
 GO_BIN  := dawn-agent
 MODEM_BIN := modem-tool
+EXPORTER_BIN := modem-exporter
 GO_MOD  := go.mod
 INSTALL_DIR := /opt/dawn
 
@@ -14,6 +15,11 @@ all: $(BPF_OBJ) $(GO_BIN)
 # independently of the eBPF/TWAMP agent.
 modem-tool: deps
 	go build -o $(MODEM_BIN) ./cmd/modem-tool
+
+# long-running service that polls modem/ and pushes signal+cell info to
+# InfluxDB — meant to run continuously (systemd/procd), not interactively.
+modem-exporter: deps
+	go build -o $(EXPORTER_BIN) ./cmd/modem-exporter
 
 # ensure go.mod exists and dependencies are fetched
 $(GO_MOD):
@@ -36,7 +42,7 @@ $(BPF_OBJ): $(BPF_SRC)
 
 
 clean:
-	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN)
+	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN)
 
 # install the agent, BPF object and init script into $(INSTALL_DIR)
 # (creates the directory if needed) and register the systemd unit.
@@ -49,4 +55,28 @@ install: all
 	systemctl daemon-reload
 	@echo "✅ Installed to $(INSTALL_DIR). Enable with: sudo systemctl enable --now dawn-agent"
 
-.PHONY: all clean install modem-tool
+# install modem-tool as a continuous background logging service (no
+# InfluxDB involved — just journalctl). Run with sudo: sudo make install-modem-tool
+install-modem-tool: modem-tool
+	install -d $(INSTALL_DIR)
+	install -m 755 $(MODEM_BIN) $(INSTALL_DIR)/
+	install -m 644 modem-tool.service /etc/systemd/system/
+	systemctl daemon-reload
+	@echo "✅ Installed to $(INSTALL_DIR). Enable with: sudo systemctl enable --now modem-tool"
+	@echo "   Logs: journalctl -u modem-tool -f"
+
+# install modem-exporter, which pushes to InfluxDB. Requires
+# /opt/dawn/modem-exporter.env with a real INFLUX_TOKEN — see
+# modem-exporter.env.example. Run with sudo: sudo make install-modem-exporter
+install-modem-exporter: modem-exporter
+	install -d $(INSTALL_DIR)
+	install -m 755 $(EXPORTER_BIN) $(INSTALL_DIR)/
+	install -m 644 modem-exporter.service /etc/systemd/system/
+	systemctl daemon-reload
+	@echo "✅ Installed to $(INSTALL_DIR)."
+	@echo "   Now: cp modem-exporter.env.example $(INSTALL_DIR)/modem-exporter.env"
+	@echo "        edit it with the real INFLUX_TOKEN, chmod 600, chown root:root"
+	@echo "   Then enable with: sudo systemctl enable --now modem-exporter"
+	@echo "   Logs: journalctl -u modem-exporter -f"
+
+.PHONY: all clean install modem-tool modem-exporter install-modem-tool install-modem-exporter

@@ -1,0 +1,42 @@
+#!/bin/sh /etc/rc.common
+# procd init script for cmd/modem-exporter on OpenWrt/WaveOS — pushes
+# signal/cell info to InfluxDB. Install as /etc/init.d/modem-exporter:
+# cp this file there, chmod +x, set the real values below (or better,
+# edit this copy before installing), then
+# `/etc/init.d/modem-exporter enable && /etc/init.d/modem-exporter start`.
+#
+# The InfluxDB token is kept out of this file: it's read from
+# /opt/dawn/modem-exporter.env (format: INFLUX_TOKEN=...), matching the
+# systemd EnvironmentFile convention used on the Debian gateway
+# (modem-exporter.service) — see MODEM_TOOL.md / modem-exporter.env.example.
+
+START=96
+STOP=3
+USE_PROCD=1
+
+PROG=/opt/dawn/modem-exporter
+ENV_FILE=/opt/dawn/modem-exporter.env
+
+# Per-device identity/target — adjust per board.
+DEVICE_ID=6global
+INFLUX_URL=https://wservices.wavesys.pt:8086
+INFLUX_ORG=wavecom
+INFLUX_BUCKET=radio
+
+start_service() {
+	INFLUX_TOKEN=""
+	[ -f "$ENV_FILE" ] && . "$ENV_FILE"
+
+	procd_open_instance
+	procd_set_param command "$PROG" \
+		-interval 30s \
+		-influx-url "$INFLUX_URL" \
+		-influx-org "$INFLUX_ORG" \
+		-influx-bucket "$INFLUX_BUCKET" \
+		-device-id "$DEVICE_ID"
+	procd_set_param env INFLUX_TOKEN="$INFLUX_TOKEN"
+	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_close_instance
+}
