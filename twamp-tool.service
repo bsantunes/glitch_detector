@@ -1,0 +1,16 @@
+[Unit]
+Description=DAWN6G TWAMP Tool (continuous RTT/jitter/loss logging)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dawn
+ExecStart=/opt/dawn/twamp-tool -reflector 10.30.30.1:862 -interval 5s
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

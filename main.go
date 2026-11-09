@@ -17,7 +17,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -27,10 +26,7 @@ import (
 	"log"
 	"net"
 	"os"
-	"os/exec"
 	"os/signal"
-	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -39,6 +35,7 @@ import (
 	"github.com/vishvananda/netlink"
 
 	"dawn-agent/modem"
+	"dawn-agent/twamp"
 )
 
 // default constants; overridden by flags if provided
@@ -193,7 +190,12 @@ func runActiveMonitoring(ctx context.Context, reflector string, modems []modem.M
 			return
 		case <-ticker.C:
 			// Sensor 1: TWAMP Metrics
-			avgRTT, jitter, loss := getTwampMetrics(ctx, reflector)
+			twampResult, err := twamp.Measure(ctx, reflector, 5, 100*time.Millisecond, 2*time.Second)
+			if err != nil {
+				log.Printf("twamp: measure against %s failed: %v", reflector, err)
+				twampResult = twamp.Result{LossPct: 100}
+			}
+			avgRTT, jitter, loss := twampResult.AvgRTT, twampResult.Jitter, twampResult.LossPct
 
 			// Sensor 2: Radio Metrics, per detected modem
 			for _, m := range modems {
@@ -221,36 +223,6 @@ func runActiveMonitoring(ctx context.Context, reflector string, modems []modem.M
 	}
 }
 
-// getTwampMetrics runs a TWAMP sender against our reflector and
-// parses the printed summary line.  On error it reports 100% loss so
-// that the status output clearly indicates a problem.
-func getTwampMetrics(ctx context.Context, reflector string) (float64, float64, float64) {
-	// Use CombinedOutput to capture both standard output and error messages (stderr)
-	cmd := exec.CommandContext(ctx, "twampy", "sender", reflector, "--count", "5", "--interval", "100")
-	out, err := cmd.CombinedOutput() 
-	
-	if err != nil { 
-		// Print EXACTLY why it failed directly to your terminal
-		log.Printf("🔴 [DEBUG] TWAMP Failed: %v | Output: %s", err, string(bytes.TrimSpace(out)))
-		return 0, 0, 100 
-	}
-
-	scanner := bufio.NewScanner(bytes.NewReader(out))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "Roundtrip:") {
-			f := strings.Fields(line)
-			if len(f) >= 6 {
-				rtt, _ := time.ParseDuration(f[3])
-				jit, _ := time.ParseDuration(f[4])
-				lStr := strings.TrimSuffix(f[5], "%")
-				l, _ := strconv.ParseFloat(lStr, 64)
-				return float64(rtt.Milliseconds()), float64(jit.Microseconds()) / 1000.0, l
-			}
-		}
-	}
-	return 0, 0, 100
-}
 // int2ip converts a little‑endian 32‑bit integer (as produced by the
 // BPF program) into a standard net.IP value.
 func int2ip(nn uint32) net.IP {
