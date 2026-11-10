@@ -94,7 +94,15 @@ The real server stack is **`~/dawn6g-metrics` on `wservices.wavesys.pt`** (Apach
 **What `twamp-exporter` writes** (confirmed live on `aaeon`/`6global`/`dawn6g`, to `network`) — schema is new, not specified by `metrics-endpoint.md` (which only earmarks the bucket, not a schema):
 - `twamp`: tags `device`/`reflector`; fields `rtt_ms`/`jitter_ms`/`loss_pct` (floats) + `sent`/`received` (ints), one point per probe burst (default interval 30s).
 - Same `WriteAPIBlocking` + log-and-drop pattern as `modem-exporter`, same reasoning.
-- **No Grafana panel exists for this yet** — the dashboard only covers the `radio` bucket's `radio_cell`/`modem_state` data. Adding a TWAMP panel is a plain Flux query against `network`, e.g. `from(bucket:"network") |> range(start:-1h) |> filter(fn:(r)=>r._measurement=="twamp" and r._field=="rtt_ms")`, filterable/grouped by the `device` tag — no new datasource needed (same `influxdb-flux` datasource, just a different bucket in the query).
+- **A Grafana panel for this now exists** (built live in Grafana's UI this session — not yet repo-tracked JSON, same open "TODO 2" gap as the `radio` dashboard). Query:
+  ```flux
+  from(bucket: "network")
+    |> range(start: v.timeRangeStart, stop: v.timeRangeStop)
+    |> filter(fn: (r) => r._measurement == "twamp")
+    |> filter(fn: (r) => r._field == "rtt_ms" or r._field == "jitter_ms" or r._field == "loss_pct")
+    |> filter(fn: (r) => r.device =~ /^${device:regex}$/)
+  ```
+  Reuses the dashboard's existing `device` template variable (query: `tagValues(bucket: "network", tag: "device")`, multi-value on) — `:regex` formatting is what makes multi-select/"All" work with `=~`, since plain `==` only matches one value. Same `influxdb-flux` datasource as the `radio` panels, just pointed at the `network` bucket.
 
 **Per-device tokens**: `./add-device.sh <id>` in `dawn6g-metrics/` on `wservices` — writes `secrets/devices/<id>.token` **and** `secrets/devices/<id>.authid` (the InfluxDB auth entry's own ID; `revoke-device.sh` needs this file and can't revoke by token value alone). **`6global` and `dawn6g`'s tokens were created manually** (not via `add-device.sh`), so neither has an `.authid` file — `revoke-device.sh` won't work for them until one is created (look up the auth ID via `influx auth list` and write it to `secrets/devices/<id>.authid` by hand, or recreate the token properly through the script).
 On each gateway, the token is wired in as `INFLUX_TOKEN` — `/opt/dawn/modem-exporter.env` (mode 600) for systemd, baked into the `procd` init script for WaveOS. This diverges from `metrics-endpoint.md`'s documented on-device convention (`/etc/dawn6g/influx.token`, read directly as a file by the Go agent) — functionally fine since our services resolve the env var themselves, but worth knowing if anything else ever expects that exact path.
