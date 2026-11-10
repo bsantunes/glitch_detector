@@ -1,0 +1,16 @@
+[Unit]
+Description=DAWN6G GPS Tool (continuous GPS/GNSS fix logging)
+After=network-online.target ModemManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dawn
+ExecStart=/opt/dawn/gps-tool -interval 10s
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

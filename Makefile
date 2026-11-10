@@ -7,6 +7,7 @@ MODEM_BIN := modem-tool
 EXPORTER_BIN := modem-exporter
 TWAMP_BIN := twamp-tool
 TWAMP_EXPORTER_BIN := twamp-exporter
+GPS_BIN := gps-tool
 GO_MOD  := go.mod
 INSTALL_DIR := /opt/dawn
 
@@ -33,6 +34,12 @@ twamp-tool: deps
 twamp-exporter: deps
 	go build -o $(TWAMP_EXPORTER_BIN) ./cmd/twamp-exporter
 
+# standalone GPS/GNSS fix prober (gps/ package) — ModemManager/raw-QMI
+# backends only so far, see gps.Supports. No InfluxDB exporter yet
+# (schema still being decided) — gps-tool only.
+gps-tool: deps
+	go build -o $(GPS_BIN) ./cmd/gps-tool
+
 # ensure go.mod exists and dependencies are fetched
 $(GO_MOD):
 	@echo "initializing go module and fetching dependencies"
@@ -54,7 +61,7 @@ $(BPF_OBJ): $(BPF_SRC)
 
 
 clean:
-	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN) $(TWAMP_BIN) $(TWAMP_EXPORTER_BIN)
+	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN) $(TWAMP_BIN) $(TWAMP_EXPORTER_BIN) $(GPS_BIN)
 
 # install the agent, BPF object and init script into $(INSTALL_DIR)
 # (creates the directory if needed) and register the systemd unit.
@@ -115,4 +122,14 @@ install-twamp-exporter: twamp-exporter
 	@echo "   Then enable with: sudo systemctl enable --now twamp-exporter"
 	@echo "   Logs: journalctl -u twamp-exporter -f"
 
-.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter
+# install gps-tool as a continuous background logging service (no
+# InfluxDB involved — just journalctl). Run with sudo: sudo make install-gps-tool
+install-gps-tool: gps-tool
+	install -d $(INSTALL_DIR)
+	install -m 755 $(GPS_BIN) $(INSTALL_DIR)/
+	install -m 644 gps-tool.service /etc/systemd/system/
+	systemctl daemon-reload
+	@echo "✅ Installed to $(INSTALL_DIR). Enable with: sudo systemctl enable --now gps-tool"
+	@echo "   Logs: journalctl -u gps-tool -f"
+
+.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter gps-tool install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool

@@ -88,9 +88,16 @@ sudo systemctl enable --now dawn-agent modem-tool modem-exporter twamp-tool twam
 ```
 
 (Running `modem-tool`/`twamp-tool` continuously *alongside* their exporters
-on the same box is redundant — both poll/probe independently — but harmless;
-disable the `-tool` ones here if you only want the InfluxDB-backed telemetry
-and don't need a local `journalctl`-readable feed too.)
+on the same box is redundant — each pair runs its own independent
+detect-and-poll loop with no shared state, so you get the same modem/reflector
+queried twice: once printed locally via `journalctl`, once pushed to
+InfluxDB. That's harmless *correctness*-wise (both are read-only queries) —
+but on WaveOS specifically, if detection ever falls through past the `ubus`
+backend to raw `qmicli`/`uqmi` (the startup-race bug in CLAUDE.md's Known
+Issues), running two independent QMI clients instead of one doubles your
+exposure to QMI client-ID exhaustion. Disable the `-tool` ones here if you
+only want the InfluxDB-backed telemetry and don't need a local
+`journalctl`-readable feed too.)
 
 Check logs:
 

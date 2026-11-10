@@ -4,11 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DAWN6G glitch detector: started as a single eBPF-powered 5G gateway agent (`dawn-agent`), now split into two shared packages (`modem/`, `twamp/`) plus five consumers — `dawn-agent` (eBPF + TWAMP + modem metrics, Debian/ModemManager gateways only), `cmd/modem-tool`/`cmd/twamp-tool` (standalone diagnostic CLIs), and `cmd/modem-exporter`/`cmd/twamp-exporter` (long-running InfluxDB/Grafana telemetry push). **Builds and runs only on Linux** (eBPF, netlink, mmcli/qmicli/uqmi/ubus), not on macOS.
+DAWN6G glitch detector: started as a single eBPF-powered 5G gateway agent (`dawn-agent`), now split into three shared packages (`modem/`, `twamp/`, `gps/`) plus consumers — `dawn-agent` (eBPF + TWAMP + modem metrics, Debian/ModemManager gateways only), `cmd/modem-tool`/`cmd/twamp-tool`/`cmd/gps-tool` (standalone diagnostic CLIs), and `cmd/modem-exporter`/`cmd/twamp-exporter` (long-running InfluxDB/Grafana telemetry push — `gps-exporter` not built yet, schema still undecided). **Builds and runs only on Linux** (eBPF, netlink, mmcli/qmicli/uqmi/ubus), not on macOS.
 
 Two gateway OS targets exist in the fleet:
 - **Debian** (e.g. host `aaeon`) — SIMCom modem via ModemManager, runs the full `dawn-agent` (eBPF works here).
-- **WaveOS** (OpenWrt-based, x86_64 Supermicro boards, e.g. hosts `6global`/`dawn6g`) — **confirmed to lack `clsact`/TC-BPF kernel support** (kernel 5.15.167, `netlink.QdiscAdd` fails with ENOENT; `modprobe cls_bpf`/`sch_ingress` also fail). `dawn-agent`'s eBPF path cannot run there — only `modem-tool`/`modem-exporter`/`twamp-tool`/`twamp-exporter` are deployed on WaveOS boards.
+- **WaveOS** (OpenWrt-based, x86_64 Supermicro boards, e.g. hosts `6global`/`dawn6g`) — **confirmed to lack `clsact`/TC-BPF kernel support** (kernel 5.15.167, `netlink.QdiscAdd` fails with ENOENT; `modprobe cls_bpf`/`sch_ingress` also fail). `dawn-agent`'s eBPF path cannot run there — only `modem-tool`/`modem-exporter`/`twamp-tool`/`twamp-exporter`/`gps-tool` are deployed on WaveOS boards.
 
 ## Repository Layout
 
@@ -19,8 +19,10 @@ Two gateway OS targets exist in the fleet:
 - `twamp/` — shared package: native Go TWAMP-Light sender (no external `twampy`/Python dependency — required for WaveOS, which has no Python at all). Has unit tests (`go test ./twamp/...`).
 - `cmd/twamp-tool/` → `twamp-tool` binary — probe a TWAMP-Test reflector on an interval and print RTT/jitter/loss forever. No InfluxDB. Mirrors `modem-tool`'s structure.
 - `cmd/twamp-exporter/` → `twamp-exporter` binary — probe a TWAMP-Test reflector, then push RTT/jitter/loss to InfluxDB's `network` bucket on an interval. Mirrors `modem-exporter`'s structure; reuses the same per-device token file.
-- `openwrt/*.init` — `procd` init scripts for WaveOS (`modem-tool.init`, `modem-exporter.init`, `twamp-tool.init`, `twamp-exporter.init`; the exporter ones need their `DEVICE_ID`/token edited per board before install).
-- `*.service` — `systemd` units for Debian gateways (`dawn-agent.service`, `modem-tool.service`, `modem-exporter.service`, `twamp-tool.service`, `twamp-exporter.service`).
+- `gps/` — shared package: GPS/GNSS fix reading via ModemManager's `gps-raw` location source or raw QMI's LOC service. Deliberately its own package, not folded into `modem/` — see the `gps/` package section below for why. Has unit tests (`go test ./gps/...`).
+- `cmd/gps-tool/` → `gps-tool` binary — probe for a GPS fix on an interval and print it forever. No InfluxDB (no `gps-exporter` yet — schema still undecided, see Telemetry). Mirrors `modem-tool`/`twamp-tool`'s structure.
+- `openwrt/*.init` — `procd` init scripts for WaveOS (`modem-tool.init`, `modem-exporter.init`, `twamp-tool.init`, `twamp-exporter.init`, `gps-tool.init`; the exporter ones need their `DEVICE_ID`/token edited per board before install).
+- `*.service` — `systemd` units for Debian gateways (`dawn-agent.service`, `modem-tool.service`, `modem-exporter.service`, `twamp-tool.service`, `twamp-exporter.service`, `gps-tool.service`).
 - `metrics-endpoint.md` — **the authoritative handoff doc for the InfluxDB/Grafana telemetry side**, written for Claude Code specifically. Read this before touching `modem-exporter`'s schema or the server stack.
 - `DEPLOYMENT.md` — end-to-end runbook for bringing a new gateway board onto the fleet: provisioning its InfluxDB token (`add-device.sh`), installing the right binaries for Debian (systemd) vs WaveOS (procd, cross-compiled), verifying data lands in InfluxDB, and why Grafana needs no manual "add device" step (its `device` variable is query-driven).
 - `dawn6g-metrics/` — a local copy of the actual server stack deployed on `wservices.wavesys.pt` (`~/dawn6g-metrics` there, Apache + Docker Compose InfluxDB/Grafana; `add-device.sh`/`revoke-device.sh`/`bootstrap.sh`/`lib.sh`). Treat this copy as reference, not a thing this repo deploys — the real one lives on that server.
@@ -43,6 +45,19 @@ Native Go sender for "TWAMP Light" (RFC 5357-style, unauthenticated, no TWAMP-Co
 
 Confirmed live with 0% loss against `10.30.30.1:862` from `aaeon`, `6global`, and `dawn6g`.
 
+## `gps/` package
+
+Reads GPS/GNSS fixes from a modem's own GNSS receiver. Deliberately a standalone package (own process, `gps-tool`/future `gps-exporter`) — not wired into `dawn-agent`'s active-monitoring loop or folded into `modem/`'s stateless per-call backend shape, because the QMI backend genuinely needs a different shape (see below).
+
+`Supports(method)` — only **ModemManager** and raw **QMI** are implemented:
+- **ModemManager**: `gps-raw` location source reports already-parsed decimal `modem.location.gps.{latitude,longitude,altitude}` directly — no NMEA parsing needed. Enabled via `--location-enable-gps-raw` (root/PolicyKit-gated, retried the same way `modem/mmcli.go`'s `runMmcliSetup` does). **Not yet validated live** — `aaeon`'s modem has confirmed capability (`gps-raw`/`gps-nmea`/`gps-unmanaged`/`agps-msa`/`agps-msb`, plus a dedicated `ttyUSB1 (gps)` port) but hasn't actually been enabled/tested with a real fix yet.
+- **Raw QMI (`qmicli`)**: has no one-shot "get current fix" command — only a `--loc-start`/`--loc-follow-nmea`(blocking stream)/`--loc-stop` session. `QMISession` owns a persistent background goroutine per device (started once, kept running, restarted on transient failure) that parses `$GxGGA` sentences and caches the latest fix — confirmed live, real NMEA sentences streaming from a SIMCom modem (no fix, no antenna connected, but the mechanism works). **Per-modem-firmware, not just per-backend**: a Quectel RM520N-GL (confirmed on both `6global` and `dawn6g`) rejects NMEA event registration outright at the QMI protocol level (`--loc-get-nmea-types` → `'NotSupported'`; `--loc-follow-nmea` → `QMI protocol error (48): 'InvalidArgument'`) — every attempt fails instantly, so `QMISession` gives up permanently after `qmiSessionMaxImmediateFailures` (3) consecutive *immediate* failures rather than retrying forever (a slow failure, by contrast, is treated as a transient hiccup and retried). The SIMCom modem on the same boards has no such issue.
+- `ubus`/`uqmi`/AT are **not implemented**: `ubus`'s `"location"` method only returns cell-ID/LAC-CI data, never real GPS coordinates, despite the name (would need a patch to the vendor's `uqmi-ubus.lua`); `uqmi` lists `pds` as a service name but exposes no actual PDS/location CLI action; AT hasn't been tested live.
+
+**`gps-tool` does NOT reuse `modem.Detect()`'s cascade result** — that cascade prioritizes `ubus` over raw QMI specifically to avoid QMI client contention, but `ubus` has no GPS support at all, so naively using its pick means `gps-tool` finds nothing on any WaveOS board. Instead it tries `modem.DetectModemManager` first, then independently falls back to `modem.DetectQMIMBIM` — GPS detection is its own concern, decoupled from the main cascade's `ubus`-priority tradeoff.
+
+**⚠️ Operational lesson (caused a real incident this session)**: never kill a `qmicli --loc-follow-nmea` (or any long-running `qmicli` session) with `timeout`/SIGKILL for manual testing — it doesn't let the QMI client release cleanly, and QMI client-ID state lives at the kernel-driver/modem-firmware level, shared across *all* processes talking to that device node, not just the one you killed. Doing this against `6global`'s Quectel (`/dev/cdc-wdm1`) during development left its QMI control endpoint hung (`CID allocation failed... endpoint hangup`) — restarting the userspace daemons (`qmi-proxy`, `uqmi-ubus`) did **not** recover it, and the production `modem-exporter` lost that modem's telemetry until the board was rebooted. If you need to test a QMI session by hand, let it exit on its own or send a graceful stop, and never test against a device another process (especially a production exporter) depends on.
+
 ## Build & Run
 
 ```bash
@@ -57,6 +72,8 @@ sudo make install-modem-tool       # modem-tool → /opt/dawn, registers systemd
 sudo make install-modem-exporter   # modem-exporter → /opt/dawn; needs /opt/dawn/modem-exporter.env (INFLUX_TOKEN=...) created manually, see modem-exporter.env.example
 sudo make install-twamp-tool       # twamp-tool → /opt/dawn, registers systemd unit
 sudo make install-twamp-exporter   # twamp-exporter → /opt/dawn; reuses the same /opt/dawn/modem-exporter.env token as modem-exporter
+make gps-tool                      # standalone GPS diagnostic CLI (not part of `make`/`make install`)
+sudo make install-gps-tool         # gps-tool → /opt/dawn, registers systemd unit
 
 sudo ./dawn-agent -iface wwan0 -reflector 10.30.30.1:862   # root required to load eBPF
 ```
@@ -66,7 +83,7 @@ On WaveOS: no Go/clang toolchain on-device and storage is tight — cross-compil
 Notes:
 - `go.mod`/`go.sum` are gitignored; `make deps` creates them fresh. Don't manually pin dependency versions in a committed `go.mod` — if one goes stale (e.g. a `netlink` version that no longer resolves), delete and regenerate rather than patching by hand.
 - `dawn-agent` loads `tc_glitch.o` from the current working directory at runtime.
-- `modem/` and `twamp/` both have real unit tests; `dawn-agent`'s eBPF side still has none (`stress_test.sh` / `tc qdisc ... netem` for manual validation).
+- `modem/`, `twamp/`, and `gps/` all have real unit tests; `dawn-agent`'s eBPF side still has none (`stress_test.sh` / `tc qdisc ... netem` for manual validation).
 
 ## Architecture
 
@@ -108,20 +125,22 @@ The real server stack is **`~/dawn6g-metrics` on `wservices.wavesys.pt`** (Apach
 **Per-device tokens**: `./add-device.sh <id>` in `dawn6g-metrics/` on `wservices` — writes `secrets/devices/<id>.token` **and** `secrets/devices/<id>.authid` (the InfluxDB auth entry's own ID; `revoke-device.sh` needs this file and can't revoke by token value alone). **`6global` and `dawn6g`'s tokens were created manually** (not via `add-device.sh`), so neither has an `.authid` file — `revoke-device.sh` won't work for them until one is created (look up the auth ID via `influx auth list` and write it to `secrets/devices/<id>.authid` by hand, or recreate the token properly through the script).
 On each gateway, the token is wired in as `INFLUX_TOKEN` — `/opt/dawn/modem-exporter.env` (mode 600) for systemd, baked into the `procd` init script for WaveOS. This diverges from `metrics-endpoint.md`'s documented on-device convention (`/etc/dawn6g/influx.token`, read directly as a file by the Go agent) — functionally fine since our services resolve the env var themselves, but worth knowing if anything else ever expects that exact path.
 
-**Known deployed devices**: `aaeon` (Debian, ModemManager, SIMCom, real MEO registration), `6global` (WaveOS Supermicro, reachable at `10.10.10.184`, SIMCom + Quectel), `dawn6g` (WaveOS Supermicro, `10.10.10.201`, SIMCom + Quectel). Neither WaveOS board has a SIM or an antenna connected. `6global`'s Quectel has nonetheless shown real RSRP/PLMN/TAC (see the no-SIM note above) by camping on a nearby cell through incidental RF leakage on the bare antenna connector — not reproducible/meaningful until real antennas are attached; `dawn6g` hasn't picked up anything at all, which is plausible RF randomness given neither board has an antenna, not evidence of a fault.
+**Known deployed devices**: `aaeon` (Debian, ModemManager, SIMCom, real MEO registration), `6global` (WaveOS Supermicro, reachable at `10.10.10.184`, SIMCom + Quectel), `dawn6g` (WaveOS Supermicro, `10.10.10.201`, SIMCom + Quectel). Neither WaveOS board has an antenna connected. `6global` has no SIM; its Quectel has nonetheless shown real RSRP/PLMN/TAC (see the no-SIM note above) by camping on a nearby cell through incidental RF leakage on the bare antenna connector — not reproducible/meaningful until a real antenna is attached. **`dawn6g` got a real SIM installed this session (2026-11-10)** — its Quectel (`lte1`) registered immediately with operator NOS over `ubus`, confirming the SIM/registration path works end-to-end; still no antenna attached.
 
 ## Known Issues
 
 - **Startup detection race, no retry on the `ubus`/QMI cascade.** `modem.Detect()` runs once per process lifetime. If WaveOS's `uqmi-ubus` daemon (or ModemManager) isn't fully ready yet right after a reboot, detection falls through to a worse/contention-prone method (raw `qmicli`/`uqmi`) and never re-evaluates — this has caused real QMI client-ID exhaustion in production (`6global`, twice). A retry-with-backoff exists for ModemManager's `--signal-setup` call specifically (`modem/mmcli.go`, `runMmcliSetup`) but **not** for the overall cascade. If telemetry goes quiet after a reboot, check whether the process is stuck on `qmicli`/`uqmi` (log lines say `via: QMI`/`via: uqmi` instead of `via: ubus`/`via: ModemManager`) and just restart the service — a fresh detection pass usually fixes it immediately.
 - **`uqmi-ubus.lua` discards PCI/EARFCN/bandwidth.** It computes them via `AT+QENG` (Quectel) but explicitly nils them before exposing anything over `ubus` (`/lib/wavesys/lib/lua/uqmi/uqmi-ubus.lua`). Not fixable from this repo — would need a patch to that vendor script.
 - **`ubus` backend doesn't normalize TAC/CellID to decimal** (see above) — cosmetic inconsistency vs. other backends, not yet fixed.
+- **Killing a raw `qmicli` session abruptly can hang the device's QMI endpoint for every process, not just yours** — see the `gps/` package section's "Operational lesson" for a real incident this caused on `6global`.
 
 ## Deployment Context
 
 - `dawn-agent.service`: systemd unit; runs `init_gateway.sh` first, then the agent from `/opt/dawn`.
 - `init_gateway.sh`: loads kernel modules, configures the modem's dedicated QoS bearer via AT commands (DSCP EF / cid 2), and sets up HTB traffic shaping with a priority lane for EF-marked traffic.
 - `modem-tool.service`/`modem-exporter.service`/`twamp-tool.service`/`twamp-exporter.service`: systemd units for the Debian gateway; `openwrt/*.init` for WaveOS (`procd`). All four are deployed and running on `aaeon`/`6global`/`dawn6g` as of this session.
+- `gps-tool.service`/`openwrt/gps-tool.init`: built and unit-tested this session, **not yet deployed as a running service anywhere** — only ad hoc live testing via a manually-copied binary so far (see `gps/` package section).
 
 ## License Constraint
 
-GPL-2.0 — required for the eBPF program (`__license` section is "GPL"; kernel helpers demand it). Only applies to the `dawn-agent`/`bpf_src` side; `modem/`, `modem-tool`, `modem-exporter`, `twamp/`, `twamp-tool`, `twamp-exporter` have no such constraint.
+GPL-2.0 — required for the eBPF program (`__license` section is "GPL"; kernel helpers demand it). Only applies to the `dawn-agent`/`bpf_src` side; `modem/`, `modem-tool`, `modem-exporter`, `twamp/`, `twamp-tool`, `twamp-exporter`, `gps/`, `gps-tool` have no such constraint.
