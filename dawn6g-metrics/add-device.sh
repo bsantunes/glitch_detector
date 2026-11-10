@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Usage: ./add-device.sh <device-id>
-# Creates a write-only token for radio/network/events, stored in secrets/devices/<id>.token
+# Creates a write-only token for radio/network/events/location, stored in secrets/devices/<id>.token
 source "$(dirname "$0")/lib.sh"
 
 id="${1:?usage: $0 <device-id>}"
@@ -9,7 +9,7 @@ tok="secrets/devices/$id.token"
 [[ -e "$tok" ]] && die "$id already has a token (revoke it first)"
 
 args=()
-for b in radio network events; do
+for b in radio network events location; do
   bid="$(bucket_id "$b")"; [[ -n "$bid" ]] || die "bucket $b missing, run ./bootstrap.sh"
   args+=(--write-bucket "$bid")
 done

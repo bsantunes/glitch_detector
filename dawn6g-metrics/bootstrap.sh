@@ -7,15 +7,16 @@ source "$(dirname "$0")/lib.sh"
 
 docker compose up -d --wait influxdb
 
-ensure_bucket radio   "$RETENTION_RADIO"
-ensure_bucket network "$RETENTION_NETWORK"
-ensure_bucket events  "$RETENTION_EVENTS"
+ensure_bucket radio    "$RETENTION_RADIO"
+ensure_bucket network  "$RETENTION_NETWORK"
+ensure_bucket events   "$RETENTION_EVENTS"
+ensure_bucket location "$RETENTION_LOCATION"
 
 if [[ -s secrets/grafana_influx_token ]]; then
   echo "grafana token exists"
 else
   args=()
-  for b in radio network events; do args+=(--read-bucket "$(bucket_id "$b")"); done
+  for b in radio network events location; do args+=(--read-bucket "$(bucket_id "$b")"); done
   token="$(ix auth create --description "grafana-read" "${args[@]}" --json | json_field token)"
   [[ -n "$token" ]] || die "could not create grafana token"
   printf '%s' "$token" > secrets/grafana_influx_token
