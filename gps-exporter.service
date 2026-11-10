@@ -1,0 +1,19 @@
+[Unit]
+Description=DAWN6G GPS Exporter (push GPS/GNSS fixes to InfluxDB)
+After=network-online.target ModemManager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dawn
+# Reuses the same per-device token as modem-exporter.service — add-device.sh
+# issues one token scoped to write on all four buckets (radio/network/events/location).
+EnvironmentFile=/opt/dawn/modem-exporter.env
+ExecStart=/opt/dawn/gps-exporter -interval 30s -influx-url https://wservices.wavesys.pt:8086 -influx-org wavecom -influx-bucket location -device-id aaeon
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

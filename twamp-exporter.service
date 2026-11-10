@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/opt/dawn
 # Reuses the same per-device token as modem-exporter.service — add-device.sh
-# issues one token scoped to write on all three buckets (radio/network/events).
+# issues one token scoped to write on all four buckets (radio/network/events/location).
 EnvironmentFile=/opt/dawn/modem-exporter.env
 ExecStart=/opt/dawn/twamp-exporter -reflector 10.30.30.1:862 -interval 30s -influx-url https://wservices.wavesys.pt:8086 -influx-org wavecom -influx-bucket network -device-id aaeon
 Restart=always

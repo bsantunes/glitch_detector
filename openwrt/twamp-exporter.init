@@ -6,8 +6,8 @@
 # `/etc/init.d/twamp-exporter enable && /etc/init.d/twamp-exporter start`.
 #
 # Reuses the SAME /opt/dawn/modem-exporter.env token as modem-exporter —
-# add-device.sh issues one per-device token scoped to write on all three
-# buckets (radio/network/events), so no separate token is needed here.
+# add-device.sh issues one per-device token scoped to write on all four
+# buckets (radio/network/events/location), so no separate token is needed here.
 
 START=97
 STOP=2

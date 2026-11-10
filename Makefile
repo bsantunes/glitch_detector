@@ -8,6 +8,7 @@ EXPORTER_BIN := modem-exporter
 TWAMP_BIN := twamp-tool
 TWAMP_EXPORTER_BIN := twamp-exporter
 GPS_BIN := gps-tool
+GPS_EXPORTER_BIN := gps-exporter
 GO_MOD  := go.mod
 INSTALL_DIR := /opt/dawn
 
@@ -35,10 +36,14 @@ twamp-exporter: deps
 	go build -o $(TWAMP_EXPORTER_BIN) ./cmd/twamp-exporter
 
 # standalone GPS/GNSS fix prober (gps/ package) — ModemManager/raw-QMI
-# backends only so far, see gps.Supports. No InfluxDB exporter yet
-# (schema still being decided) — gps-tool only.
+# backends only so far, see gps.Supports.
 gps-tool: deps
 	go build -o $(GPS_BIN) ./cmd/gps-tool
+
+# long-running service that polls gps/ and pushes GPS fixes to
+# InfluxDB's "location" bucket — meant to run continuously (systemd/procd).
+gps-exporter: deps
+	go build -o $(GPS_EXPORTER_BIN) ./cmd/gps-exporter
 
 # ensure go.mod exists and dependencies are fetched
 $(GO_MOD):
@@ -61,7 +66,7 @@ $(BPF_OBJ): $(BPF_SRC)
 
 
 clean:
-	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN) $(TWAMP_BIN) $(TWAMP_EXPORTER_BIN) $(GPS_BIN)
+	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN) $(TWAMP_BIN) $(TWAMP_EXPORTER_BIN) $(GPS_BIN) $(GPS_EXPORTER_BIN)
 
 # install the agent, BPF object and init script into $(INSTALL_DIR)
 # (creates the directory if needed) and register the systemd unit.
@@ -132,4 +137,18 @@ install-gps-tool: gps-tool
 	@echo "✅ Installed to $(INSTALL_DIR). Enable with: sudo systemctl enable --now gps-tool"
 	@echo "   Logs: journalctl -u gps-tool -f"
 
-.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter gps-tool install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool
+# install gps-exporter, which pushes to InfluxDB. Reuses the same
+# /opt/dawn/modem-exporter.env token as modem-exporter/twamp-exporter
+# (add-device.sh tokens are scoped to write across all four buckets).
+# Run with sudo: sudo make install-gps-exporter
+install-gps-exporter: gps-exporter
+	install -d $(INSTALL_DIR)
+	install -m 755 $(GPS_EXPORTER_BIN) $(INSTALL_DIR)/
+	install -m 644 gps-exporter.service /etc/systemd/system/
+	systemctl daemon-reload
+	@echo "✅ Installed to $(INSTALL_DIR)."
+	@echo "   Reuses /opt/dawn/modem-exporter.env for INFLUX_TOKEN (see install-modem-exporter)."
+	@echo "   Then enable with: sudo systemctl enable --now gps-exporter"
+	@echo "   Logs: journalctl -u gps-exporter -f"
+
+.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter
