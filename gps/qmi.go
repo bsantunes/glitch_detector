@@ -29,9 +29,15 @@ import (
 // single attempt fails instantly, so retrying forever would just spam
 // the log for a device that will never work. The SIMCom modem on the
 // same boards has no such issue and streams real NMEA sentences fine.
+// qmiSessionCloseGraceDelay bounds how long Close waits for a graceful
+// shutdown (via --loc-stop ending the session server-side, which should
+// make the running --loc-follow-nmea process exit on its own) before
+// falling back to a force-kill. See Close's doc comment for why the
+// graceful path matters.
 const (
 	qmiSessionRetryDelay           = 5 * time.Second
 	qmiSessionMaxImmediateFailures = 3
+	qmiSessionCloseGraceDelay      = 3 * time.Second
 )
 
 // QMISession owns a long-lived QMI LOC NMEA stream for one QMI modem
@@ -48,10 +54,16 @@ type QMISession struct {
 	cancel context.CancelFunc
 	done   chan struct{}
 
-	mu      sync.Mutex
-	fix     Fix
+	mu  sync.Mutex
+	fix Fix
+	// stopped/lastErr: the session gave up permanently after repeated
+	// immediate failures (see qmiSessionMaxImmediateFailures) — a
+	// per-modem incompatibility, not a shutdown request.
 	stopped bool
 	lastErr error
+	// stopping: Close was called — run's loop should exit after the
+	// current followOnce call ends rather than retrying/restarting.
+	stopping bool
 }
 
 // NewQMISession starts the LOC session (--loc-start) and a background
@@ -72,12 +84,12 @@ func (s *QMISession) run(ctx context.Context) {
 	defer close(s.done)
 	immediateFailures := 0
 	for {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || s.stopRequested() {
 			return
 		}
 		start := time.Now()
 		err := s.followOnce(ctx)
-		if ctx.Err() != nil {
+		if ctx.Err() != nil || s.stopRequested() {
 			return
 		}
 		if err == nil {
@@ -143,11 +155,42 @@ func (s *QMISession) Fix() (Fix, error) {
 	return s.fix, nil
 }
 
-// Close stops the background goroutine and the QMI LOC session.
+// stopRequested reports whether Close has been called.
+func (s *QMISession) stopRequested() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stopping
+}
+
+// Close stops the QMI LOC session gracefully: it tells run's loop not
+// to restart --loc-follow-nmea, then runs --loc-stop to end the
+// session server-side — which should make the currently running
+// --loc-follow-nmea process notice its stream ended and exit on its
+// own — before falling back to a force-kill (via context cancellation)
+// only if that doesn't happen within qmiSessionCloseGraceDelay.
+//
+// Getting this order backwards (force-kill first, --loc-stop after, as
+// this code used to do) caused a real production incident: killing
+// --loc-follow-nmea abruptly doesn't let the QMI client release
+// cleanly, and that client-ID state lives at the kernel-driver/modem-
+// firmware level — shared across every process talking to that device
+// node, not scoped to this one. Doing that against 6global's Quectel
+// modem left its QMI control endpoint hung for every client, breaking
+// production modem-exporter telemetry for that modem until a reboot.
 func (s *QMISession) Close() {
-	s.cancel()
-	<-s.done
+	s.mu.Lock()
+	s.stopping = true
+	s.mu.Unlock()
+
 	_ = exec.Command("qmicli", "-d", s.device, "--loc-stop").Run()
+
+	select {
+	case <-s.done:
+	case <-time.After(qmiSessionCloseGraceDelay):
+		s.cancel() // last resort — didn't exit gracefully in time
+		<-s.done
+	}
+	s.cancel() // no-op if already canceled; always release the context
 }
 
 // parseNMEAGGA parses an NMEA "GGA" sentence (any talker ID — $GPGGA,
