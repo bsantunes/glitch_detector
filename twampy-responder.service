@@ -1,0 +1,17 @@
+[Unit]
+Description=TWAMP Responder (twampy) - reflector for DAWN6G gateway TWAMP clients
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/idwave/twampy
+ExecStart=/home/idwave/twampy/venv/bin/twampy responder :862
+User=root
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
