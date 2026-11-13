@@ -150,9 +150,9 @@ func signalSlicesEqual(a, b []Signal) bool {
 // `mmcli -m 0 --output-keyvalue` on the gateway board.
 func TestCellInfoFrom3GPPKeyValue(t *testing.T) {
 	info := map[string]string{
-		"modem.3gpp.operator-code":       "26806",
-		"modem.3gpp.operator-name":       "MEO",
-		"modem.3gpp.registration-state":  "home",
+		"modem.3gpp.operator-code":        "26806",
+		"modem.3gpp.operator-name":        "MEO",
+		"modem.3gpp.registration-state":   "home",
 		"modem.3gpp.packet-service-state": "attached",
 	}
 	want := CellInfo{PLMN: "26806", OperatorName: "MEO", RegistrationState: "home", PacketServiceState: "attached"}

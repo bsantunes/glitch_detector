@@ -66,7 +66,7 @@ func TestParseCGPSINFO_ValidFix(t *testing.T) {
 
 func TestParseCGPSINFO_Malformed(t *testing.T) {
 	for _, resp := range []string{
-		"AT+CGPSINFO\r\nOK\r\n",     // no +CGPSINFO line at all
+		"AT+CGPSINFO\r\nOK\r\n",      // no +CGPSINFO line at all
 		"+CGPSINFO: ,,,,,\r\nOK\r\n", // too few fields
 	} {
 		if _, err := parseCGPSINFO(resp); err == nil {
@@ -123,7 +123,7 @@ func TestParseQGPSLOC_ValidFix(t *testing.T) {
 
 func TestParseQGPSLOC_Malformed(t *testing.T) {
 	for _, resp := range []string{
-		"AT+QGPSLOC=2\r\nOK\r\n",           // no +QGPSLOC line and no CME ERROR
+		"AT+QGPSLOC=2\r\nOK\r\n",              // no +QGPSLOC line and no CME ERROR
 		"+QGPSLOC: 061951.00,41.02\r\nOK\r\n", // too few fields
 	} {
 		if _, err := parseQGPSLOC(resp); err == nil {
