@@ -8,8 +8,16 @@ import (
 	"dawn-agent/modem"
 )
 
-// Detect finds modems via the two backends Supports actually
-// implements — ModemManager first, then raw QMI if that finds nothing.
+// Detect finds modems via the backends Supports actually implements —
+// ModemManager, then raw QMI (currently always unusable — see
+// Supports), then AT-over-serial — stopping as soon as a step yields
+// at least one modem Supports will actually use, rather than just the
+// first step to find *any* modem. That distinction matters here: on
+// WaveOS, modem.DetectQMIMBIM(ctx) reliably finds modems (raw qmicli
+// answers cdc-wdm0/1 fine), but every one of them is useless for GPS
+// right now (QMI is disabled) — stopping there like modem.Detect()'s
+// own cascade does would mean never reaching AT at all.
+//
 // Deliberately independent of modem.Detect()'s own cascade: that
 // cascade prioritizes WaveOS's ubus backend over raw QMI specifically
 // to avoid QMI client-ID contention with the uqmi-ubus daemon, but
@@ -20,21 +28,40 @@ func Detect(ctx context.Context) ([]modem.Modem, error) {
 	modems, err := modem.DetectModemManager(ctx)
 	if err != nil {
 		log.Printf("gps: ModemManager detection unavailable: %v", err)
-	} else if len(modems) > 0 {
+	} else if anySupported(modems) {
 		return modems, nil
 	}
 
-	modems, err = modem.DetectQMIMBIM(ctx)
+	qmiModems, err := modem.DetectQMIMBIM(ctx)
 	if err != nil {
 		log.Printf("gps: QMI/MBIM detection unavailable: %v", err)
+	} else if anySupported(qmiModems) {
+		return qmiModems, nil
 	}
-	// MBIM-detected modems are simply skipped later by Supports — only
-	// QMI-method ones from this call are usable.
-	return modems, nil
+
+	atModems, err := modem.DetectAT(ctx)
+	if err != nil {
+		log.Printf("gps: AT detection unavailable: %v", err)
+	}
+	return atModems, nil
+}
+
+// anySupported reports whether at least one modem in modems is one
+// Supports actually approves of.
+func anySupported(modems []modem.Modem) bool {
+	for _, m := range modems {
+		if Supports(m.Method) {
+			return true
+		}
+	}
+	return false
 }
 
 // Supports reports whether GPS fixes are available for a modem detected
-// via method. Only ModemManager (gps-raw location source) is enabled:
+// via method. ModemManager (gps-raw location source) and AT-over-serial
+// (SIMCom/Quectel vendor commands — see detectATGPSVendor; other
+// manufacturers refused by NewPoller, not here, same as the QMI
+// disable) are enabled:
 //   - raw QMI (qmicli's LOC service) is **implemented but deliberately
 //     disabled** (see NewPoller/NewQMISession) after repeatedly
 //     corrupting a modem's QMI client state in production, even with a
@@ -53,10 +80,9 @@ func Detect(ctx context.Context) ([]modem.Modem, error) {
 //     PCI/EARFCN-discard limitation in modem/'s Known Issues.
 //   - uqmi lists "pds" as a supported service name but this build
 //     exposes no actual PDS/location CLI action to call.
-//   - AT-over-serial hasn't been tested live yet.
 func Supports(method modem.Method) bool {
 	switch method {
-	case modem.MethodModemManager:
+	case modem.MethodModemManager, modem.MethodAT:
 		return true
 	default:
 		return false
@@ -66,15 +92,22 @@ func Supports(method modem.Method) bool {
 // Poller gets GPS fixes for one modem. Construct with NewPoller and
 // Close when done — QMI-backed pollers own a persistent background
 // session (see QMISession) that must be torn down explicitly;
-// ModemManager-backed ones hold no resources and Close is a no-op.
+// ModemManager/AT-backed ones hold no resources and Close is a no-op
+// (every Fix call is a fresh mmcli/AT command, nothing kept open
+// between polls).
 type Poller struct {
-	m       modem.Modem
-	session *QMISession // nil for ModemManager
+	m        modem.Modem
+	session  *QMISession // nil for ModemManager/AT
+	atVendor atGPSVendor // atGPSVendorUnknown for ModemManager/QMI
 }
 
 // NewPoller sets up GPS polling for m. For ModemManager, this enables
 // the gps-raw location source (best-effort, retried — see
-// enableModemManager) and every Fix call makes a fresh mmcli call.
+// enableModemManager) and every Fix call makes a fresh mmcli call. For
+// AT, this enables the modem's own GNSS engine via its vendor-specific
+// command (see enableAT) and every Fix call makes a fresh AT query
+// (see getFixAT) — same one-shot-per-call shape as ModemManager, not
+// a persistent session.
 //
 // The QMI path (NewQMISession — a persistent background NMEA session,
 // since qmicli has no one-shot "get current fix" command) is
@@ -87,6 +120,15 @@ func NewPoller(ctx context.Context, m modem.Modem) (*Poller, error) {
 	case modem.MethodModemManager:
 		enableModemManager(ctx, m)
 		return &Poller{m: m}, nil
+	case modem.MethodAT:
+		vendor := detectATGPSVendor(m)
+		if vendor == atGPSVendorUnknown {
+			return nil, fmt.Errorf("gps: AT GPS not supported for manufacturer %q (only SIMCom/Quectel recognized)", m.Manufacturer)
+		}
+		if err := enableAT(ctx, m, vendor); err != nil {
+			return nil, err
+		}
+		return &Poller{m: m, atVendor: vendor}, nil
 	case modem.MethodQMI:
 		return nil, fmt.Errorf("gps: QMI backend is disabled (see Supports' doc comment) — refusing to start a session for %s", m.Port)
 	default:
@@ -95,11 +137,14 @@ func NewPoller(ctx context.Context, m modem.Modem) (*Poller, error) {
 }
 
 // Fix returns the current GPS fix for this poller's modem. For
-// ModemManager this makes a fresh mmcli call; for QMI it's an instant
-// read of the background session's cache (see QMISession.Fix).
+// ModemManager/AT this makes a fresh mmcli/AT call; for QMI it's an
+// instant read of the background session's cache (see QMISession.Fix).
 func (p *Poller) Fix(ctx context.Context) (Fix, error) {
 	if p.session != nil {
 		return p.session.Fix()
+	}
+	if p.atVendor != atGPSVendorUnknown {
+		return getFixAT(p.m, p.atVendor)
 	}
 	return getFixModemManager(ctx, p.m)
 }

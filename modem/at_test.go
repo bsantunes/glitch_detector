@@ -24,6 +24,18 @@ func TestParseATI(t *testing.T) {
 			wantManufacturer: "Quectel",
 			wantModel:        "EC25",
 		},
+		{
+			// Real captured output from a live Quectel RM520N-GL
+			// (6global/dawn6g, no SIM present): it spams unsolicited
+			// "+CPIN: NOT INSERTED" notifications before actually
+			// answering ATI. Without anchoring on the command echo,
+			// the positional fallback mistakes that noise for the
+			// manufacturer/model themselves.
+			name:             "unsolicited notifications before the echo",
+			resp:             "\r\n+CPIN: NOT INSERTED\r\n\r\n+CPIN: NOT INSERTED\r\n\r\nATI\r\nQuectel\r\nRM520N-GL\r\nRevision: RM520NGLAAR03A04M4G\r\n\r\nOK\r\n\r\n+CPIN: NOT INSERTED\r\n",
+			wantManufacturer: "Quectel",
+			wantModel:        "RM520N-GL",
+		},
 	}
 
 	for _, tc := range cases {
