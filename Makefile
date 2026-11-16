@@ -9,6 +9,7 @@ TWAMP_BIN := twamp-tool
 TWAMP_EXPORTER_BIN := twamp-exporter
 GPS_BIN := gps-tool
 GPS_EXPORTER_BIN := gps-exporter
+GLITCH_BIN := glitch-tool
 GO_MOD  := go.mod
 INSTALL_DIR := /opt/dawn
 
@@ -45,6 +46,18 @@ gps-tool: deps
 gps-exporter: deps
 	go build -o $(GPS_EXPORTER_BIN) ./cmd/gps-exporter
 
+# copy for go:embed — the glitch/ package embeds tc_glitch.o from its
+# own directory (go:embed can't reach ../), so this mirrors the
+# repo-root object built above rather than compiling it twice.
+glitch/tc_glitch.o: $(BPF_OBJ)
+	cp $(BPF_OBJ) glitch/tc_glitch.o
+
+# standalone passive eBPF stall/retransmission monitor (glitch/
+# package) — same event stream as dawn-agent's passive loop, no
+# TWAMP/modem side, no InfluxDB.
+glitch-tool: deps glitch/tc_glitch.o
+	go build -o $(GLITCH_BIN) ./cmd/glitch-tool
+
 # ensure go.mod exists and dependencies are fetched
 $(GO_MOD):
 	@echo "initializing go module and fetching dependencies"
@@ -66,7 +79,7 @@ $(BPF_OBJ): $(BPF_SRC)
 
 
 clean:
-	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN) $(TWAMP_BIN) $(TWAMP_EXPORTER_BIN) $(GPS_BIN) $(GPS_EXPORTER_BIN)
+	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN) $(TWAMP_BIN) $(TWAMP_EXPORTER_BIN) $(GPS_BIN) $(GPS_EXPORTER_BIN) $(GLITCH_BIN) glitch/tc_glitch.o
 
 # install the agent, BPF object and init script into $(INSTALL_DIR)
 # (creates the directory if needed) and register the systemd unit.
@@ -151,4 +164,4 @@ install-gps-exporter: gps-exporter
 	@echo "   Then enable with: sudo systemctl enable --now gps-exporter"
 	@echo "   Logs: journalctl -u gps-exporter -f"
 
-.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter
+.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter glitch-tool install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter
