@@ -6,22 +6,36 @@ import (
 	"testing"
 )
 
-func TestWireEventRoundTrip(t *testing.T) {
-	want := wireEvent{
-		SrcIP: 0x0100007f, // stored little-endian the same way the kernel already does
-		DstIP: 0x08080808,
-		Value: 150_000_000,
-		Type:  uint32(KindStall),
-		Proto: 6,
+// TestWireEventDecode decodes a hand-built byte sequence matching the
+// real C struct glitch_event layout exactly (21 bytes of real fields,
+// 3 bytes of the compiler's own trailing padding to the u64 member's
+// 8-byte struct alignment, 24 total) — not a Go-to-Go round trip, which
+// would pass even if wireEvent's field order didn't actually match the
+// C struct.
+func TestWireEventDecode(t *testing.T) {
+	raw := []byte{
+		0x7f, 0x00, 0x00, 0x01, // src_ip = 127.0.0.1, stored the way the kernel already does
+		0x08, 0x08, 0x08, 0x08, // dst_ip = 8.8.8.8
+		0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // value = 0x1122334455667788 (byte-order-sensitive pattern)
+		0x01, 0x00, 0x00, 0x00, // type = 1 (stall)
+		0x06,             // proto = 6 (TCP)
+		0x00, 0x00, 0x00, // compiler's trailing pad to 24 bytes — never read
 	}
-	var buf bytes.Buffer
-	if err := binary.Write(&buf, binary.LittleEndian, want); err != nil {
-		t.Fatalf("binary.Write: %v", err)
+	if len(raw) != 24 {
+		t.Fatalf("test fixture is %d bytes, want 24 (sizeof(struct glitch_event) with its natural padding)", len(raw))
 	}
 
 	var got wireEvent
-	if err := binary.Read(bytes.NewReader(buf.Bytes()), binary.LittleEndian, &got); err != nil {
+	if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, &got); err != nil {
 		t.Fatalf("binary.Read: %v", err)
+	}
+
+	want := wireEvent{
+		SrcIP: 0x0100007f,
+		DstIP: 0x08080808,
+		Value: 0x1122334455667788,
+		Type:  uint32(KindStall),
+		Proto: 6,
 	}
 	if got != want {
 		t.Errorf("got %+v, want %+v", got, want)

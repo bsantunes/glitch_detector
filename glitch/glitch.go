@@ -4,9 +4,10 @@
 // decodes events from its ring buffer into a clean Go type. Extracted
 // from main.go/dawn-agent so cmd/glitch-tool and cmd/glitch-exporter
 // can share the loading/attach/decode logic instead of duplicating it
-// — same shape as modem/, twamp/, and gps/. main.go itself is
-// deliberately left on its own original, unextracted copy of this
-// logic; see CLAUDE.md for why.
+// — same shape as modem/, twamp/, and gps/. main.go itself is left on
+// its own original, unextracted copy of this logic for now, so this
+// change carries zero risk to the one piece of this project that can't
+// be unit-tested (needs root and real hardware).
 package glitch
 
 import (
@@ -16,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"syscall"
 
@@ -25,9 +27,12 @@ import (
 )
 
 // go:embed can only reach files in its own package directory, never a
-// parent (`../`) — the Makefile copies the repo-root-built tc_glitch.o
-// here specifically so this works, rather than compiling it twice; see
-// CLAUDE.md's glitch/ section.
+// parent (`../`) — the Makefile's `glitch/tc_glitch.o` rule copies the
+// repo-root-built object here specifically so this works, rather than
+// compiling it twice. Run `make glitch/tc_glitch.o` (or `make embed`)
+// before `go vet ./...`/`go test ./...` on a fresh checkout — this is
+// now a compile-time dependency for the whole module, not just a
+// dawn-agent runtime one.
 //
 //go:embed tc_glitch.o
 var bpfObject []byte
@@ -74,7 +79,12 @@ type Event struct {
 
 // wireEvent mirrors bpf_src/tc_glitch.bpf.c's struct glitch_event
 // byte-for-byte — decoded via binary.Read, little-endian. Keep these
-// two in sync; see that file's own struct comment.
+// two in sync; see that file's own struct comment. Phase 1's C struct
+// is 21 bytes of real fields, padded to 24 by the compiler to satisfy
+// the u64 member's 8-byte struct alignment; binary.Read only consumes
+// the fields declared below, so that trailing pad is simply never read
+// — see glitch_test.go's TestWireEventDecode for a fixture built from
+// the real 24-byte layout, not a Go-to-Go round trip.
 type wireEvent struct {
 	SrcIP uint32
 	DstIP uint32
@@ -90,22 +100,35 @@ type bpfObjects struct {
 
 // Handle owns one loaded+attached instance of the glitch BPF program on
 // one interface. Call Close when done to remove the filter and qdisc
-// and release kernel resources.
+// (whichever this Handle actually created — see ownsQdisc) and release
+// kernel resources.
 type Handle struct {
-	qdisc  *netlink.GenericQdisc
-	filter *netlink.BpfFilter
-	objs   bpfObjects
-	rd     *ringbuf.Reader
+	qdisc     *netlink.GenericQdisc
+	ownsQdisc bool // only true if this Handle's own QdiscAdd created it (not a pre-existing EEXIST)
+	filter    *netlink.BpfFilter
+	objs      bpfObjects
+	rd        *ringbuf.Reader
 
 	events  chan Event
 	dropped uint64 // atomic
-	done    chan struct{}
+
+	mu   sync.Mutex
+	err  error // non-nil once readLoop sees a real (non-ErrClosed) reader error
+	done chan struct{}
 }
 
-// Open loads the embedded BPF object, attaches it to iface's egress via
-// a clsact qdisc + BPF filter (tolerating either already existing, the
-// same way main.go always has), and starts reading its ring buffer in
-// the background. Call Close when done.
+// Open loads the embedded BPF object and attaches it to iface's egress
+// via a clsact qdisc (reusing one if it already exists — shared qdiscs
+// across multiple attached programs are normal) and a BPF filter, then
+// starts reading its ring buffer in the background. Call Close when
+// done.
+//
+// Unlike the qdisc, the filter must be one this Handle actually
+// installed: if FilterAdd reports EEXIST, some other process already
+// occupies that exact filter slot, which means this Handle's own
+// program was never actually attached and would silently never receive
+// any events — Open returns a clear error in that case rather than
+// continuing in that broken state.
 func Open(iface string) (h *Handle, err error) {
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfObject))
 	if err != nil {
@@ -132,12 +155,19 @@ func Open(iface string) (h *Handle, err error) {
 		QdiscAttrs: netlink.QdiscAttrs{LinkIndex: link.Attrs().Index, Handle: netlink.MakeHandle(0xffff, 0), Parent: netlink.HANDLE_CLSACT},
 		QdiscType:  "clsact",
 	}
-	if qerr := netlink.QdiscAdd(qdisc); qerr != nil && !errors.Is(qerr, syscall.EEXIST) {
-		err = fmt.Errorf("glitch: QdiscAdd: %w", qerr)
-		return nil, err
+	ownsQdisc := false
+	if qerr := netlink.QdiscAdd(qdisc); qerr != nil {
+		if !errors.Is(qerr, syscall.EEXIST) {
+			err = fmt.Errorf("glitch: QdiscAdd: %w", qerr)
+			return nil, err
+		}
+		// Pre-existing qdisc, not ours — fine to share, but we must not
+		// delete it later (see ownsQdisc below).
+	} else {
+		ownsQdisc = true
 	}
 	defer func() {
-		if err != nil {
+		if err != nil && ownsQdisc {
 			netlink.QdiscDel(qdisc)
 		}
 	}()
@@ -148,8 +178,12 @@ func Open(iface string) (h *Handle, err error) {
 		Name:         "egress_monitor",
 		DirectAction: true,
 	}
-	if ferr := netlink.FilterAdd(filter); ferr != nil && !errors.Is(ferr, syscall.EEXIST) {
-		err = fmt.Errorf("glitch: FilterAdd: %w", ferr)
+	if ferr := netlink.FilterAdd(filter); ferr != nil {
+		if errors.Is(ferr, syscall.EEXIST) {
+			err = fmt.Errorf("glitch: another glitch monitor is already attached to %s", iface)
+		} else {
+			err = fmt.Errorf("glitch: FilterAdd: %w", ferr)
+		}
 		return nil, err
 	}
 	defer func() {
@@ -164,12 +198,13 @@ func Open(iface string) (h *Handle, err error) {
 	}
 
 	handle := &Handle{
-		qdisc:  qdisc,
-		filter: filter,
-		objs:   objs,
-		rd:     rd,
-		events: make(chan Event, 256),
-		done:   make(chan struct{}),
+		qdisc:     qdisc,
+		ownsQdisc: ownsQdisc,
+		filter:    filter,
+		objs:      objs,
+		rd:        rd,
+		events:    make(chan Event, 256),
+		done:      make(chan struct{}),
 	}
 	go handle.readLoop()
 	return handle, nil
@@ -182,11 +217,21 @@ func Open(iface string) (h *Handle, err error) {
 // kernel ring buffer. This is new plumbing, not a behavior change under
 // normal use — the channel's buffer only fills if a consumer falls
 // behind, which none of this phase's callers do.
+//
+// Closes Events() and records any real error (everything except the
+// expected ringbuf.ErrClosed from our own Close) in h.err, readable via
+// Err() once Events() reports closed.
 func (h *Handle) readLoop() {
+	defer close(h.events)
 	defer close(h.done)
 	for {
 		rec, err := h.rd.Read()
 		if err != nil {
+			if !errors.Is(err, ringbuf.ErrClosed) {
+				h.mu.Lock()
+				h.err = fmt.Errorf("glitch: ring buffer read: %w", err)
+				h.mu.Unlock()
+			}
 			return
 		}
 		var w wireEvent
@@ -208,11 +253,22 @@ func (h *Handle) readLoop() {
 	}
 }
 
-// Events returns the channel of decoded glitch events. It's closed once
-// the Handle's ring buffer reader stops, which normally only happens
-// after Close.
+// Events returns the channel of decoded glitch events. It is closed
+// once the ring buffer reader stops — normally only after Close, but
+// also on an unexpected read error; check Err() once a receive reports
+// the channel closed to tell the two apart.
 func (h *Handle) Events() <-chan Event {
 	return h.events
+}
+
+// Err returns the error that caused the ring buffer reader to stop, if
+// any. Always nil until Events() is closed; nil after a normal Close
+// too, since that produces the expected ringbuf.ErrClosed, which isn't
+// treated as a real error.
+func (h *Handle) Err() error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.err
 }
 
 // Dropped returns the cumulative count of events dropped because a
@@ -221,19 +277,22 @@ func (h *Handle) Dropped() uint64 {
 	return atomic.LoadUint64(&h.dropped)
 }
 
-// Close removes the BPF filter and qdisc (filter first, then qdisc —
-// the same order main.go's own deferred cleanup already ran in) and
+// Close removes the BPF filter, and the qdisc too if this Handle is
+// the one that created it (see ownsQdisc) — the same order main.go's
+// own deferred cleanup already ran in, filter before qdisc — and
 // releases the loaded program/map and ring buffer reader.
 func (h *Handle) Close() error {
-	h.rd.Close() // unblocks readLoop's pending Read(), which then returns and closes h.done
+	h.rd.Close() // unblocks readLoop's pending Read() with ringbuf.ErrClosed
 	<-h.done
 
 	var errs []error
 	if err := netlink.FilterDel(h.filter); err != nil {
 		errs = append(errs, fmt.Errorf("FilterDel: %w", err))
 	}
-	if err := netlink.QdiscDel(h.qdisc); err != nil {
-		errs = append(errs, fmt.Errorf("QdiscDel: %w", err))
+	if h.ownsQdisc {
+		if err := netlink.QdiscDel(h.qdisc); err != nil {
+			errs = append(errs, fmt.Errorf("QdiscDel: %w", err))
+		}
 	}
 	h.objs.EgressMonitor.Close()
 	h.objs.Events.Close()

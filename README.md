@@ -105,6 +105,11 @@ make
 make clean
 ```
 
+If you're running `go vet ./...`/`go test ./...` directly instead of through
+`make`, run `make embed` first — the `glitch` package embeds the compiled BPF
+object via `go:embed`, so that file has to exist before the Go toolchain can
+even compile the package, not just before running the final binary.
+
 ### 4. Install as a Service (optional)
 
 To deploy the agent permanently on the gateway, install it into `/opt/dawn`

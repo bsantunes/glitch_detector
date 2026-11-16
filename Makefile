@@ -52,6 +52,12 @@ gps-exporter: deps
 glitch/tc_glitch.o: $(BPF_OBJ)
 	cp $(BPF_OBJ) glitch/tc_glitch.o
 
+# convenience alias: run this once on a fresh checkout before using
+# `go vet ./...`/`go test ./...` directly (bypassing make) — go:embed
+# makes glitch/tc_glitch.o a compile-time dependency for the whole
+# module, not just a dawn-agent runtime one.
+embed: glitch/tc_glitch.o
+
 # standalone passive eBPF stall/retransmission monitor (glitch/
 # package) — same event stream as dawn-agent's passive loop, no
 # TWAMP/modem side, no InfluxDB.
@@ -164,4 +170,4 @@ install-gps-exporter: gps-exporter
 	@echo "   Then enable with: sudo systemctl enable --now gps-exporter"
 	@echo "   Logs: journalctl -u gps-exporter -f"
 
-.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter glitch-tool install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter
+.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter glitch-tool embed install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter

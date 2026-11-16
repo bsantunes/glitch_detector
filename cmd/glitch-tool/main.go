@@ -38,6 +38,9 @@ func main() {
 			return
 		case ev, ok := <-h.Events():
 			if !ok {
+				if err := h.Err(); err != nil {
+					log.Fatalf("glitch: ring buffer reader stopped: %v", err)
+				}
 				return
 			}
 			if ev.Type == glitch.KindRetrans {
