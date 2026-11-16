@@ -118,7 +118,7 @@ type Handle struct {
 	filter      *netlink.BpfFilter
 	objs        bpfObjects
 	rd          *ringbuf.Reader
-	clockOffset int64 // wall_ns - mono_ns, taken once at Open; see Open's doc comment
+	clockOffset int64 // atomic: wall_ns - mono_ns, refreshed periodically — see refreshClockOffset
 
 	events  chan Event
 	dropped uint64 // atomic
@@ -126,7 +126,18 @@ type Handle struct {
 	mu   sync.Mutex
 	err  error // non-nil once readLoop sees a real (non-ErrClosed) reader error
 	done chan struct{}
+
+	stopOffsetRefresh chan struct{}
+	offsetRefreshDone chan struct{}
 }
+
+// clockOffsetRefreshInterval is how often Open's background goroutine
+// recomputes clockOffset. A one-time offset captured only at Open would
+// drift out of sync with reality if the system clock steps after boot
+// (e.g. an NTP correction once connectivity comes up) — recomputing it
+// periodically keeps later events' wall-clock Time accurate without
+// needing per-event clock reads.
+const clockOffsetRefreshInterval = 10 * time.Second
 
 // Open loads the embedded BPF object and attaches it to iface's egress
 // via a clsact qdisc (reusing one if it already exists — shared qdiscs
@@ -147,11 +158,13 @@ type Handle struct {
 //
 // Each Event's Time is wall-clock, converted from the BPF program's
 // raw bpf_ktime_get_ns() timestamp (CLOCK_MONOTONIC — an arbitrary
-// epoch, not meaningful on its own) via an offset computed once here:
-// (CLOCK_REALTIME at this moment) - (CLOCK_MONOTONIC at this same
-// moment). Both clocks tick at the same real-world rate, so that delta
-// stays accurate for the Handle's whole lifetime; it's deliberately
-// not recomputed per-event.
+// epoch, not meaningful on its own) via an offset: (CLOCK_REALTIME at
+// some moment) - (CLOCK_MONOTONIC at that same moment). Both clocks
+// tick at the same real-world rate, so a single offset stays accurate
+// between recomputations — but it's refreshed every
+// clockOffsetRefreshInterval rather than taken once at Open, so a wall
+// clock step after boot (e.g. an NTP correction once connectivity
+// comes up) doesn't permanently skew every later event's Time.
 func Open(iface string) (h *Handle, err error) {
 	lockFile, err := os.OpenFile(fmt.Sprintf("/run/glitch-%s.lock", iface), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -171,12 +184,11 @@ func Open(iface string) (h *Handle, err error) {
 		return nil, err
 	}
 
-	var monoNow unix.Timespec
-	if merr := unix.ClockGettime(unix.CLOCK_MONOTONIC, &monoNow); merr != nil {
-		err = fmt.Errorf("glitch: ClockGettime(CLOCK_MONOTONIC): %w", merr)
+	clockOffset, cerr := computeClockOffset()
+	if cerr != nil {
+		err = fmt.Errorf("glitch: ClockGettime(CLOCK_MONOTONIC): %w", cerr)
 		return nil, err
 	}
-	clockOffset := time.Now().UnixNano() - monoNow.Nano()
 
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfObject))
 	if err != nil {
@@ -248,18 +260,51 @@ func Open(iface string) (h *Handle, err error) {
 	}
 
 	handle := &Handle{
-		lockFile:    lockFile,
-		qdisc:       qdisc,
-		ownsQdisc:   ownsQdisc,
-		filter:      filter,
-		objs:        objs,
-		rd:          rd,
-		clockOffset: clockOffset,
-		events:      make(chan Event, 256),
-		done:        make(chan struct{}),
+		lockFile:          lockFile,
+		qdisc:             qdisc,
+		ownsQdisc:         ownsQdisc,
+		filter:            filter,
+		objs:              objs,
+		rd:                rd,
+		clockOffset:       clockOffset,
+		events:            make(chan Event, 256),
+		done:              make(chan struct{}),
+		stopOffsetRefresh: make(chan struct{}),
+		offsetRefreshDone: make(chan struct{}),
 	}
 	go handle.readLoop()
+	go handle.refreshClockOffsetLoop()
 	return handle, nil
+}
+
+// computeClockOffset returns (CLOCK_REALTIME now) - (CLOCK_MONOTONIC now),
+// both read as close together as possible.
+func computeClockOffset() (int64, error) {
+	var monoNow unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &monoNow); err != nil {
+		return 0, err
+	}
+	return time.Now().UnixNano() - monoNow.Nano(), nil
+}
+
+// refreshClockOffsetLoop recomputes clockOffset every
+// clockOffsetRefreshInterval until Close stops it. A failed
+// ClockGettime is left for the next tick rather than treated as fatal —
+// the existing offset simply keeps being used until it succeeds again.
+func (h *Handle) refreshClockOffsetLoop() {
+	defer close(h.offsetRefreshDone)
+	ticker := time.NewTicker(clockOffsetRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-h.stopOffsetRefresh:
+			return
+		case <-ticker.C:
+			if offset, err := computeClockOffset(); err == nil {
+				atomic.StoreInt64(&h.clockOffset, offset)
+			}
+		}
+	}
 }
 
 // readLoop decodes ring buffer records into Events, forwarding them on
@@ -291,7 +336,7 @@ func (h *Handle) readLoop() {
 			continue
 		}
 		ev := Event{
-			Time:    time.Unix(0, int64(w.Ts)+h.clockOffset),
+			Time:    time.Unix(0, int64(w.Ts)+atomic.LoadInt64(&h.clockOffset)),
 			SrcIP:   int2ip(w.SrcIP),
 			DstIP:   int2ip(w.DstIP),
 			SrcPort: w.SrcPort,
@@ -339,6 +384,9 @@ func (h *Handle) Dropped() uint64 {
 // exclusivity lock (closing the fd is enough; flock releases on close,
 // no explicit LOCK_UN needed) so a subsequent Open can succeed.
 func (h *Handle) Close() error {
+	close(h.stopOffsetRefresh)
+	<-h.offsetRefreshDone
+
 	h.rd.Close() // unblocks readLoop's pending Read() with ringbuf.ErrClosed
 	<-h.done
 

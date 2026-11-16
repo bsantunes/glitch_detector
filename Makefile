@@ -13,7 +13,13 @@ GLITCH_BIN := glitch-tool
 GO_MOD  := go.mod
 INSTALL_DIR := /opt/dawn
 
-all: $(BPF_OBJ) $(GO_BIN)
+# dawn-agent is superseded by glitch-exporter + twamp-exporter +
+# modem-exporter (see README) - not built or installed by default
+# anymore. $(BPF_OBJ) stays a default-build dependency since glitch-tool
+# and glitch-exporter both need it too (see glitch/tc_glitch.o below).
+# Use `make dawn-agent` / `make install-dawn-agent` explicitly if you
+# still need the old eBPF-only agent.
+all: $(BPF_OBJ)
 
 # standalone modem detection/signal-quality CLI (modem/ package) — not
 # part of the default build, since it's for developing modem support
@@ -89,8 +95,10 @@ clean:
 
 # install the agent, BPF object and init script into $(INSTALL_DIR)
 # (creates the directory if needed) and register the systemd unit.
-# Run with sudo: sudo make install
-install: all
+# dawn-agent is superseded (see README) - this is no longer the plain
+# `install` target, so it's never pulled in by accident.
+# Run with sudo: sudo make install-dawn-agent
+install-dawn-agent: $(BPF_OBJ) $(GO_BIN)
 	install -d $(INSTALL_DIR)
 	install -m 755 $(GO_BIN) init_gateway.sh $(INSTALL_DIR)/
 	install -m 644 $(BPF_OBJ) $(INSTALL_DIR)/
@@ -170,4 +178,4 @@ install-gps-exporter: gps-exporter
 	@echo "   Then enable with: sudo systemctl enable --now gps-exporter"
 	@echo "   Logs: journalctl -u gps-exporter -f"
 
-.PHONY: all clean install modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter glitch-tool embed install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter
+.PHONY: all clean dawn-agent install-dawn-agent modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter glitch-tool embed install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter

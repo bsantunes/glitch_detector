@@ -32,7 +32,14 @@ struct flow_key {
 // State we track per flow
 struct flow_state {
     __u64 last_ts;
-    __u32 max_seq; // Highest TCP Sequence seen
+    __u32 end_seq; // Highest (seq + payload_len) seen so far - the end of
+                   // the furthest-reaching segment sent, not just its start.
+                   // Tracking only the start (as a prior version of this
+                   // program did) under-counts how far a segment actually
+                   // reached, which matters once a retransmission is only
+                   // flagged for segments that carry real payload (see
+                   // below) - a resend of the *most recent* segment must
+                   // still compare behind its true end, not just its start.
 };
 
 // Event data sent to Go. Ordered large-to-small so the only padding is
@@ -94,6 +101,16 @@ int egress_monitor(struct __sk_buff *skb) {
     if (ihl < 5) return TC_ACT_OK;
     void *l4 = (void *)ip + (ihl * 4);
 
+    // Skip non-first fragments: the fragment offset (low 13 bits of
+    // frag_off) is non-zero for every fragment after the first, and
+    // those never carry a TCP/UDP header at all - what sits right after
+    // the IP header in a non-first fragment is raw payload, not a
+    // tcphdr/udphdr, so parsing it as one would misread arbitrary bytes
+    // as ports/sequence numbers. The first fragment (offset 0, possibly
+    // with the more-fragments bit set) still carries the real L4 header
+    // and is processed normally below.
+    if (bpf_ntohs(ip->frag_off) & 0x1FFF) return TC_ACT_OK;
+
     // Define Flow Key
     struct flow_key key = {};
     key.src_ip = ip->saddr;
@@ -148,23 +165,36 @@ int egress_monitor(struct __sk_buff *skb) {
         }
 
         // 2. CHECK FOR RETRANSMISSION (TCP Only), wraparound-safe: a
-        // plain `seq < max_seq` compare breaks every time the 32-bit
+        // plain `seq < end_seq` compare breaks every time the 32-bit
         // sequence number wraps (roughly every 4 GiB of one flow's
         // traffic), since a freshly-wrapped small seq would otherwise
-        // always look "behind" a large pre-wrap max_seq. The signed-
+        // always look "behind" a large pre-wrap end_seq. The signed-
         // difference idiom (same one the Linux kernel's own TCP stack
         // uses) stays correct across the wrap.
+        //
+        // Compared against end_seq (seq + payload length), not just the
+        // segment's start - and only when this packet actually carries
+        // payload. A pure ACK/keepalive (payload_len == 0) repeats the
+        // same seq every time by design (it has nothing new to send),
+        // which would otherwise look identical to a real resend; it
+        // carries no data to have been "resent" at all, so it can never
+        // be flagged and never advances end_seq either.
         if (tcp) {
-            __u32 seq = bpf_ntohl(tcp->seq);    // Get Sequence Number
-            __s32 diff = (__s32)(seq - state->max_seq);
+            __u32 seq = bpf_ntohl(tcp->seq);
+            __u16 tcp_hlen = tcp->doff * 4;
+            __u16 l4_hlen = ihl * 4 + tcp_hlen;
+            __u16 ip_total_len = bpf_ntohs(ip->tot_len);
+            __u16 payload_len = (ip_total_len > l4_hlen) ? (ip_total_len - l4_hlen) : 0;
 
-            if (diff < 0) {
-                 // seq is behind max_seq - an old packet sent again.
+            __s32 diff = (__s32)(seq - state->end_seq);
+            if (diff < 0 && payload_len > 0) {
+                 // seq is behind end_seq and this segment carries real
+                 // data - an old byte range sent again.
                  struct glitch_event *e = bpf_ringbuf_reserve(&events, sizeof(*e), 0);
                  if (e) {
                     e->ts = ts;
                     e->value = (__u64)(-diff); // How far back did it jump?
-                    // ... It means we already saw this packet! It was RESENT.
+                    // ... It means we already saw this data! It was RESENT.
                     e->src_ip = key.src_ip;
                     e->dst_ip = key.dst_ip;
                     e->type = EVENT_TYPE_RETRANS;
@@ -173,8 +203,8 @@ int egress_monitor(struct __sk_buff *skb) {
                     e->proto = ip->protocol;
                     bpf_ringbuf_submit(e, 0);
                  }
-            } else {
-                state->max_seq = seq; // Update max
+            } else if (diff >= 0 && payload_len > 0) {
+                state->end_seq = seq + payload_len; // Update furthest-reaching end
             }
         }
         state->last_ts = ts;
@@ -182,7 +212,13 @@ int egress_monitor(struct __sk_buff *skb) {
         // New Flow
         struct flow_state new_state = {};
         new_state.last_ts = ts;
-        if (tcp) new_state.max_seq = bpf_ntohl(tcp->seq);
+        if (tcp) {
+            __u16 tcp_hlen = tcp->doff * 4;
+            __u16 l4_hlen = ihl * 4 + tcp_hlen;
+            __u16 ip_total_len = bpf_ntohs(ip->tot_len);
+            __u16 payload_len = (ip_total_len > l4_hlen) ? (ip_total_len - l4_hlen) : 0;
+            new_state.end_seq = bpf_ntohl(tcp->seq) + payload_len;
+        }
         bpf_map_update_elem(&flow_tracker, &key, &new_state, BPF_ANY);
     }
 

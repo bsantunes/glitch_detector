@@ -53,10 +53,21 @@ func run() error {
 				return h.Err()
 			}
 			if ev.Type == glitch.KindRetrans {
-				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | Dest: %s\n", ev.DstIP)
+				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | %s %s:%d -> %s:%d\n", protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			} else {
-				fmt.Printf("⚠️  [KERNEL] Stall: %.1fms | Dest: %s\n", float64(ev.Value)/1e6, ev.DstIP)
+				fmt.Printf("⚠️  [KERNEL] Stall: %.1fms | %s %s:%d -> %s:%d\n", float64(ev.Value)/1e6, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			}
 		}
+	}
+}
+
+func protoName(proto uint8) string {
+	switch proto {
+	case 6:
+		return "TCP"
+	case 17:
+		return "UDP"
+	default:
+		return fmt.Sprintf("proto(%d)", proto)
 	}
 }

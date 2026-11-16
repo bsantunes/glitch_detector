@@ -110,6 +110,19 @@ If you're running `go vet ./...`/`go test ./...` directly instead of through
 object via `go:embed`, so that file has to exist before the Go toolchain can
 even compile the package, not just before running the final binary.
 
+**`dawn-agent` itself (`main.go`) is superseded** by `glitch-exporter` +
+`twamp-exporter` + `modem-exporter` running side by side — the eBPF passive
+detection, TWAMP, and modem telemetry it used to do in one process now each
+live in their own package/tool/exporter (`glitch/`, `twamp/`, `modem/`), with
+events actually reaching InfluxDB instead of only being printed. `dawn-agent`
+is kept in the tree for now but is no longer built or installed by `make`/
+`make install` — use `make dawn-agent`/`sudo make install-dawn-agent`
+explicitly if you still need it. Note that it loads `tc_glitch.o` itself and
+still decodes the old, smaller `glitch_event` layout, which no longer matches
+what the shared BPF object now emits — don't run it alongside `glitch-tool`/
+`glitch-exporter` on the same interface, and don't trust its stall/retrans
+output as-is.
+
 ### 4. Install as a Service (optional)
 
 To deploy the agent permanently on the gateway, install it into `/opt/dawn`
