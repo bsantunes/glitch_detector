@@ -79,7 +79,7 @@ $(GO_BIN): deps
 	go build -o $(GO_BIN)
 
 $(BPF_OBJ): $(BPF_SRC)
-	clang -O2 -g -target bpf \
+	clang -O2 -g -Wall -target bpf \
 	    -I/usr/include/$(shell uname -m)-linux-gnu \
 	    -c $< -o $@
 

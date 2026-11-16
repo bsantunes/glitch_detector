@@ -21,6 +21,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
@@ -64,35 +65,41 @@ func (k Kind) String() string {
 
 // Event is one decoded glitch_event from the BPF ring buffer.
 //
-// Phase 1 carries exactly the fields main.go's GlitchEvent already had
-// (same semantics, same byte layout) — Value is the raw stall duration
-// in nanoseconds for KindStall, or the retransmission's sequence-number
-// delta for KindRetrans, matching main.go's existing (and only
-// partially interpreted — it never printed Value for retrans) usage.
-// Phase 2 adds Time/SrcPort/DstPort once the BPF program itself reports
-// them.
+// Value is the raw stall duration in nanoseconds for KindStall, or the
+// retransmission's sequence-number delta for KindRetrans, matching
+// main.go's original GlitchEvent's (only partially interpreted there —
+// it never printed Value for retrans) usage. Time is wall-clock, not
+// the kernel's raw monotonic timestamp — see Open's doc comment for
+// how that conversion works.
 type Event struct {
-	SrcIP net.IP
-	DstIP net.IP
-	Value uint64
-	Type  Kind
-	Proto uint8
+	Time    time.Time
+	SrcIP   net.IP
+	DstIP   net.IP
+	SrcPort uint16
+	DstPort uint16
+	Value   uint64
+	Type    Kind
+	Proto   uint8
 }
 
 // wireEvent mirrors bpf_src/tc_glitch.bpf.c's struct glitch_event
 // byte-for-byte — decoded via binary.Read, little-endian. Keep these
-// two in sync; see that file's own struct comment. Phase 1's C struct
-// is 21 bytes of real fields, padded to 24 by the compiler to satisfy
-// the u64 member's 8-byte struct alignment; binary.Read only consumes
+// two in sync; see that file's own struct comment. 33 bytes of real
+// fields, padded by the compiler to 40 to satisfy the two __u64
+// members' 8-byte struct alignment (confirmed via a native-ABI host
+// compile, not just hand-counted offsets); binary.Read only consumes
 // the fields declared below, so that trailing pad is simply never read
 // — see glitch_test.go's TestWireEventDecode for a fixture built from
-// the real 24-byte layout, not a Go-to-Go round trip.
+// the real 40-byte layout, not a Go-to-Go round trip.
 type wireEvent struct {
-	SrcIP uint32
-	DstIP uint32
-	Value uint64
-	Type  uint32
-	Proto uint8
+	Ts      uint64
+	Value   uint64
+	SrcIP   uint32
+	DstIP   uint32
+	Type    uint32
+	SrcPort uint16
+	DstPort uint16
+	Proto   uint8
 }
 
 type bpfObjects struct {
@@ -105,12 +112,13 @@ type bpfObjects struct {
 // (whichever this Handle actually created — see ownsQdisc) and release
 // kernel resources.
 type Handle struct {
-	lockFile  *os.File
-	qdisc     *netlink.GenericQdisc
-	ownsQdisc bool // only true if this Handle's own QdiscAdd created it (not a pre-existing EEXIST)
-	filter    *netlink.BpfFilter
-	objs      bpfObjects
-	rd        *ringbuf.Reader
+	lockFile    *os.File
+	qdisc       *netlink.GenericQdisc
+	ownsQdisc   bool // only true if this Handle's own QdiscAdd created it (not a pre-existing EEXIST)
+	filter      *netlink.BpfFilter
+	objs        bpfObjects
+	rd          *ringbuf.Reader
+	clockOffset int64 // wall_ns - mono_ns, taken once at Open; see Open's doc comment
 
 	events  chan Event
 	dropped uint64 // atomic
@@ -136,6 +144,14 @@ type Handle struct {
 // any reason, so a stale filter no longer looks like a live instance —
 // Open takes over a leftover filter via FilterReplace (not FilterAdd)
 // once it holds the lock, rather than erroring on it.
+//
+// Each Event's Time is wall-clock, converted from the BPF program's
+// raw bpf_ktime_get_ns() timestamp (CLOCK_MONOTONIC — an arbitrary
+// epoch, not meaningful on its own) via an offset computed once here:
+// (CLOCK_REALTIME at this moment) - (CLOCK_MONOTONIC at this same
+// moment). Both clocks tick at the same real-world rate, so that delta
+// stays accurate for the Handle's whole lifetime; it's deliberately
+// not recomputed per-event.
 func Open(iface string) (h *Handle, err error) {
 	lockFile, err := os.OpenFile(fmt.Sprintf("/run/glitch-%s.lock", iface), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
@@ -154,6 +170,13 @@ func Open(iface string) (h *Handle, err error) {
 		}
 		return nil, err
 	}
+
+	var monoNow unix.Timespec
+	if merr := unix.ClockGettime(unix.CLOCK_MONOTONIC, &monoNow); merr != nil {
+		err = fmt.Errorf("glitch: ClockGettime(CLOCK_MONOTONIC): %w", merr)
+		return nil, err
+	}
+	clockOffset := time.Now().UnixNano() - monoNow.Nano()
 
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfObject))
 	if err != nil {
@@ -225,14 +248,15 @@ func Open(iface string) (h *Handle, err error) {
 	}
 
 	handle := &Handle{
-		lockFile:  lockFile,
-		qdisc:     qdisc,
-		ownsQdisc: ownsQdisc,
-		filter:    filter,
-		objs:      objs,
-		rd:        rd,
-		events:    make(chan Event, 256),
-		done:      make(chan struct{}),
+		lockFile:    lockFile,
+		qdisc:       qdisc,
+		ownsQdisc:   ownsQdisc,
+		filter:      filter,
+		objs:        objs,
+		rd:          rd,
+		clockOffset: clockOffset,
+		events:      make(chan Event, 256),
+		done:        make(chan struct{}),
 	}
 	go handle.readLoop()
 	return handle, nil
@@ -267,11 +291,14 @@ func (h *Handle) readLoop() {
 			continue
 		}
 		ev := Event{
-			SrcIP: int2ip(w.SrcIP),
-			DstIP: int2ip(w.DstIP),
-			Value: w.Value,
-			Type:  Kind(w.Type),
-			Proto: w.Proto,
+			Time:    time.Unix(0, int64(w.Ts)+h.clockOffset),
+			SrcIP:   int2ip(w.SrcIP),
+			DstIP:   int2ip(w.DstIP),
+			SrcPort: w.SrcPort,
+			DstPort: w.DstPort,
+			Value:   w.Value,
+			Type:    Kind(w.Type),
+			Proto:   w.Proto,
 		}
 		select {
 		case h.events <- ev:
