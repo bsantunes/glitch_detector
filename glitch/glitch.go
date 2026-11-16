@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
 
 // go:embed can only reach files in its own package directory, never a
@@ -103,6 +105,7 @@ type bpfObjects struct {
 // (whichever this Handle actually created — see ownsQdisc) and release
 // kernel resources.
 type Handle struct {
+	lockFile  *os.File
 	qdisc     *netlink.GenericQdisc
 	ownsQdisc bool // only true if this Handle's own QdiscAdd created it (not a pre-existing EEXIST)
 	filter    *netlink.BpfFilter
@@ -123,13 +126,35 @@ type Handle struct {
 // starts reading its ring buffer in the background. Call Close when
 // done.
 //
-// Unlike the qdisc, the filter must be one this Handle actually
-// installed: if FilterAdd reports EEXIST, some other process already
-// occupies that exact filter slot, which means this Handle's own
-// program was never actually attached and would silently never receive
-// any events — Open returns a clear error in that case rather than
-// continuing in that broken state.
+// Exclusivity is enforced by an flock on /run/glitch-<iface>.lock, held
+// for the Handle's lifetime — not by the tc filter's own presence. A tc
+// filter is kernel state that outlives the process that installed it:
+// after a crash, SIGKILL, or OOM kill, a stale filter would otherwise
+// make every later Open fail as if another instance were still running,
+// which under a Restart=always service is a permanent restart loop. The
+// kernel drops an flock automatically when its holding process dies for
+// any reason, so a stale filter no longer looks like a live instance —
+// Open takes over a leftover filter via FilterReplace (not FilterAdd)
+// once it holds the lock, rather than erroring on it.
 func Open(iface string) (h *Handle, err error) {
+	lockFile, err := os.OpenFile(fmt.Sprintf("/run/glitch-%s.lock", iface), os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("glitch: open lock file: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			lockFile.Close()
+		}
+	}()
+	if ferr := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); ferr != nil {
+		if errors.Is(ferr, unix.EWOULDBLOCK) {
+			err = fmt.Errorf("glitch: another glitch monitor is already attached to %s", iface)
+		} else {
+			err = fmt.Errorf("glitch: flock: %w", ferr)
+		}
+		return nil, err
+	}
+
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(bpfObject))
 	if err != nil {
 		return nil, fmt.Errorf("glitch: load collection spec: %w", err)
@@ -172,18 +197,20 @@ func Open(iface string) (h *Handle, err error) {
 		}
 	}()
 
+	// FilterReplace, not FilterAdd: the flock above is what guarantees
+	// exclusivity now, so a filter already present at this exact spot is
+	// either ours from last time (impossible — Close always removes it
+	// while the lock is held) or a stale leftover from a previous,
+	// now-dead holder of the lock (the crash/SIGKILL/OOM case) — take it
+	// over rather than erroring on it.
 	filter := &netlink.BpfFilter{
 		FilterAttrs:  netlink.FilterAttrs{LinkIndex: link.Attrs().Index, Parent: netlink.MakeHandle(0xffff, handleMinEgress), Handle: 1, Protocol: syscall.ETH_P_ALL, Priority: 1},
 		Fd:           objs.EgressMonitor.FD(),
 		Name:         "egress_monitor",
 		DirectAction: true,
 	}
-	if ferr := netlink.FilterAdd(filter); ferr != nil {
-		if errors.Is(ferr, syscall.EEXIST) {
-			err = fmt.Errorf("glitch: another glitch monitor is already attached to %s", iface)
-		} else {
-			err = fmt.Errorf("glitch: FilterAdd: %w", ferr)
-		}
+	if ferr := netlink.FilterReplace(filter); ferr != nil {
+		err = fmt.Errorf("glitch: FilterReplace: %w", ferr)
 		return nil, err
 	}
 	defer func() {
@@ -198,6 +225,7 @@ func Open(iface string) (h *Handle, err error) {
 	}
 
 	handle := &Handle{
+		lockFile:  lockFile,
 		qdisc:     qdisc,
 		ownsQdisc: ownsQdisc,
 		filter:    filter,
@@ -279,8 +307,10 @@ func (h *Handle) Dropped() uint64 {
 
 // Close removes the BPF filter, and the qdisc too if this Handle is
 // the one that created it (see ownsQdisc) — the same order main.go's
-// own deferred cleanup already ran in, filter before qdisc — and
-// releases the loaded program/map and ring buffer reader.
+// own deferred cleanup already ran in, filter before qdisc — releases
+// the loaded program/map and ring buffer reader, and releases the
+// exclusivity lock (closing the fd is enough; flock releases on close,
+// no explicit LOCK_UN needed) so a subsequent Open can succeed.
 func (h *Handle) Close() error {
 	h.rd.Close() // unblocks readLoop's pending Read() with ringbuf.ErrClosed
 	<-h.done
@@ -296,6 +326,7 @@ func (h *Handle) Close() error {
 	}
 	h.objs.EgressMonitor.Close()
 	h.objs.Events.Close()
+	h.lockFile.Close()
 	return errors.Join(errs...)
 }
 

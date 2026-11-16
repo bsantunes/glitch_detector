@@ -18,6 +18,18 @@ import (
 )
 
 func main() {
+	// Logic lives in run() so its deferred h.Close() always executes on
+	// any return path, including an error one — os.Exit (which
+	// log.Fatalf calls internally) skips deferred calls entirely, which
+	// would leave the filter attached. main only decides the process
+	// exit code after run has fully returned.
+	if err := run(); err != nil {
+		log.Print(err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
 	iface := flag.String("iface", "wwan0", "network interface to attach to")
 	flag.Parse()
 
@@ -26,7 +38,7 @@ func main() {
 
 	h, err := glitch.Open(*iface)
 	if err != nil {
-		log.Fatalf("glitch.Open(%s): %v", *iface, err)
+		return fmt.Errorf("glitch.Open(%s): %w", *iface, err)
 	}
 	defer h.Close()
 
@@ -35,13 +47,10 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			return
+			return nil
 		case ev, ok := <-h.Events():
 			if !ok {
-				if err := h.Err(); err != nil {
-					log.Fatalf("glitch: ring buffer reader stopped: %v", err)
-				}
-				return
+				return h.Err()
 			}
 			if ev.Type == glitch.KindRetrans {
 				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | Dest: %s\n", ev.DstIP)
