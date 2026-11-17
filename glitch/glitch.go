@@ -40,9 +40,19 @@ import (
 //go:embed tc_glitch.o
 var bpfObject []byte
 
-// handleMinEgress is the clsact egress hook handle the BPF filter
-// attaches to. Moved verbatim from main.go (was HANDLE_MINEGRESS there).
-const handleMinEgress = 0xFFF2
+// handleMinEgress is the clsact egress hook's minor handle value, passed
+// as MakeHandle's second (minor) argument below. main.go's original
+// HANDLE_MINEGRESS constant was actually 0xFFF2 — TC_H_MIN_INGRESS in
+// the real kernel/netlink ABI, not egress (TC_H_MIN_EGRESS = 0xFFF3) —
+// so dawn-agent/glitch-tool had silently been monitoring ingress
+// (downlink) this whole time despite every name and comment saying
+// egress. Every earlier live result measured against this program,
+// including dawn-agent's own and the August stress test, was therefore
+// observing ingress traffic, not egress.
+// netlink.HANDLE_MIN_EGRESS (0xFFFFFFF3) is the library's own pre-
+// combined full handle, not a bare minor value, so it can't be used
+// directly as MakeHandle's second argument — hence the literal here.
+const handleMinEgress = 0xFFF3
 
 // Kind identifies the type of glitch an Event reports.
 type Kind uint32
