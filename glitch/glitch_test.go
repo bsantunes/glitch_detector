@@ -7,26 +7,27 @@ import (
 )
 
 // TestWireEventDecode decodes a hand-built byte sequence matching the
-// real C struct glitch_event layout exactly (33 bytes of real fields,
-// 7 bytes of the compiler's own trailing padding to the two __u64
-// members' 8-byte struct alignment, 40 total — confirmed against a
-// native-ABI host compile of the same field layout, not just hand-
-// counted offsets) — not a Go-to-Go round trip, which would pass even
-// if wireEvent's field order didn't actually match the C struct.
+// real C struct glitch_event layout exactly (45 bytes of real fields,
+// 3 bytes of the compiler's own trailing padding to the three __u64
+// members' 8-byte struct alignment, 48 total) — not a Go-to-Go round
+// trip, which would pass even if wireEvent's field order didn't
+// actually match the C struct.
 func TestWireEventDecode(t *testing.T) {
 	raw := []byte{
 		0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, // ts = 0x0102030405060708 (byte-order-sensitive pattern)
 		0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11, // value = 0x1122334455667788
+		0xef, 0xcd, 0xab, 0x90, 0x78, 0x56, 0x34, 0x12, // baseline_ns = 0x1234567890abcdef
 		0x7f, 0x00, 0x00, 0x01, // src_ip = 127.0.0.1, stored the way the kernel already does
 		0x08, 0x08, 0x08, 0x08, // dst_ip = 8.8.8.8
-		0x01, 0x00, 0x00, 0x00, // type = 1 (stall)
+		0x03, 0x00, 0x00, 0x00, // type = 3 (stall_end)
+		0x07, 0x00, 0x00, 0x00, // steps = 7
 		0x39, 0x30, // src_port = 12345
 		0xbb, 0x01, // dst_port = 443
-		0x06,                                     // proto = 6 (TCP)
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // compiler's trailing pad to 40 bytes — never read
+		0x06,             // proto = 6 (TCP)
+		0x00, 0x00, 0x00, // compiler's trailing pad to 48 bytes — never read
 	}
-	if len(raw) != 40 {
-		t.Fatalf("test fixture is %d bytes, want 40 (sizeof(struct glitch_event) with its natural padding)", len(raw))
+	if len(raw) != 48 {
+		t.Fatalf("test fixture is %d bytes, want 48 (sizeof(struct glitch_event) with its natural padding)", len(raw))
 	}
 
 	var got wireEvent
@@ -35,14 +36,16 @@ func TestWireEventDecode(t *testing.T) {
 	}
 
 	want := wireEvent{
-		Ts:      0x0102030405060708,
-		Value:   0x1122334455667788,
-		SrcIP:   0x0100007f,
-		DstIP:   0x08080808,
-		Type:    uint32(KindStall),
-		SrcPort: 12345,
-		DstPort: 443,
-		Proto:   6,
+		Ts:         0x0102030405060708,
+		Value:      0x1122334455667788,
+		BaselineNs: 0x1234567890abcdef,
+		SrcIP:      0x0100007f,
+		DstIP:      0x08080808,
+		Type:       uint32(KindStallEnd),
+		Steps:      7,
+		SrcPort:    12345,
+		DstPort:    443,
+		Proto:      6,
 	}
 	if got != want {
 		t.Errorf("got %+v, want %+v", got, want)
@@ -75,8 +78,9 @@ func TestKindString(t *testing.T) {
 		k    Kind
 		want string
 	}{
-		{KindStall, "stall"},
+		{KindStallStart, "stall_start"},
 		{KindRetrans, "retrans"},
+		{KindStallEnd, "stall_end"},
 		{Kind(99), "unknown"},
 	}
 	for _, tt := range tests {

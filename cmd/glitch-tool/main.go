@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"dawn-agent/glitch"
 )
@@ -44,18 +45,32 @@ func run() error {
 
 	fmt.Printf("🚀 glitch-tool watching %s (Ctrl+C to stop)\n", *iface)
 
+	// Printed periodically, not just on a clean exit: a SIGKILL skips
+	// every deferred/exit-path print, so this is the only way to see
+	// whether the 256-slot Events() channel is backpressuring (events
+	// silently dropped because nothing drained it fast enough) rather
+	// than having to trust a final count that might never get printed.
+	dropTicker := time.NewTicker(5 * time.Second)
+	defer dropTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
+			fmt.Printf("📊 dropped=%d (final)\n", h.Dropped())
 			return nil
+		case <-dropTicker.C:
+			fmt.Printf("📊 dropped=%d\n", h.Dropped())
 		case ev, ok := <-h.Events():
 			if !ok {
 				return h.Err()
 			}
-			if ev.Type == glitch.KindRetrans {
+			switch ev.Type {
+			case glitch.KindRetrans:
 				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | %s %s:%d -> %s:%d\n", protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
-			} else {
-				fmt.Printf("⚠️  [KERNEL] Stall: %.1fms | %s %s:%d -> %s:%d\n", float64(ev.Value)/1e6, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+			case glitch.KindStallStart:
+				fmt.Printf("🟡 [KERNEL] Stall START: gap %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+			case glitch.KindStallEnd:
+				fmt.Printf("✅ [KERNEL] Stall END: duration %.1fms, steps=%d (baseline %.1fms) | %s %s:%d -> %s:%d\n", float64(ev.Value)/1e6, ev.Steps, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			}
 		}
 	}

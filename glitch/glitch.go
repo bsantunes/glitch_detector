@@ -44,30 +44,42 @@ var bpfObject []byte
 // as MakeHandle's second (minor) argument below. main.go's original
 // HANDLE_MINEGRESS constant was actually 0xFFF2 — TC_H_MIN_INGRESS in
 // the real kernel/netlink ABI, not egress (TC_H_MIN_EGRESS = 0xFFF3) —
-// so dawn-agent/glitch-tool had silently been monitoring ingress
-// (downlink) this whole time despite every name and comment saying
-// egress. Every earlier live result measured against this program,
-// including dawn-agent's own and the August stress test, was therefore
-// observing ingress traffic, not egress.
+// so dawn-agent/glitch-tool had silently been monitoring ingress this
+// whole time despite every name and comment saying egress.
 // netlink.HANDLE_MIN_EGRESS (0xFFFFFFF3) is the library's own pre-
 // combined full handle, not a bare minor value, so it can't be used
 // directly as MakeHandle's second argument — hence the literal here.
 const handleMinEgress = 0xFFF3
 
+// handleMinIngress is the clsact ingress hook's minor handle value —
+// TC_H_MIN_INGRESS, the correct value for the constant that used to be
+// (mis-)named handleMinEgress above. ingress_monitor attaches here to
+// track inbound ACKs for the TCP stall gate; see its own doc comment.
+const handleMinIngress = 0xFFF2
+
 // Kind identifies the type of glitch an Event reports.
 type Kind uint32
 
 const (
-	KindStall   Kind = 1
-	KindRetrans Kind = 2
+	// KindStallStart marks the first qualifying gap of a new stall
+	// episode. KindStallEnd closes it once a normal gap recovers,
+	// carrying the episode's total duration and step count — see the
+	// BPF program's stall-episode comment. No single-shot "stall"
+	// event is emitted per gap any more; every qualifying gap after
+	// the first just extends the open episode silently.
+	KindStallStart Kind = 1
+	KindRetrans    Kind = 2
+	KindStallEnd   Kind = 3
 )
 
 func (k Kind) String() string {
 	switch k {
-	case KindStall:
-		return "stall"
+	case KindStallStart:
+		return "stall_start"
 	case KindRetrans:
 		return "retrans"
+	case KindStallEnd:
+		return "stall_end"
 	default:
 		return "unknown"
 	}
@@ -75,60 +87,70 @@ func (k Kind) String() string {
 
 // Event is one decoded glitch_event from the BPF ring buffer.
 //
-// Value is the raw stall duration in nanoseconds for KindStall, or the
-// retransmission's sequence-number delta for KindRetrans, matching
-// main.go's original GlitchEvent's (only partially interpreted there —
-// it never printed Value for retrans) usage. Time is wall-clock, not
-// the kernel's raw monotonic timestamp — see Open's doc comment for
-// how that conversion works.
+// Value is the gap (ns) that triggered a KindStallStart, the total
+// episode duration (ns) for a KindStallEnd, or the sequence-number
+// delta for KindRetrans. Baseline is the per-flow stall threshold the
+// triggering gap was judged against (zero for KindRetrans, which has
+// no baseline concept) — see the BPF program's STALL_K/
+// STALL_MIN_PACKETS comment for how it's computed. Steps is only
+// meaningful on KindStallEnd: the number of qualifying gaps folded
+// into the episode that just closed (matches the visible retry/
+// backoff count). Time is wall-clock, not the kernel's raw monotonic
+// timestamp — see Open's doc comment for how that conversion works.
 type Event struct {
-	Time    time.Time
-	SrcIP   net.IP
-	DstIP   net.IP
-	SrcPort uint16
-	DstPort uint16
-	Value   uint64
-	Type    Kind
-	Proto   uint8
+	Time     time.Time
+	SrcIP    net.IP
+	DstIP    net.IP
+	SrcPort  uint16
+	DstPort  uint16
+	Value    uint64
+	Baseline time.Duration
+	Type     Kind
+	Steps    uint32
+	Proto    uint8
 }
 
 // wireEvent mirrors bpf_src/tc_glitch.bpf.c's struct glitch_event
 // byte-for-byte — decoded via binary.Read, little-endian. Keep these
-// two in sync; see that file's own struct comment. 33 bytes of real
-// fields, padded by the compiler to 40 to satisfy the two __u64
-// members' 8-byte struct alignment (confirmed via a native-ABI host
-// compile, not just hand-counted offsets); binary.Read only consumes
-// the fields declared below, so that trailing pad is simply never read
-// — see glitch_test.go's TestWireEventDecode for a fixture built from
-// the real 40-byte layout, not a Go-to-Go round trip.
+// two in sync; see that file's own struct comment. 45 bytes of real
+// fields, padded by the compiler to 48 to satisfy the three __u64
+// members' 8-byte struct alignment; binary.Read only consumes the
+// fields declared below, so that trailing pad is simply never read —
+// see glitch_test.go's TestWireEventDecode for a fixture built from the
+// real 48-byte layout, not a Go-to-Go round trip.
 type wireEvent struct {
-	Ts      uint64
-	Value   uint64
-	SrcIP   uint32
-	DstIP   uint32
-	Type    uint32
-	SrcPort uint16
-	DstPort uint16
-	Proto   uint8
+	Ts         uint64
+	Value      uint64
+	BaselineNs uint64
+	SrcIP      uint32
+	DstIP      uint32
+	Type       uint32
+	Steps      uint32
+	SrcPort    uint16
+	DstPort    uint16
+	Proto      uint8
 }
 
 type bpfObjects struct {
-	EgressMonitor *ebpf.Program `ebpf:"egress_monitor"`
-	Events        *ebpf.Map     `ebpf:"events"`
+	EgressMonitor  *ebpf.Program `ebpf:"egress_monitor"`
+	IngressMonitor *ebpf.Program `ebpf:"ingress_monitor"`
+	Events         *ebpf.Map     `ebpf:"events"`
 }
 
-// Handle owns one loaded+attached instance of the glitch BPF program on
-// one interface. Call Close when done to remove the filter and qdisc
-// (whichever this Handle actually created — see ownsQdisc) and release
-// kernel resources.
+// Handle owns one loaded+attached instance of the glitch BPF programs
+// (egress_monitor and ingress_monitor, sharing one flow_tracker map) on
+// one interface. Call Close when done to remove both filters and the
+// qdisc (whichever this Handle actually created — see ownsQdisc) and
+// release kernel resources.
 type Handle struct {
-	lockFile    *os.File
-	qdisc       *netlink.GenericQdisc
-	ownsQdisc   bool // only true if this Handle's own QdiscAdd created it (not a pre-existing EEXIST)
-	filter      *netlink.BpfFilter
-	objs        bpfObjects
-	rd          *ringbuf.Reader
-	clockOffset int64 // atomic: wall_ns - mono_ns, refreshed periodically — see refreshClockOffset
+	lockFile       *os.File
+	qdisc          *netlink.GenericQdisc
+	ownsQdisc      bool // only true if this Handle's own QdiscAdd created it (not a pre-existing EEXIST)
+	egressFilter   *netlink.BpfFilter
+	ingressFilter  *netlink.BpfFilter
+	objs           bpfObjects
+	rd             *ringbuf.Reader
+	clockOffset    int64 // atomic: wall_ns - mono_ns, refreshed periodically — see refreshClockOffset
 
 	events  chan Event
 	dropped uint64 // atomic
@@ -212,6 +234,7 @@ func Open(iface string) (h *Handle, err error) {
 	defer func() {
 		if err != nil {
 			objs.EgressMonitor.Close()
+			objs.IngressMonitor.Close()
 			objs.Events.Close()
 		}
 	}()
@@ -247,20 +270,36 @@ func Open(iface string) (h *Handle, err error) {
 	// either ours from last time (impossible — Close always removes it
 	// while the lock is held) or a stale leftover from a previous,
 	// now-dead holder of the lock (the crash/SIGKILL/OOM case) — take it
-	// over rather than erroring on it.
-	filter := &netlink.BpfFilter{
+	// over rather than erroring on it. Both filters share this logic.
+	egressFilter := &netlink.BpfFilter{
 		FilterAttrs:  netlink.FilterAttrs{LinkIndex: link.Attrs().Index, Parent: netlink.MakeHandle(0xffff, handleMinEgress), Handle: 1, Protocol: syscall.ETH_P_ALL, Priority: 1},
 		Fd:           objs.EgressMonitor.FD(),
 		Name:         "egress_monitor",
 		DirectAction: true,
 	}
-	if ferr := netlink.FilterReplace(filter); ferr != nil {
-		err = fmt.Errorf("glitch: FilterReplace: %w", ferr)
+	if ferr := netlink.FilterReplace(egressFilter); ferr != nil {
+		err = fmt.Errorf("glitch: FilterReplace(egress): %w", ferr)
 		return nil, err
 	}
 	defer func() {
 		if err != nil {
-			netlink.FilterDel(filter)
+			netlink.FilterDel(egressFilter)
+		}
+	}()
+
+	ingressFilter := &netlink.BpfFilter{
+		FilterAttrs:  netlink.FilterAttrs{LinkIndex: link.Attrs().Index, Parent: netlink.MakeHandle(0xffff, handleMinIngress), Handle: 1, Protocol: syscall.ETH_P_ALL, Priority: 1},
+		Fd:           objs.IngressMonitor.FD(),
+		Name:         "ingress_monitor",
+		DirectAction: true,
+	}
+	if ferr := netlink.FilterReplace(ingressFilter); ferr != nil {
+		err = fmt.Errorf("glitch: FilterReplace(ingress): %w", ferr)
+		return nil, err
+	}
+	defer func() {
+		if err != nil {
+			netlink.FilterDel(ingressFilter)
 		}
 	}()
 
@@ -273,7 +312,8 @@ func Open(iface string) (h *Handle, err error) {
 		lockFile:          lockFile,
 		qdisc:             qdisc,
 		ownsQdisc:         ownsQdisc,
-		filter:            filter,
+		egressFilter:      egressFilter,
+		ingressFilter:     ingressFilter,
 		objs:              objs,
 		rd:                rd,
 		clockOffset:       clockOffset,
@@ -346,14 +386,16 @@ func (h *Handle) readLoop() {
 			continue
 		}
 		ev := Event{
-			Time:    time.Unix(0, int64(w.Ts)+atomic.LoadInt64(&h.clockOffset)),
-			SrcIP:   int2ip(w.SrcIP),
-			DstIP:   int2ip(w.DstIP),
-			SrcPort: w.SrcPort,
-			DstPort: w.DstPort,
-			Value:   w.Value,
-			Type:    Kind(w.Type),
-			Proto:   w.Proto,
+			Time:     time.Unix(0, int64(w.Ts)+atomic.LoadInt64(&h.clockOffset)),
+			SrcIP:    int2ip(w.SrcIP),
+			DstIP:    int2ip(w.DstIP),
+			SrcPort:  w.SrcPort,
+			DstPort:  w.DstPort,
+			Value:    w.Value,
+			Baseline: time.Duration(w.BaselineNs),
+			Type:     Kind(w.Type),
+			Steps:    w.Steps,
+			Proto:    w.Proto,
 		}
 		select {
 		case h.events <- ev:
@@ -387,10 +429,10 @@ func (h *Handle) Dropped() uint64 {
 	return atomic.LoadUint64(&h.dropped)
 }
 
-// Close removes the BPF filter, and the qdisc too if this Handle is
+// Close removes both BPF filters, and the qdisc too if this Handle is
 // the one that created it (see ownsQdisc) — the same order main.go's
-// own deferred cleanup already ran in, filter before qdisc — releases
-// the loaded program/map and ring buffer reader, and releases the
+// own deferred cleanup already ran in, filters before qdisc — releases
+// the loaded programs/map and ring buffer reader, and releases the
 // exclusivity lock (closing the fd is enough; flock releases on close,
 // no explicit LOCK_UN needed) so a subsequent Open can succeed.
 func (h *Handle) Close() error {
@@ -401,8 +443,11 @@ func (h *Handle) Close() error {
 	<-h.done
 
 	var errs []error
-	if err := netlink.FilterDel(h.filter); err != nil {
-		errs = append(errs, fmt.Errorf("FilterDel: %w", err))
+	if err := netlink.FilterDel(h.egressFilter); err != nil {
+		errs = append(errs, fmt.Errorf("FilterDel(egress): %w", err))
+	}
+	if err := netlink.FilterDel(h.ingressFilter); err != nil {
+		errs = append(errs, fmt.Errorf("FilterDel(ingress): %w", err))
 	}
 	if h.ownsQdisc {
 		if err := netlink.QdiscDel(h.qdisc); err != nil {
@@ -410,6 +455,7 @@ func (h *Handle) Close() error {
 		}
 	}
 	h.objs.EgressMonitor.Close()
+	h.objs.IngressMonitor.Close()
 	h.objs.Events.Close()
 	h.lockFile.Close()
 	return errors.Join(errs...)
