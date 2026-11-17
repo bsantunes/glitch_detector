@@ -5,7 +5,7 @@
 A high-performance, eBPF-powered 5G gateway agent designed for **SIMCom SIM8202G-M2** modules. It provides active/passive network monitoring, 5QI QoS enforcement, and cloud-based telemetry.
 
 ## 🌟 Features
-- **Passive Monitoring:** eBPF-based detection of TCP retransmissions and micro-stalls (>100ms).
+- **Passive Monitoring:** eBPF-based detection of TCP retransmissions and stall episodes, judged against each flow's own adaptive pacing baseline (a fixed 100ms floor for flows with no established pace yet) rather than a single fixed threshold — see [glitch-tool's output](#4-glitch-tool-output) below.
 - **Active Auditing:** Multi-profile TWAMP (RFC 5357) to measure 5QI slice performance.
 - **Hardware Integration:** Real-time RSRP/RSRQ/RSSI/SINR extraction with automatic modem detection — tries ModemManager, then QMI/MBIM, then raw AT, so it isn't locked to one modem vendor.
 - **QoS Enforcement:** Dynamic traffic shaping (HTB) to protect critical flows (DSCP EF) during congestion.
@@ -19,6 +19,7 @@ A high-performance, eBPF-powered 5G gateway agent designed for **SIMCom SIM8202G
 sudo apt update
 sudo apt install clang llvm libbpf-dev golang modemmanager python3-pip -y
 pip3 install twampy --break-system-packages
+```
 
 **A high-precision network diagnostic tool for 5G Gateways and Embedded Linux.**
 
@@ -28,9 +29,9 @@ Standard network tools like `ping` or `iperf` measure averages. They often miss 
 
 **5G-Glitch-Monitor** attaches directly to the Linux Kernel via **eBPF** (Traffic Control hook) to observe every single packet leaving the interface. It detects:
 
-1. **Micro-Stalls (Jitter):** When the modem stops sending data for >100ms despite active traffic.
+1. **Stalls, as episodes:** When a flow's own egress pacing goes quiet for longer than its adaptive baseline, that's reported as one episode (start → end, with a step count), not one event per lagging retry.
 2. **Packet Loss (Retransmissions):** By tracking TCP sequence numbers, it definitively identifies when a packet was lost and resent.
-3. **Idle vs. Fault:** Intelligently distinguishes between a broken network and a sleeping application.
+3. **Idle vs. Fault:** For TCP, a stall only counts if the flow actually has unacknowledged data in flight — an idle connection with nothing queued to send is never flagged just for going quiet. UDP has no ACK signal to make that same distinction, so it's stall-checked only on ports explicitly opted in (none, by default).
 
 ---
 
@@ -38,8 +39,8 @@ Standard network tools like `ping` or `iperf` measure averages. They often miss 
 
 The project consists of two components:
 
-1. **Kernel Space (C):** A lightweight eBPF program (`tc_glitch.bpf.c`) that attaches to the egress path. It calculates Inter-Packet Arrival Time (IPAT) and tracks TCP flows.
-2. **User Space (Go):** A high-performance agent (`dawn-agent`) that loads the BPF program, reads events from a Ring Buffer, and prints human-readable diagnostics.
+1. **Kernel Space (C):** `tc_glitch.bpf.c` defines two eBPF programs sharing one flow-state map — `egress_monitor` (attached to the egress hook) does the actual work: inter-packet-gap pacing, stall episodes, and TCP sequence tracking for retransmission detection; `ingress_monitor` (attached to the ingress hook) only tracks the highest TCP ACK seen per flow, so `egress_monitor` can tell a genuinely stuck flow (data in flight, nothing coming back) apart from one that's simply idle. Both hooks live on the same `clsact` qdisc — see [glitch-tool's output](#4-glitch-tool-output) below for exactly what each detects.
+2. **User Space (Go):** A high-performance agent (`dawn-agent`, superseded — see below) or the standalone `glitch-tool`/`glitch-exporter`, all built on the shared `glitch/` package, which loads both BPF programs, reads events from a Ring Buffer, and prints/exports human-readable diagnostics.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for a full component diagram covering both the gateway and the server side.
 
@@ -123,6 +124,14 @@ what the shared BPF object now emits — don't run it alongside `glitch-tool`/
 `glitch-exporter` on the same interface, and don't trust its stall/retrans
 output as-is.
 
+**A clsact handle bug meant every result from `dawn-agent` (and any build
+before the `glitch/` package's egress/ingress handle fix) was actually
+measuring ingress (downlink) traffic, not egress** — the constant used for
+"egress" was `0xFFF2`, which is `TC_H_MIN_INGRESS` in the real kernel ABI;
+`TC_H_MIN_EGRESS` is `0xFFF3`. If you have old captured output or test
+results from before this fix, treat them as describing the downlink, not
+the uplink, regardless of what they were labeled as at the time.
+
 ### 4. Install as a Service (optional)
 
 To deploy the agent permanently on the gateway, install it into `/opt/dawn`
@@ -168,13 +177,62 @@ sudo ./dawn-agent
 
 ### 3. Interpret the Output
 
+This table describes `dawn-agent`'s own output specifically — it's unchanged,
+frozen legacy code (see the superseded note above) still using a single fixed
+gap threshold, not the adaptive model below.
+
 | Icon | Event Type | Meaning | Action Required |
 | --- | --- | --- | --- |
 | 💤 | **Idle Stall** | Gap > 1000ms. App is likely sleeping. | None (Normal). |
 | ⚠️ | **Micro-Stall** | Gap 100ms - 1000ms during active flow. | Monitor. Indicates jitter/bufferbloat. |
 | 🔴 | **LOSS** | TCP Retransmission detected. | **Critical.** Radio link quality is poor. |
 
-### 4. Modem Detection
+### 4. glitch-tool Output
+
+`glitch-tool`/`glitch-exporter` (and `dawn-agent`'s own original pre-Phase-2
+code, conceptually) use a different, more refined model than the fixed-
+threshold table above. Run it the same way, just with its own binary:
+
+```bash
+make glitch-tool
+sudo ./glitch-tool -iface wwan0
+```
+
+| Icon | Event Type | Meaning |
+| --- | --- | --- |
+| 🔴 | **Retransmission** | A TCP sequence number went backwards with real payload attached — the kernel resent data it already sent once. Independent of the stall logic below; fires regardless of pacing. |
+| 🟡 | **Stall START** | The first gap in this flow's egress pacing that exceeded its adaptive baseline. Emitted immediately (not buffered until the episode ends), so a consumer reacting in a closed loop (e.g. QoS re-routing) doesn't have to wait for recovery to find out something is wrong. |
+| ✅ | **Stall END** | The episode closed: a normal-paced packet arrived again. Carries the **total duration** (from the last good packet before the episode to the one that closed it) and the **step count** (how many qualifying gaps were folded into the episode — e.g. a TCP RTO backoff retrying 4 times shows up as one episode with `steps=4`, not four separate events). |
+
+**Stalls are reported as episodes, not one event per lagging packet.** Every
+qualifying gap after the first silently extends the open episode (tracked
+internally as a step count) instead of emitting its own event; only the
+first gap (START) and the eventual recovery (END) are ever printed. This
+matters specifically for TCP retransmission backoff, where a single real
+outage produces several retries at growing intervals — without episode
+tracking, that reads as a burst of unrelated stall events instead of the one
+underlying problem it actually is.
+
+**A gap only counts toward a stall at all if it's eligible:**
+- **TCP:** only once the flow has genuine outstanding data — bytes already
+  sent (`end_seq`) but not yet acknowledged by the remote peer. A second,
+  separate eBPF program (`ingress_monitor`, attached to the same interface's
+  ingress hook) tracks the highest ACK number returned for each flow
+  specifically so this comparison is possible. An idle TCP connection with
+  nothing queued to send is never flagged just for going quiet — only a
+  connection that is demonstrably waiting on data it already sent is.
+- **UDP:** never eligible by default — there's no ACK signal for UDP, so
+  there's no way to tell "stuck" apart from "nothing queued" the way TCP
+  allows. A port (checked against either side of the flow) can opt in via
+  the `UDP_MONITOR_PORTS` load-time constant array in `bpf_src/tc_glitch.bpf.c`
+  (empty by default — rebuild after editing it to take effect).
+
+Either way, a gap is also never eligible until the flow has seen at least 8
+packets (`STALL_MIN_PACKETS`) — a brand-new flow's first few gaps don't yet
+represent its real pace, so the adaptive baseline isn't trustworthy until
+then.
+
+### 5. Modem Detection
 
 On startup, `dawn-agent` auto-detects whatever modem is present instead of
 assuming a fixed ModemManager index. It tries, in order, **ModemManager**
@@ -211,9 +269,12 @@ the detection cascade and each backend work.
 
 ## 🧪 Testing
 
-To verify the tool is working, you can simulate network faults.
+To verify the tool is working, you can simulate network faults. The two
+approaches below test different code paths — `dawn-agent`'s own fixed-
+threshold logic vs. `glitch-tool`'s adaptive, ACK-gated one — and aren't
+interchangeable.
 
-**1. Simulate a Stall (Jitter)**
+**1. `dawn-agent` (fixed threshold): simulate a stall with `netem` delay**
 In a separate terminal, use `netem` to delay packets on the interface:
 
 ```bash
@@ -226,7 +287,7 @@ sudo tc qdisc del dev eth0 root netem
 
 ```
 
-**2. Simulate Idle Traffic**
+**2. `dawn-agent` (fixed threshold): simulate idle traffic**
 Simply run a slow ping:
 
 ```bash
@@ -234,6 +295,49 @@ ping -i 1.5 8.8.8.8
 # Watch the agent output "💤 [STALL] ~1500ms"
 
 ```
+
+**3. `glitch-tool`: real TCP retransmissions on the monitored interface**
+Ping alone won't exercise the retransmission path at all (no TCP, no real
+loss) — drive real traffic through real loss instead. The monitored
+interface has to be the one actually carrying the traffic: if the box has
+more than one route to the target (e.g. a wired `enp1s0` default route
+alongside `wwan0`), force egress onto the one you're testing with
+`iperf3 --bind-dev`, and sanity-check with `ip route get <target> oif wwan0`
+first — a quiet result otherwise just means the traffic never crossed the
+monitored interface at all, not that nothing went wrong.
+
+```bash
+sudo ./glitch-tool -iface wwan0 &
+sudo tc qdisc add dev wwan0 root netem loss 10%
+iperf3 -c <some-iperf3-server> --bind-dev wwan0 -t 10
+sudo tc qdisc del dev wwan0 root netem
+# Watch glitch-tool output a 🔴 line per real retransmission — compare
+# the count against iperf3's own reported "Retr" column.
+```
+
+**4. `glitch-tool`: force a stall episode**
+A forced outage on a *low-throughput* flow (small TCP congestion window,
+so the sender genuinely exhausts what it can send and goes quiet) reliably
+shows one 🟡/✅ episode pair:
+
+```bash
+sudo ./glitch-tool -iface wwan0 &
+iperf3 -c <some-iperf3-server> --bind-dev wwan0 -t 10 -b 500K &
+sleep 3
+sudo tc qdisc add dev wwan0 root netem loss 100%
+sleep 1
+sudo tc qdisc del dev wwan0 root netem
+# Watch for one 🟡 Stall START followed by one ✅ Stall END with
+# duration >= 1s once the outage clears.
+```
+
+A *high-throughput, large-cwnd* bulk flow (no `-b` limit) forced through
+the same 1s total-loss outage is a harder case: the sender may have enough
+already-queued congestion window to keep transmitting new data throughout
+the outage without ever actually going quiet on egress, so no stall episode
+fires even though the retransmission burst afterward is very real — this
+is an open area of investigation for the episode/ACK-gating logic, not a
+confirmed intended behavior.
 
 ---
 
