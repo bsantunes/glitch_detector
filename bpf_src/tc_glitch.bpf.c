@@ -82,8 +82,13 @@ struct flow_state {
                         // egress_monitor tell "genuinely stuck with data
                         // in flight" apart from "idle, nothing outstanding
                         // to acknowledge" (see the TCP stall gate below).
-                        // Stays 0 until the first inbound ACK is seen;
-                        // end_seq > 0 is already correctly "ahead" of that.
+                        // Seeded from the flow's first packet's own seq
+                        // when the entry is created (see the new-flow
+                        // branch below), not 0 - with random ISNs,
+                        // roughly half of all connections have seq/ack
+                        // values at or above 2^31 for their whole
+                        // practical lifetime, where a 0 origin makes
+                        // every later signed comparison come out wrong.
     __u64 stall_start_ts; // 0 when not currently in a stall episode,
                            // otherwise the timestamp of the last packet
                            // seen *before* the episode began (so the
@@ -354,15 +359,34 @@ int egress_monitor(struct __sk_buff *skb) {
         struct flow_state new_state = {};
         new_state.last_ts = ts;
         new_state.pkt_count = 1; // this first packet counts as seen
-        // avg_gap_ns, highest_ack, stall_start_ts, stall_steps all start
-        // at 0 via the zero-initializer above - no prior gap, ack, or
-        // episode exists yet.
+        // avg_gap_ns, stall_start_ts, stall_steps all start at 0 via the
+        // zero-initializer above - no prior gap or episode exists yet.
         if (tcp) {
+            __u32 seq = bpf_ntohl(tcp->seq);
             __u16 tcp_hlen = tcp->doff * 4;
             __u16 l4_hlen = ihl * 4 + tcp_hlen;
             __u16 ip_total_len = bpf_ntohs(ip->tot_len);
             __u16 payload_len = (ip_total_len > l4_hlen) ? (ip_total_len - l4_hlen) : 0;
-            new_state.end_seq = bpf_ntohl(tcp->seq) + payload_len;
+            new_state.end_seq = seq + payload_len;
+            // highest_ack must start relative to this connection's own
+            // sequence space, not a bare 0: TCP ISNs are randomized
+            // across the full 32-bit range, so roughly half of all
+            // connections have seq/ack values that sit at or above
+            // 2^31 for their entire practical lifetime (real transfer
+            // sizes never approach the 4 GiB wrap). For those
+            // connections, (s32)(real_ack - 0) is always negative, so
+            // ingress_monitor's "did the ack advance" check never sees
+            // it as an advance and highest_ack would stay stuck at 0
+            // forever - and independently, egress_monitor's own
+            // eligibility check (s32)(end_seq - highest_ack) also comes
+            // out negative purely because end_seq itself is >= 2^31,
+            // permanently disabling stall detection for exactly that
+            // ~50% of connections. Seeding highest_ack from this first
+            // packet's own seq keeps every later signed comparison
+            // anchored to the connection's real sequence space instead
+            // of an arbitrary origin that may be on the wrong side of
+            // the 32-bit signed boundary.
+            new_state.highest_ack = seq;
         }
         bpf_map_update_elem(&flow_tracker, &key, &new_state, BPF_ANY);
     }
