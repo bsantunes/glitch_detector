@@ -2,7 +2,7 @@
 
 ## DAWN6G Smart Gateway 🛰️
 
-A high-performance, eBPF-powered 5G gateway agent designed for **SIMCom SIM8202G-M2** modules. It provides active/passive network monitoring, 5QI QoS enforcement, and cloud-based telemetry.
+A high-performance, eBPF-powered 5G gateway agent. It provides active/passive network monitoring, 5QI QoS enforcement, and cloud-based telemetry.
 
 ## 🌟 Features
 - **Passive Monitoring:** eBPF-based detection of TCP retransmissions and stall episodes, judged against each flow's own adaptive pacing baseline (a fixed 100ms floor for flows with no established pace yet) rather than a single fixed threshold — see [glitch-tool's output](#4-glitch-tool-output) below.
