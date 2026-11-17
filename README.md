@@ -267,6 +267,96 @@ the detection cascade and each backend work.
 
 ---
 
+## 🧰 Other Standalone Tools & Exporters
+
+`modem/`, `twamp/`, and `gps/` are shared packages, each with its own pair of
+binaries: a `*-tool` for ad hoc/interactive inspection (prints to stdout
+forever, no InfluxDB, no root required), and a `*-exporter` meant to run as
+a continuous background service, pushing to InfluxDB on an interval. None
+of the three needs the eBPF/TC side at all — they're independent of
+`dawn-agent`/`glitch-tool`/`glitch-exporter`.
+
+Every exporter needs an InfluxDB token, either via `-influx-token` or the
+`INFLUX_TOKEN` environment variable — when installed as a service
+(`sudo make install-*-exporter`), they all read it from the same
+`/opt/dawn/modem-exporter.env` file (copy `modem-exporter.env.example` there
+first and fill in a real token from `add-device.sh`; `twamp-exporter`'s and
+`gps-exporter`'s own install targets reuse that file rather than needing
+their own).
+
+### modem-tool / modem-exporter
+
+Detects modems (ModemManager → QMI/MBIM → `uqmi` → AT) and reads
+RSRP/RSRQ/RSSI/SINR + cell/registration info — see
+[§5 Modem Detection](#5-modem-detection) above for `modem-tool`'s usage and
+output.
+
+```bash
+make modem-exporter
+sudo ./modem-exporter -influx-url http://10.30.30.1:8086 -influx-token "$INFLUX_TOKEN"
+# optional: -interval 30s (default) -influx-org wavecom -influx-bucket radio -device-id <name>
+```
+
+Writes `radio_cell` (one point per active radio leg — two under EN-DC) and
+`modem_state` to InfluxDB. Install as a service with
+`sudo make install-modem-exporter` (see `modem-exporter.service`).
+
+### twamp-tool / twamp-exporter
+
+Sends TWAMP-Test ("TWAMP Light", unauthenticated, no TWAMP-Control
+handshake) probe bursts to a reflector that's already listening, and
+reports RTT/jitter/loss:
+
+```bash
+make twamp-tool
+sudo ./twamp-tool -reflector 10.30.30.1:862
+# optional: -interval 5s (default) -count 5 -probe-interval 100ms -timeout 2s
+```
+
+`twamp-exporter` runs the same probe on an interval and pushes a `twamp`
+point (`rtt_ms`/`jitter_ms`/`loss_pct`/`sent`/`received`) to InfluxDB's
+`network` bucket each burst:
+
+```bash
+make twamp-exporter
+sudo ./twamp-exporter -reflector 10.30.30.1:862 -influx-url https://wservices.wavesys.pt:8086 -influx-token "$INFLUX_TOKEN"
+# optional: -interval 30s (default) -influx-org wavecom -influx-bucket network -device-id <name>
+```
+
+Install as a service with `sudo make install-twamp-tool` /
+`sudo make install-twamp-exporter`.
+
+### gps-tool / gps-exporter
+
+Detects GPS/GNSS-capable modems (ModemManager's `gps-raw` source, or
+AT-over-serial as a fallback — raw QMI is implemented but deliberately
+disabled, see `CLAUDE.md`'s `gps/` package section) and polls for a fix:
+
+```bash
+make gps-tool
+sudo ./gps-tool
+# optional: -interval 10s (default)
+```
+
+Until a GPS antenna is actually connected, expect `no GPS fix yet` forever
+— that's the hardware, not the tool; the detection/polling path itself
+works correctly without one. `gps-exporter` polls the same way and writes
+a `gps_fix` point (`latitude`/`longitude`/`altitude`) to InfluxDB's
+`location` bucket, but **only once a fix is valid** — no point is written
+at all while there's no fix, rather than writing meaningless zeros (unlike
+signal metrics, `(0, 0)` is a real coordinate):
+
+```bash
+make gps-exporter
+sudo ./gps-exporter -influx-url https://wservices.wavesys.pt:8086 -influx-token "$INFLUX_TOKEN"
+# optional: -interval 30s (default) -influx-org wavecom -influx-bucket location -device-id <name>
+```
+
+Install as a service with `sudo make install-gps-tool` /
+`sudo make install-gps-exporter`.
+
+---
+
 ## 🧪 Testing
 
 To verify the tool is working, you can simulate network faults. The two
