@@ -8,12 +8,18 @@ not repeated here.
 
 ## 0. Decide what this device is
 
-- **Debian + ModemManager** (like `aaeon`) → eBPF works. Install everything:
-  `dawn-agent`, `modem-tool`, `modem-exporter`, `twamp-tool`, `twamp-exporter`.
+- **Debian + ModemManager** (like `aaeon`) → eBPF works. Install
+  `glitch-exporter`, `modem-exporter`, `twamp-exporter` (plus `modem-tool`/
+  `twamp-tool`/`glitch-tool` if you also want local, journalctl-readable
+  diagnostics alongside the InfluxDB push — see the redundancy note below).
+  **Don't install `dawn-agent`** — it's superseded by those three exporters
+  running side by side (see CLAUDE.md's Project Overview) and its own eBPF
+  decode logic no longer matches the current `tc_glitch.o` at all.
 - **WaveOS / OpenWrt** (like `6global`, `dawn6g`) → **no eBPF** (confirmed
   missing `clsact`/TC-BPF kernel support — see CLAUDE.md's Known Issues).
   Install only `modem-tool`, `modem-exporter`, `twamp-tool`, `twamp-exporter`.
-  Don't bother with `dawn-agent` here; it will fail to load its qdisc.
+  Don't bother with `dawn-agent`, `glitch-tool`, or `glitch-exporter` here —
+  the whole eBPF path fails to load its qdisc on this kernel.
 
 Pick a short, stable **device ID** now (e.g. the hostname — `aaeon`,
 `6global`, `dawn6g`) — it's used as both the InfluxDB token's name and the
@@ -29,9 +35,10 @@ cd ~/dawn6g-metrics
 cat secrets/devices/<device-id>.token
 ```
 
-This creates **one write-only token scoped to all three buckets**
-(`radio`/`network`/`events`) — the same token is reused by `modem-exporter`
-*and* `twamp-exporter`, no need to provision separately per exporter.
+This creates **one write-only token scoped to all four buckets**
+(`radio`/`network`/`events`/`location`) — the same token is reused by
+`modem-exporter`, `twamp-exporter`, `gps-exporter`, *and* `glitch-exporter`,
+no need to provision separately per exporter.
 
 **Always use `add-device.sh`, not a manual `influx auth create`.** It also
 writes `secrets/devices/<device-id>.authid` (the auth entry's own ID), which
@@ -60,19 +67,23 @@ Run on the device itself (it has a Go toolchain):
 
 ```bash
 cd glitch_detector
-make                               # tc_glitch.o + dawn-agent
-make modem-tool modem-exporter twamp-tool twamp-exporter
+make                               # tc_glitch.o only, by default (see CLAUDE.md) — dawn-agent is superseded, not built here
+make modem-tool modem-exporter twamp-tool twamp-exporter glitch-tool glitch-exporter
 
-sudo make install                  # dawn-agent → /opt/dawn, systemd unit
 sudo make install-modem-tool
-sudo make install-modem-exporter   # needs modem-exporter.env — see below
+sudo make install-modem-exporter      # needs modem-exporter.env — see below
 sudo make install-twamp-tool
-sudo make install-twamp-exporter   # reuses the same modem-exporter.env
+sudo make install-twamp-exporter      # reuses the same modem-exporter.env
+sudo make install-glitch-exporter     # reuses the same modem-exporter.env
 ```
 
+(`glitch-tool` has no install target — it's interactive-only, run it directly
+for diagnostics; see below. `dawn-agent`'s own `sudo make install-dawn-agent`
+exists but is intentionally not part of this flow — see step 0.)
+
 Create the token file (mode 600, root-owned) **before** enabling the
-exporters — both `modem-exporter.service` and `twamp-exporter.service` read
-`INFLUX_TOKEN` from it:
+exporters — `modem-exporter.service`, `twamp-exporter.service`, *and*
+`glitch-exporter.service` all read `INFLUX_TOKEN` from it:
 
 ```bash
 sudo cp modem-exporter.env.example /opt/dawn/modem-exporter.env
@@ -84,7 +95,7 @@ sudo chown root:root /opt/dawn/modem-exporter.env
 Enable and start everything:
 
 ```bash
-sudo systemctl enable --now dawn-agent modem-tool modem-exporter twamp-tool twamp-exporter
+sudo systemctl enable --now modem-tool modem-exporter twamp-tool twamp-exporter glitch-exporter
 ```
 
 (Running `modem-tool`/`twamp-tool` continuously *alongside* their exporters
@@ -102,7 +113,7 @@ only want the InfluxDB-backed telemetry and don't need a local
 Check logs:
 
 ```bash
-journalctl -u dawn-agent -u modem-exporter -u twamp-exporter -f
+journalctl -u modem-exporter -u twamp-exporter -u glitch-exporter -f
 ```
 
 ## 3B. Install on a WaveOS gateway (procd)
@@ -183,6 +194,15 @@ from(bucket:"network") |> range(start:-5m)
   |> filter(fn:(r)=>r.device=="<device-id>")
   |> filter(fn:(r)=>r._measurement=="twamp")
   |> last()'
+
+# glitch-exporter — Debian/eBPF gateways only (see step 0). glitch_summary
+# writes a point every interval regardless of activity, so this should
+# never come back empty on a device that has it installed and running.
+docker compose exec -T influxdb influx query '
+from(bucket:"network") |> range(start:-5m)
+  |> filter(fn:(r)=>r.device=="<device-id>")
+  |> filter(fn:(r)=>r._measurement=="glitch_summary")
+  |> last()'
 ```
 
 If `radio`/`radio_cell` comes back empty but `modem_state` has rows, the modem
@@ -230,4 +250,9 @@ list` while debugging a separate "no data" issue, not assumed.
   boot. See CLAUDE.md's Known Issues for the underlying startup-race cause.
 - **`dawn-agent` will not run on WaveOS** — its eBPF qdisc load fails
   (`ENOENT`) on every WaveOS kernel seen so far. Don't install/enable it
-  there.
+  there — and don't install it on Debian either; it's superseded (step 0).
+- **`glitch-exporter.service` sets `Conflicts=dawn-agent.service`** — if
+  `dawn-agent` happens to already be installed/enabled on a device (it
+  shouldn't be, per step 0), starting `glitch-exporter` will stop it. Both
+  would otherwise try to attach their own eBPF program to the same
+  interface.

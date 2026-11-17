@@ -38,6 +38,75 @@ modem_state,device=<id>,modem_id=<n> operator_name="<s>",registration_state="<s>
 - Go client `github.com/influxdata/influxdb-client-go/v2`, one `WriteAPI` per bucket, batch 500,
   flush 1000 ms, max retries 10, retry buffer 100000 points (RAM only), precision ms.
 
+## `network` bucket: `glitch_summary` / `glitch_event` (eBPF stall/retransmission monitor)
+
+Written by `cmd/glitch-exporter` (the `glitch/` package's InfluxDB exporter —
+see `CLAUDE.md`'s `glitch/` package section for the detection logic this
+schema reports on). Confirmed live on `aaeon`: a forced-outage test's points
+matched the kernel's own reported duration/step count exactly, and 10+
+minutes of background-only traffic kept ticking `glitch_summary` with
+`stall_episodes=0` throughout.
+
+**`glitch_summary`** — one point per `-interval` (default 10s), **always
+written even when every field is zero** (a heartbeat — unlike `radio_cell`/
+`twamp`, which skip a point when there's nothing to report).
+
+| Field | Type | Unit | Meaning |
+|---|---|---|---|
+| `stall_episodes` | int | count | `STALL_END`s seen this interval. |
+| `stall_max_ms` | float | ms | Largest single episode duration this interval (0 if none). |
+| `stall_sum_ms` | float | ms | Sum of episode durations this interval (0 if none). |
+| `stall_open` | int | count | Episodes started but not yet ended **as of this point** — a live snapshot of in-progress stalls, not accumulated over the interval like the fields above. |
+| `retrans_count` | int | count | Retransmissions seen this interval. |
+| `dropped_events` | uint | count | Delta of `glitch.Handle.Dropped()` since the last tick — kernel ring-buffer events the Go side's internal channel couldn't keep up with. Should stay 0 under normal load. |
+
+Tags: `device`, `iface`. **Never an IP address or port** — see `glitch_event` below for where those actually live.
+
+**`glitch_event`** — one point per `stall_start`/`stall_end`/`stall_abandoned`.
+**No point for a retransmission** — those are counted only, via
+`glitch_summary.retrans_count`. Timestamped with the kernel event's own time
+(or, for `stall_abandoned`, the moment the 30s no-`STALL_END` timeout was
+detected — there is no kernel event to read a time from for that case).
+Rate-limited to `-max-events-per-sec` (default 20) points/second, shared
+across all three types; anything the limit drops still counts in
+`glitch_summary` above.
+
+| Field | Type | Unit | Meaning |
+|---|---|---|---|
+| `proto` | int | — | IP protocol number (6=TCP, 17=UDP). |
+| `src_port` | int | — | Local port. |
+| `dst_port` | int | — | Remote port. |
+| `dst_ip` | string | — | Remote IP address. **A field, not a tag** (see below). |
+| `baseline_ms` | float | ms | The adaptive stall baseline this flow was judged against when the episode started (`stall_start`) or, for `stall_end`/`stall_abandoned`, the one in effect when it closed/timed out. |
+| `duration_ms` | float | ms | **`stall_end`/`stall_abandoned` only.** Total episode duration — from the last normal-paced packet before the episode to whatever closed it. Can run roughly 2× the underlying network outage, since it includes TCP retransmission-timer backoff time, not just the outage itself. |
+| `steps` | int | count | **`stall_end`/`stall_abandoned` only.** Number of qualifying gaps folded into the episode (matches the visible retry/backoff count). Always 0 for `stall_abandoned` — the kernel only ever reports a step count on `STALL_END`, which by definition never arrived, so the real count is genuinely unknown, not a plausible-looking default. |
+
+Tags: `device`, `iface`, `type` (`"stall_start"` / `"stall_end"` /
+`"stall_abandoned"`).
+
+**Deliberately never a tag on an IP address or port anywhere in this
+schema** — unlike `radio_cell`'s `device`/`modem_id` or `twamp`'s
+`reflector`, a 5-tuple is high-cardinality and per-flow, not a stable
+grouping key across a device's lifetime.
+
+**Known limitations** (full explanation in `CLAUDE.md`'s `glitch/` package
+section — these are inherent to the design, not bugs):
+- Stalls are detected when the silence ends, not while it lasts — there is
+  no mid-outage "still stalling" signal, only the eventual `stall_end` (or,
+  after 30s, `stall_abandoned`).
+- An outage shorter than about one RTT may leave no egress gap at all, if
+  the sender's own congestion window keeps it transmitting throughout —
+  that case shows up only as a retransmission burst, with no stall episode.
+- `duration_ms` includes RTO backoff time, so it isn't a 1:1 measurement of
+  the underlying outage length.
+- UDP stall detection is opt-in per port, fixed at compile time
+  (`UDP_MONITOR_PORTS` in `bpf_src/tc_glitch.bpf.c`), empty by default.
+- On `aaeon`, `glitch-exporter`'s own InfluxDB write traffic goes out over
+  the same `wwan0` interface it monitors, so it's counted in its own stats.
+
+No Grafana panel for this yet — same open "TODO 2"-style gap as the
+`radio`/`twamp` dashboards below, not yet captured as repo-tracked JSON.
+
 ## Current state / open work
 
 - `gw01`: only a manual curl test point (`radio_cell`, tag `device`).

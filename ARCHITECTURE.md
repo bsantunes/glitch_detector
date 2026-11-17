@@ -1,8 +1,10 @@
 # DAWN6G Glitch Detector — Architecture
 
 System overview across both endpoints: the gateway (x86 Linux board with a
-SIMCom SIM8202G-M2 5G modem) and the server (x86 Linux board hosting the TWAMP
-reflector and the telemetry stack).
+5G modem) and the server (x86 Linux board hosting the TWAMP reflector and the
+telemetry stack).
+
+**The diagram and kernel-space description immediately below are `dawn-agent`'s own pipeline specifically — `dawn-agent` is now superseded** by `glitch-exporter` + `twamp-exporter` + `modem-exporter` running side by side (kept in the tree, not deleted, but no longer built/installed by default — see `CLAUDE.md`'s Project Overview). Its eBPF kernel-space box below is also stale in a second way: `dawn-agent`'s own Go decode logic was never updated alongside the shared BPF program's later changes, so it no longer matches what's actually compiled into `tc_glitch.o` today (wrong struct layout, and it attaches to the wrong clsact hook — see the "Current pipeline" section right after this diagram for what's actually accurate now). Read the current pipeline section for anything you intend to rely on; treat this diagram as a historical/dawn-agent-specific reference only.
 
 ```
 ┌─────────────────────────────────── GATEWAY (x86 Linux board) ────────────────────────────────────┐
@@ -89,6 +91,65 @@ reflector and the telemetry stack).
 └──────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+## Current pipeline (`glitch/` package — supersedes the diagram above)
+
+```
+┌────────────── GATEWAY, glitch-tool / glitch-exporter (glitch/ package) ──────────────┐
+│                                                                                       │
+│  ═══ KERNEL SPACE — bpf_src/tc_glitch.bpf.c (same source file as the diagram above,  │
+│       dawn-agent's own decode logic just never caught up to its later changes) ═══   │
+│                                                                                       │
+│  ┌─ egress_monitor(skb) ───────────────┐   ┌─ ingress_monitor(skb) ──────────────┐   │
+│  │ SEC("tc"), clsact EGRESS hook        │   │ SEC("tc"), clsact INGRESS hook      │   │
+│  │ (TC_H_MIN_EGRESS = 0xFFF3)           │   │ (TC_H_MIN_INGRESS = 0xFFF2)         │   │
+│  │                                       │   │                                      │   │
+│  │ parse raw IP (no Ethernet header —   │   │ parse raw IP, TCP only              │   │
+│  │ correct for wwan0)                   │   │                                      │   │
+│  │ key = 5-tuple → flow_tracker         │   │ key = 5-tuple, SWAPPED src/dst       │   │
+│  │ (creates entry if new; seeds         │   │ (this pkt's src is the remote peer) │   │
+│  │  highest_ack = this pkt's own seq —  │   │ → flow_tracker (lookup only, never  │   │
+│  │  NOT 0, see "Historical bug" below)  │   │   creates — egress_monitor owns     │   │
+│  │                                       │   │   the flow's lifecycle)             │   │
+│  │ STALL check, per packet:              │   │ highest_ack = max(highest_ack,      │   │
+│  │  baseline = max(100ms,                │   │   this pkt's ack_seq) — signed-diff │   │
+│  │              4 × flow's EWMA gap)      │   │   compare, wraparound-safe          │   │
+│  │  eligible = pkt_count>=8 AND           │   └──────────────────────────────────────┘   │
+│  │    (TCP: end_seq > highest_ack  |          ▲                                        │
+│  │     UDP: port in UDP_MONITOR_PORTS)        │ shared flow_tracker map                │
+│  │  gap > baseline & eligible?                │ (BPF_MAP_TYPE_LRU_HASH, 10k flows)     │
+│  │   ├─ first such gap → STALL_START ─────────┼──────────┐                             │
+│  │   ├─ later ones → silently extend          │          │                             │
+│  │   │   (step counter, no event)             │          │                             │
+│  │   └─ gap normalizes → STALL_END            │          │                             │
+│  │       (total duration + step count) ───────┼──────────┤                             │
+│  │                                             │          │                             │
+│  │ RETRANS check, independent of the above:     │          │                             │
+│  │  seq behind end_seq (signed-diff,            │          │                             │
+│  │  wraparound-safe) AND payload_len>0?         │          ▼                             │
+│  │   └─ RETRANS event ──────────────────────────┼──▶ events (BPF_MAP_TYPE_RINGBUF, 16KiB)│
+│  └───────────────────────────────────────────────────────────────────────────────────┘   │
+│                                                           │                                │
+│  ═══ USER SPACE — glitch/glitch.go ═══                   ▼                                │
+│  Open(iface): loads both programs, attaches both hooks, reads the ring buffer,           │
+│  decodes wireEvent (48 bytes, little-endian) → Event{Time, SrcIP, DstIP, SrcPort,        │
+│  DstPort, Value, Baseline, Type, Steps, Proto}. Events()/Dropped()/Close().               │
+│       │                                        │                                          │
+│       ▼                                        ▼                                          │
+│  cmd/glitch-tool                      cmd/glitch-exporter                                 │
+│  prints 🔴/🟡/✅ to stdout             aggregates (see Aggregator, cmd/glitch-exporter/     │
+│  forever, no InfluxDB                 aggregate.go) → glitch_summary (heartbeat,          │
+│                                        every -interval) + glitch_event (rate-limited,     │
+│                                        stall_start/stall_end/stall_abandoned) → InfluxDB  │
+│                                        "network" bucket via async WriteAPI                │
+└─────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+**Historical bug, fixed, relevant to interpreting old data:** the constant `dawn-agent`'s diagram above calls "egress" (`HANDLE_MINEGRESS = 0xFFF2`) is actually `TC_H_MIN_INGRESS` in the real kernel ABI — `dawn-agent` itself still has this bug (frozen/superseded, never fixed there). `glitch/glitch.go` fixed it (commit `023a517`): `handleMinEgress` is now `0xFFF3`, and a new `handleMinIngress = 0xFFF2` constant is used for `ingress_monitor`'s own attachment. Every result measured against the old code — `dawn-agent`'s own output and the original pre-refactor stress test included — was observing ingress (downlink) traffic, not egress (uplink), regardless of its label at the time.
+
+**`highest_ack`'s seed value, fixed, the other historical bug worth knowing about:** seeding it from a bare `0` (rather than the flow's own first packet's seq) made the TCP stall gate permanently non-functional for roughly half of all connections — see `CLAUDE.md`'s `glitch/` package section for the full signed-arithmetic explanation and `bpf_src/verify_highest_ack_wraparound.sh` for the regression test. Fixed in commit `e1b0945`.
+
+**Known limitations of this design** (see `CLAUDE.md`'s `glitch/` package section for the full writeup): stalls are only known once the silence ends, not while it lasts; an outage shorter than about one RTT can leave no egress gap at all if the sender's own congestion window keeps it transmitting throughout, surfacing only as a retransmission burst; a TCP stall episode's reported duration includes RTO backoff time, so it can run roughly 2× the underlying outage; UDP stall detection is opt-in per port, compiled in, empty by default.
+
 ## Modem detection (`modem/` package)
 
 Radio signal quality no longer assumes a single ModemManager modem at index 0.
@@ -152,7 +213,7 @@ is covered by unit tests, several built directly from real captured
 |                  | **Passive path** (eBPF)                          | **Active path** (TWAMP + modem/)                       |
 |------------------|--------------------------------------------------|--------------------------------------------------------|
 | **What**         | Observes *real user traffic* leaving the NIC     | Injects *synthetic probes* + reads modem radio stats   |
-| **Detects**      | Micro-stalls (>100ms gaps mid-flow), TCP retransmissions | RTT, jitter, loss per QoS class; RSRP/RSRQ/RSSI/SINR |
+| **Detects**      | Stall episodes (adaptive per-flow baseline, TCP ACK-gated — see Current pipeline above), TCP retransmissions | RTT, jitter, loss per QoS class; RSRP/RSRQ/RSSI/SINR |
 | **Cost**         | Near-zero (runs in kernel, per-packet)           | One 5-probe TWAMP burst + one signal read per modem, every 5s |
 | **Needs server?**| No — fully local                                 | Yes — the twampy reflector on the server               |
 
@@ -164,9 +225,14 @@ is covered by unit tests, several built directly from real captured
   the netem tests in the README), the parse offset is wrong and the
   `ip->version != 4` check silently discards nearly everything — the
   commented-out `ethhdr` path in the C source is the ethernet variant.
-- **Struct coupling**: the Go `GlitchEvent` (main.go) and C `glitch_event`
-  (tc_glitch.bpf.c) must stay byte-compatible; events cross the ring buffer as
-  raw little-endian bytes.
+- **Struct coupling**: a Go decoder and the C `glitch_event` (tc_glitch.bpf.c)
+  must stay byte-compatible; events cross the ring buffer as raw little-endian
+  bytes. `glitch/glitch.go`'s `wireEvent` is the current, correct decoder (48
+  bytes, kept in sync with the C struct and covered by
+  `glitch/glitch_test.go`'s `TestWireEventDecode`); `main.go`'s own
+  `GlitchEvent` (24 bytes) is the pre-refactor layout and no longer matches
+  what's actually compiled into `tc_glitch.o` — see the superseded note at the
+  top of this document.
 - **Modem detection is best-effort past ModemManager**: the QMI/MBIM/AT
   fallbacks in `modem/` were written against documented `qmicli`/`mbimcli`
   text formats and 3GPP AT command semantics, then corrected against real
