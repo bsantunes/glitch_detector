@@ -10,6 +10,7 @@ TWAMP_EXPORTER_BIN := twamp-exporter
 GPS_BIN := gps-tool
 GPS_EXPORTER_BIN := gps-exporter
 GLITCH_BIN := glitch-tool
+GLITCH_EXPORTER_BIN := glitch-exporter
 GO_MOD  := go.mod
 INSTALL_DIR := /opt/dawn
 
@@ -70,6 +71,13 @@ embed: glitch/tc_glitch.o
 glitch-tool: deps glitch/tc_glitch.o
 	go build -o $(GLITCH_BIN) ./cmd/glitch-tool
 
+# long-running service that runs the eBPF passive monitor and pushes
+# aggregated stall-episode/retransmission stats to InfluxDB's "network"
+# bucket — meant to run continuously (systemd; no OpenWrt procd init
+# script, since the eBPF/TC side doesn't work on WaveOS at all).
+glitch-exporter: deps glitch/tc_glitch.o
+	go build -o $(GLITCH_EXPORTER_BIN) ./cmd/glitch-exporter
+
 # ensure go.mod exists and dependencies are fetched
 $(GO_MOD):
 	@echo "initializing go module and fetching dependencies"
@@ -91,7 +99,7 @@ $(BPF_OBJ): $(BPF_SRC)
 
 
 clean:
-	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN) $(TWAMP_BIN) $(TWAMP_EXPORTER_BIN) $(GPS_BIN) $(GPS_EXPORTER_BIN) $(GLITCH_BIN) glitch/tc_glitch.o
+	rm -f $(BPF_OBJ) $(GO_BIN) $(MODEM_BIN) $(EXPORTER_BIN) $(TWAMP_BIN) $(TWAMP_EXPORTER_BIN) $(GPS_BIN) $(GPS_EXPORTER_BIN) $(GLITCH_BIN) $(GLITCH_EXPORTER_BIN) glitch/tc_glitch.o
 
 # install the agent, BPF object and init script into $(INSTALL_DIR)
 # (creates the directory if needed) and register the systemd unit.
@@ -178,4 +186,20 @@ install-gps-exporter: gps-exporter
 	@echo "   Then enable with: sudo systemctl enable --now gps-exporter"
 	@echo "   Logs: journalctl -u gps-exporter -f"
 
-.PHONY: all clean dawn-agent install-dawn-agent modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter glitch-tool embed install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter
+# install glitch-exporter, which pushes to InfluxDB. Reuses the same
+# /opt/dawn/modem-exporter.env token as modem-exporter/twamp-exporter/
+# gps-exporter (add-device.sh tokens are scoped to write across all four
+# buckets). Conflicts with dawn-agent.service (glitch-exporter.service),
+# since both would otherwise try to attach their own eBPF program to the
+# same interface. Run with sudo: sudo make install-glitch-exporter
+install-glitch-exporter: glitch-exporter
+	install -d $(INSTALL_DIR)
+	install -m 755 $(GLITCH_EXPORTER_BIN) $(INSTALL_DIR)/
+	install -m 644 glitch-exporter.service /etc/systemd/system/
+	systemctl daemon-reload
+	@echo "✅ Installed to $(INSTALL_DIR)."
+	@echo "   Reuses /opt/dawn/modem-exporter.env for INFLUX_TOKEN (see install-modem-exporter)."
+	@echo "   Then enable with: sudo systemctl enable --now glitch-exporter"
+	@echo "   Logs: journalctl -u glitch-exporter -f"
+
+.PHONY: all clean dawn-agent install-dawn-agent modem-tool modem-exporter twamp-tool twamp-exporter gps-tool gps-exporter glitch-tool glitch-exporter embed install-modem-tool install-modem-exporter install-twamp-tool install-twamp-exporter install-gps-tool install-gps-exporter install-glitch-exporter

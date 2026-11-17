@@ -1,0 +1,20 @@
+[Unit]
+Description=DAWN6G Glitch Exporter (push eBPF stall/retransmission stats to InfluxDB)
+After=network-online.target
+Wants=network-online.target
+Conflicts=dawn-agent.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/dawn
+# Reuses the same per-device token as modem-exporter.service — add-device.sh
+# issues one token scoped to write on all four buckets (radio/network/events/location).
+EnvironmentFile=/opt/dawn/modem-exporter.env
+ExecStart=/opt/dawn/glitch-exporter -iface wwan0 -interval 10s -influx-url https://wservices.wavesys.pt:8086 -influx-org wavecom -influx-bucket network
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
