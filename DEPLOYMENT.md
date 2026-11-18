@@ -256,3 +256,62 @@ list` while debugging a separate "no data" issue, not assumed.
   shouldn't be, per step 0), starting `glitch-exporter` will stop it. Both
   would otherwise try to attach their own eBPF program to the same
   interface.
+
+## 7. GPS on a Debian gateway: reserving a dedicated AT port
+
+`gps-exporter -method at` needs its own serial port, never shared with
+ModemManager or anything else that might open it concurrently. Before
+installing/enabling `gps-exporter` with `-method at -port <dev>` on a new
+Debian board, reserve that port with a udev rule so ModemManager (and
+`modem.DetectAT`'s own fallback scan) never touches it either.
+
+**Identify the right port first** — read-only, no `mmcli --location-*`
+calls:
+
+```bash
+mmcli -m 0 | sed -n '/ports:/,/---/p'      # find the AT_SECONDARY port — never AT_PRIMARY, that one stays ModemManager's
+udevadm info -q property -n /dev/ttyUSBx   # per candidate: note ID_VENDOR_ID, ID_MODEL_ID, ID_USB_INTERFACE_NUM
+```
+
+**Install the rule** (example from `aaeon`'s SIMCom, USB interface `03` —
+substitute the vendor/product/interface values for the board at hand):
+
+```bash
+sudo tee /etc/udev/rules.d/99-dawn-gps.rules > /dev/null <<'EOF'
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1e0e", ATTRS{idProduct}=="9001", ENV{ID_USB_INTERFACE_NUM}=="03", ENV{ID_MM_PORT_IGNORE}="1", SYMLINK+="dawn-gps"
+EOF
+sudo udevadm control --reload-rules
+```
+
+**Validate with a dry run before rebooting** — the reserved port must show
+`ID_MM_PORT_IGNORE=1` and a `dawn-gps` symlink action; every other AT port
+(especially `AT_PRIMARY`) must show neither:
+
+```bash
+sudo udevadm test /sys/class/tty/ttyUSBx 2>&1 | grep -iE "ID_MM_PORT_IGNORE|dawn-gps|ID_USB_INTERFACE_NUM"
+```
+
+**Reboot, then confirm**:
+
+```bash
+mmcli -m 0 | sed -n '/ports:/,/---/p'   # reserved port now shows as "ignored"
+ls -l /dev/dawn-gps                     # symlink exists, points at the reserved port
+sudo fuser -v /dev/dawn-gps             # must print nothing — no process holds it
+ip -4 addr show wwan0                   # still has an IP — the reboot didn't break the data session
+systemctl is-active modem-exporter twamp-exporter glitch-exporter   # all still "active"
+```
+
+**Rollback**, if the rule ever needs to come out:
+
+```bash
+sudo rm /etc/udev/rules.d/99-dawn-gps.rules
+sudo udevadm control --reload-rules
+sudo reboot
+# then confirm the port is back in mmcli's normal (non-"ignored") port list
+```
+
+Confirmed live on `aaeon` (2026-11-18): `ttyUSB3` — SIMCom's `AT_SECONDARY`
+port — reserved this way as `/dev/dawn-gps`; `ttyUSB2` (`AT_PRIMARY`)
+correctly untouched; `modem-exporter`/`twamp-exporter`/`glitch-exporter` all
+stayed up across the reboot. See CLAUDE.md's `gps/` package section
+("Phase C") for the full writeup.
