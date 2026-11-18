@@ -105,14 +105,29 @@ func gnssAlreadyRunning(port, stateCmd string) bool {
 // startup, since a missing/failed enable doesn't prevent GPS from
 // working at all, just (on hardware like aaeon's) can mean it may
 // never acquire a fix.
-func enableAssistanceData(m modem.Modem, vendor atGPSVendor) {
+//
+// send is an injectable AT transport (atSend in production) so the
+// engine-already-running retry path below can be exercised with a
+// fake in tests, without a real serial port.
+func enableAssistanceData(m modem.Modem, vendor atGPSVendor, send atSendFunc) {
 	switch vendor {
 	case atGPSVendorSIMCom:
-		// AT+CGPSXE=1 must be sent before AT+CGPS=1,1 starts the engine
-		// (per SIMCom's own command ordering) — this is called before
-		// the engine-enable retry loop below for exactly that reason.
-		resp, err := atSend(m.Port, "AT+CGPSXE=1", 3*time.Second)
-		if err != nil || !strings.Contains(resp, "OK") {
+		enableXTRA := func() (string, error) { return sendAndCheckOK(send, m.Port, "AT+CGPSXE=1") }
+		resp, err := enableXTRA()
+		if err != nil && engineAlreadyRunning(send, m.Port, "AT+CGPS?") {
+			// Confirmed to matter in practice, not just a theoretical
+			// case: AT+CGPSXE=1 can fail while the engine is already
+			// running. Stop the engine, retry XTRA, then let enableAT's
+			// own normal enable sequence (which runs right after this
+			// function returns) restart it — we don't restart it
+			// ourselves here, so a failure in that restart surfaces
+			// through the usual retry/error path instead of being
+			// swallowed here too.
+			log.Printf("gps: [%s] AT+CGPSXE=1 failed with engine already running — stopping engine (AT+CGPS=0), retrying XTRA, then restarting via the normal enable path", m.Port)
+			send(m.Port, "AT+CGPS=0", 3*time.Second)
+			resp, err = enableXTRA()
+		}
+		if err != nil {
 			log.Printf("gps: [%s] AT+CGPSXE=1 (enable XTRA assistance data) failed, continuing without it: err=%v resp=%q", m.Port, err, strings.TrimSpace(resp))
 			return
 		}
@@ -125,19 +140,22 @@ func enableAssistanceData(m modem.Modem, vendor atGPSVendor) {
 		// toggle distinct from CGPSXE itself as far as could be
 		// confirmed without live hardware access — if one turns up
 		// during live testing, add it here.
-		if state, err := atSend(m.Port, "AT+CGPSXE?", 3*time.Second); err == nil {
+		if state, err := send(m.Port, "AT+CGPSXE?", 3*time.Second); err == nil {
 			log.Printf("gps: [%s] AT+CGPSXE? = %q", m.Port, strings.TrimSpace(state))
 		}
 	case atGPSVendorQuectel:
-		// AT+QGPSXTRA=1 must be set while the engine is OFF — called
-		// here, before the engine-enable retry loop, specifically so
-		// it runs while the engine is still off on a clean start. If
-		// the engine happens to already be running (e.g. a restarted
-		// process finding it still on from before), this command is
-		// expected to fail — that's not specially handled, since
-		// either way the outcome here is just "log and continue".
-		resp, err := atSend(m.Port, "AT+QGPSXTRA=1", 3*time.Second)
-		if err != nil || !strings.Contains(resp, "OK") {
+		enableXTRA := func() (string, error) { return sendAndCheckOK(send, m.Port, "AT+QGPSXTRA=1") }
+		resp, err := enableXTRA()
+		if err != nil && engineAlreadyRunning(send, m.Port, "AT+QGPS?") {
+			// AT+QGPSXTRA=1 must be set while the engine is OFF per
+			// Quectel's own documentation — if the engine turns out to
+			// already be running, the same stop/retry/let-the-normal-
+			// path-restart-it approach as SIMCom above applies.
+			log.Printf("gps: [%s] AT+QGPSXTRA=1 failed with engine already running — stopping engine (AT+QGPSEND), retrying XTRA, then restarting via the normal enable path", m.Port)
+			send(m.Port, "AT+QGPSEND", 3*time.Second)
+			resp, err = enableXTRA()
+		}
+		if err != nil {
 			log.Printf("gps: [%s] AT+QGPSXTRA=1 (enable XTRA assistance data) failed, continuing without it: err=%v resp=%q", m.Port, err, strings.TrimSpace(resp))
 			return
 		}
@@ -145,10 +163,40 @@ func enableAssistanceData(m modem.Modem, vendor atGPSVendor) {
 		// AT+QGPSXTRADATA? reports whether the downloaded assistance
 		// data is still valid — logged for visibility, same reasoning
 		// as AT+CGPSXE? above.
-		if valid, err := atSend(m.Port, "AT+QGPSXTRADATA?", 3*time.Second); err == nil {
+		if valid, err := send(m.Port, "AT+QGPSXTRADATA?", 3*time.Second); err == nil {
 			log.Printf("gps: [%s] AT+QGPSXTRADATA? = %q", m.Port, strings.TrimSpace(valid))
 		}
 	}
+}
+
+// atSendFunc is the minimal AT-command transport enableAssistanceData
+// needs — a seam over atSend specifically so a unit test can inject
+// scripted responses without a real serial port. Production always
+// passes atSend itself.
+type atSendFunc func(dev, cmd string, timeout time.Duration) (string, error)
+
+// sendAndCheckOK sends cmd via send and normalizes "replied but not
+// OK" into an error alongside "didn't reply at all" — enableXTRA's
+// retry logic above only needs to ask "did this succeed", not which
+// of those two ways it failed.
+func sendAndCheckOK(send atSendFunc, port, cmd string) (string, error) {
+	resp, err := send(port, cmd, 3*time.Second)
+	if err == nil && !strings.Contains(resp, "OK") {
+		err = fmt.Errorf("unexpected response to %s: %q", cmd, strings.TrimSpace(resp))
+	}
+	return resp, err
+}
+
+// engineAlreadyRunning is gnssAlreadyRunning with an explicit,
+// injectable transport instead of a hardcoded atSend call, so
+// enableAssistanceData's engine-already-on retry path can be
+// exercised with a fake in tests.
+func engineAlreadyRunning(send atSendFunc, port, stateCmd string) bool {
+	resp, err := send(port, stateCmd, 3*time.Second)
+	if err != nil {
+		return false
+	}
+	return parseGNSSState(resp)
 }
 
 // enableAT turns on the modem's own GNSS engine via the vendor-
@@ -162,7 +210,7 @@ func enableAssistanceData(m modem.Modem, vendor atGPSVendor) {
 // is actually connected.
 func enableAT(ctx context.Context, m modem.Modem, vendor atGPSVendor, agps bool) error {
 	if agps {
-		enableAssistanceData(m, vendor)
+		enableAssistanceData(m, vendor, atSend)
 	}
 
 	var cmd, stateCmd string

@@ -2,7 +2,9 @@ package gps
 
 import (
 	"math"
+	"reflect"
 	"testing"
+	"time"
 
 	"dawn-agent/modem"
 )
@@ -186,6 +188,79 @@ func TestParseQGPSLOC_Malformed(t *testing.T) {
 		if _, err := parseQGPSLOC(resp); err == nil {
 			t.Errorf("parseQGPSLOC(%q): expected error, got none", resp)
 		}
+	}
+}
+
+func TestEnableAssistanceData_SIMCom_EngineAlreadyRunning(t *testing.T) {
+	// Confirmed to matter in practice, not just theoretical: SIMCom's
+	// AT+CGPSXE=1 can fail while the GNSS engine is already running.
+	// Exercises the stop-engine/retry-XTRA path via a fake transport,
+	// since this needs no real serial port — just the exact command
+	// sequence enableAssistanceData is expected to send.
+	var calls []string
+	xtraAttempt := 0
+	fake := atSendFunc(func(dev, cmd string, timeout time.Duration) (string, error) {
+		calls = append(calls, cmd)
+		switch cmd {
+		case "AT+CGPSXE=1":
+			xtraAttempt++
+			if xtraAttempt == 1 {
+				return "ERROR", nil // fails the first time — engine is on
+			}
+			return "OK", nil // succeeds after the engine was stopped
+		case "AT+CGPS?":
+			return "+CGPS: 1,1\r\nOK", nil // engine already running
+		case "AT+CGPS=0":
+			return "OK", nil // engine stopped
+		case "AT+CGPSXE?":
+			return "+CGPSXE: 1\r\nOK", nil
+		default:
+			t.Fatalf("unexpected AT command: %q", cmd)
+			return "", nil
+		}
+	})
+
+	enableAssistanceData(modem.Modem{Port: "/dev/ttyUSB2"}, atGPSVendorSIMCom, fake)
+
+	want := []string{"AT+CGPSXE=1", "AT+CGPS?", "AT+CGPS=0", "AT+CGPSXE=1", "AT+CGPSXE?"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("call sequence = %v, want %v", calls, want)
+	}
+}
+
+func TestEnableAssistanceData_Quectel_EngineAlreadyRunning(t *testing.T) {
+	// Same retry path as the SIMCom test above, but AT+QGPSXTRA=1/
+	// AT+QGPS?/AT+QGPSEND — Quectel's documentation says XTRA must be
+	// set while the engine is off, so this is the expected path
+	// whenever a restarted process finds the engine still on.
+	var calls []string
+	xtraAttempt := 0
+	fake := atSendFunc(func(dev, cmd string, timeout time.Duration) (string, error) {
+		calls = append(calls, cmd)
+		switch cmd {
+		case "AT+QGPSXTRA=1":
+			xtraAttempt++
+			if xtraAttempt == 1 {
+				return "+CME ERROR: 504", nil // fails the first time — engine is on
+			}
+			return "OK", nil
+		case "AT+QGPS?":
+			return "+QGPS: 1\r\nOK", nil
+		case "AT+QGPSEND":
+			return "OK", nil
+		case "AT+QGPSXTRADATA?":
+			return "+QGPSXTRADATA: 1,48\r\nOK", nil
+		default:
+			t.Fatalf("unexpected AT command: %q", cmd)
+			return "", nil
+		}
+	})
+
+	enableAssistanceData(modem.Modem{Port: "/dev/ttyUSB3"}, atGPSVendorQuectel, fake)
+
+	want := []string{"AT+QGPSXTRA=1", "AT+QGPS?", "AT+QGPSEND", "AT+QGPSXTRA=1", "AT+QGPSXTRADATA?"}
+	if !reflect.DeepEqual(calls, want) {
+		t.Errorf("call sequence = %v, want %v", calls, want)
 	}
 }
 
