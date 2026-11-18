@@ -87,9 +87,24 @@ func ProbeATPort(dev string) (Modem, error) {
 // with "OK" — the lowest common denominator supported by essentially
 // every cellular modem. This is the last-resort fallback, used only
 // when neither ModemManager nor QMI/MBIM tooling found a modem.
+//
+// Skips any device a udev rule has marked ID_MM_PORT_IGNORE=1 —
+// that property exists to tell ModemManager a port is reserved for
+// something else's exclusive use (e.g. gps-exporter's -port, pinned
+// to a dedicated udev-created symlink), and this auto-scan has to
+// honor the same reservation for the identical reason: opening a
+// port something else explicitly reserved would race it for that
+// port, exactly what the reservation exists to prevent. This does
+// NOT apply to ProbeATPort when called directly with an explicit,
+// already-known device (e.g. gps.DetectATPort for -port itself) —
+// that path is the one thing allowed to open a reserved port, since
+// it's the reservation's own intended user asking for it by name.
 func DetectAT(ctx context.Context) ([]Modem, error) {
 	var modems []Modem
 	for _, dev := range candidateATDevices() {
+		if portIgnoredByModemManager(dev) {
+			continue
+		}
 		m, err := ProbeATPort(dev)
 		if err != nil {
 			continue
@@ -97,6 +112,32 @@ func DetectAT(ctx context.Context) ([]Modem, error) {
 		modems = append(modems, m)
 	}
 	return modems, nil
+}
+
+// portIgnoredByModemManager reports whether udev has marked dev with
+// ID_MM_PORT_IGNORE=1. A tooling hiccup (udevadm missing/erroring)
+// returns false — "can't tell" must never be treated the same as a
+// real reservation, or a transient failure here would silently make
+// DetectAT skip a perfectly normal port.
+func portIgnoredByModemManager(dev string) bool {
+	out, err := exec.Command("udevadm", "info", "-q", "property", "-n", dev).Output()
+	if err != nil {
+		return false
+	}
+	return parseIDMMPortIgnore(string(out))
+}
+
+// parseIDMMPortIgnore is portIgnoredByModemManager's pure parsing
+// step, split out specifically so it's unit-testable — real hardware
+// and a real udev database can't be faked in a test, but udevadm's
+// own property-output format can.
+func parseIDMMPortIgnore(udevadmOutput string) bool {
+	for _, line := range strings.Split(udevadmOutput, "\n") {
+		if strings.TrimSpace(line) == "ID_MM_PORT_IGNORE=1" {
+			return true
+		}
+	}
+	return false
 }
 
 // sendAT configures the serial port with `stty` (raw mode, no echo,

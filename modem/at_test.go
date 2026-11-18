@@ -5,6 +5,44 @@ import (
 	"testing"
 )
 
+func TestParseIDMMPortIgnore(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{
+			name: "marked ignored",
+			// Real udevadm property-output shape, as seen on aaeon for
+			// a port a 99-dawn-gps.rules-style udev rule has reserved.
+			output: "DEVPATH=/devices/pci0000:00/0000:00:14.0/usb2/2-3/2-3:1.3/ttyUSB3/tty/ttyUSB3\nID_VENDOR_ID=1e0e\nID_MODEL_ID=9001\nID_USB_INTERFACE_NUM=03\nID_MM_PORT_IGNORE=1\n",
+			want:   true,
+		},
+		{
+			name:   "not marked",
+			output: "DEVPATH=/devices/pci0000:00/0000:00:14.0/usb2/2-3/2-3:1.2/ttyUSB2/tty/ttyUSB2\nID_VENDOR_ID=1e0e\nID_MODEL_ID=9001\nID_USB_INTERFACE_NUM=02\n",
+			want:   false,
+		},
+		{
+			name:   "empty output (e.g. udevadm error swallowed upstream)",
+			output: "",
+			want:   false,
+		},
+		{
+			name:   "property present but not exactly \"1\" - must not fuzzy-match",
+			output: "ID_MM_PORT_IGNORE=0\n",
+			want:   false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := parseIDMMPortIgnore(tt.output); got != tt.want {
+				t.Errorf("parseIDMMPortIgnore(%q) = %v, want %v", tt.output, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseATI(t *testing.T) {
 	cases := []struct {
 		name             string
