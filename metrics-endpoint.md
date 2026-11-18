@@ -19,8 +19,10 @@ telemetry writer, the Grafana dashboards, or the `dawn6g-metrics` server stack.
 ## InfluxDB layout
 
 - Org `wavecom`. Buckets: `radio` (90d, periodic KPIs), `network` (90d, TWAMP/QoS/nDPI/eBPF),
-  `events` (365d, RadioEvent: PLMN/PCI/TAC change, EN-DC add/drop, RRC re-est.).
-- Tokens: admin (server only), Grafana read-only on the 3 buckets, **one write-only token per device**
+  `events` (365d, RadioEvent: PLMN/PCI/TAC change, EN-DC add/drop, RRC re-est.), `location` (365d,
+  device GPS/GNSS position — see `gps_fix` below; its own bucket since GPS isn't a radio metric
+  despite coming from the same modem hardware).
+- Tokens: admin (server only), Grafana read-only on all four buckets, **one write-only token per device**
   (`./add-device.sh <id>`, `./revoke-device.sh <id>`; stored in `secrets/devices/<id>.token`).
   On devices the token lives at `/etc/dawn6g/influx.token` (0600). Never commit secrets.
 - Scripts: `gen-secrets.sh`, `bootstrap.sh` (idempotent), `add-device.sh`, `revoke-device.sh`, `lib.sh`.
@@ -106,6 +108,46 @@ section — these are inherent to the design, not bugs):
 
 No Grafana panel for this yet — same open "TODO 2"-style gap as the
 `radio`/`twamp` dashboards below, not yet captured as repo-tracked JSON.
+
+## `location` bucket: `gps_fix`
+
+Written by `cmd/gps-exporter` (the `gps/` package's InfluxDB exporter — see
+`CLAUDE.md`'s `gps/` package section for the detection/backend logic this
+schema reports on). Deployed and running on `6global`/`dawn6g` via the
+AT-over-serial backend; `aaeon`'s `gps-exporter` is currently stopped/
+disabled (independent of hardware — `aaeon` does have a working GNSS
+antenna, confirmed via manual testing, see `CLAUDE.md`).
+
+**`gps_fix`** — one point per poll interval (default 30s), **only written
+when the fix is actually valid** — unlike `radio_cell`/`twamp`, there is no
+safe "skip/NaN" sentinel for "no fix yet," since `(0, 0)` is a real
+coordinate (Null Island); the point is skipped entirely rather than written
+with meaningless zeros.
+
+| Field | Type | Unit | Meaning |
+|---|---|---|---|
+| `latitude` | float | degrees | Signed decimal degrees. |
+| `longitude` | float | degrees | Signed decimal degrees. |
+| `altitude` | float | meters | — |
+
+Tags: `device`, `modem_id`, `method` (`"ModemManager"` or `"AT"` — raw QMI
+is implemented but deliberately disabled, see `CLAUDE.md`).
+
+**No real `gps_fix` point has landed from `6global`/`dawn6g` yet** — both
+run cleanly with zero errors but have no GPS antenna connected, so they
+never get past "engine enabled, polling, no fix." `aaeon` does have a
+working antenna (confirmed via manual AT testing, decoding to
+41.549747, -8.413069 — see `CLAUDE.md`), but that was outside
+`gps-exporter`, which remains stopped there; no point has been written to
+this bucket from any device yet as of this writing.
+
+Deliberately its own bucket, not folded into `radio` — the plan is to
+**join at query time** (Flux `join()` on the `device` tag against the
+latest `gps_fix` point) for map panels combining radio/network metrics with
+position, rather than denormalizing lat/lon onto every `radio_cell`/`twamp`/
+`glitch_summary` point.
+
+No Grafana panel for this yet either.
 
 ## Current state / open work
 

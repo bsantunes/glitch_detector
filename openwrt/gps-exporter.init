@@ -9,10 +9,14 @@
 # add-device.sh issues one per-device token scoped to write on all four
 # buckets (radio/network/events/location), so no separate token is needed here.
 #
-# Only useful on modems reached via raw QMI (gps.Supports) — WaveOS's
-# ubus "qmi" object doesn't expose real GPS coordinates (its "location"
-# method is cell-ID/LAC-CI only, not GNSS). See gps/gps.go's Supports
-# doc comment.
+# Actually deployed and running on WaveOS via the AT-over-serial backend
+# (gps.Supports is true for ModemManager and AT-over-serial; raw QMI is
+# implemented but deliberately disabled after repeatedly corrupting
+# production QMI client state — see CLAUDE.md's gps/ package section
+# and gps/gps.go's Supports doc comment). WaveOS's ubus "qmi" object
+# doesn't expose real GPS coordinates either way (its "location" method
+# is cell-ID/LAC-CI only, not GNSS), so AT-over-serial is what this
+# board actually uses.
 
 START=98
 STOP=1

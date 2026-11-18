@@ -208,6 +208,55 @@ in the cascade on this hardware. All pure-parsing logic (`modem/*_test.go`)
 is covered by unit tests, several built directly from real captured
 `mmcli`/`qmicli` output.
 
+## GPS detection (`gps/` package)
+
+```
+gps.Detect(ctx)
+  │
+  ├─ 1. ModemManager (gps/gps.go, enableModemManager)
+  │     `--location-enable-gps-raw`, then reads already-parsed decimal
+  │     modem.location.gps.{latitude,longitude,altitude} — no NMEA
+  │     parsing needed. Disabled on aaeon specifically by policy (never
+  │     call mmcli --location-* there, never restart ModemManager —
+  │     see CLAUDE.md's gps/ package section for why), independent of
+  │     whether it would otherwise work.
+  │
+  ├─ 2. Raw QMI (gps/qmi.go, QMISession) — implemented, but Supports()
+  │     deliberately refuses it. A persistent background NMEA session
+  │     (qmicli has no one-shot "get current fix" command), gated off
+  │     after repeatedly corrupting production QMI client state on
+  │     6global — see CLAUDE.md's incident writeup before ever
+  │     re-enabling it.
+  │
+  └─ 3. AT-over-serial (gps/at.go) — the backend actually deployed.
+        SIMCom (AT+CGPS=1,1 / AT+CGPSINFO) or Quectel (AT+QGPS=1 /
+        AT+QGPSLOC=2), chosen via detectATGPSVendor. Confirmed live,
+        sustained, zero errors on 6global/dawn6g (no fix — no GPS
+        antenna on either board) and confirmed to obtain a real fix on
+        aaeon's SIMCom modem via manual testing (41.549747, -8.413069)
+        — but only once SIMCom's XTRA assistance data was also enabled
+        (AT+CGPSXE=1); the engine alone tracked satellites but never
+        resolved a position. modem.PortInUse skips any serial port
+        another process already has open.
+```
+
+`gps.Detect` does **not** reuse `modem.Detect()`'s own cascade result or
+stopping rule — it tries ModemManager, then raw QMI/MBIM, then AT, but
+stops at the first step `Supports` will actually use (`anySupported`), not
+the first step that finds any modem at all. That distinction matters on
+WaveOS: raw `qmicli` reliably answers a modem there, but it's unusable for
+GPS (disabled), so without `anySupported` AT would never be reached. See
+CLAUDE.md's `gps/` package section for the full backend/incident history,
+including why `aaeon`'s ModemManager `GeneralError` is not a missing-antenna
+issue despite earlier documentation having theorized that it was.
+
+**`cmd/gps-tool`/`cmd/gps-exporter`** mirror `modem-tool`/`modem-exporter`'s
+shape: detect, then poll on an interval (`gps-tool` prints forever, no
+InfluxDB; `gps-exporter` pushes `gps_fix` points to InfluxDB's `location`
+bucket, only when a fix is valid — see `metrics-endpoint.md`). `gps-exporter`
+is deployed and running on `6global`/`dawn6g`; `gps-tool` isn't installed
+anywhere as a running service.
+
 ## How the two measurement paths complement each other
 
 |                  | **Passive path** (eBPF)                          | **Active path** (TWAMP + modem/)                       |
