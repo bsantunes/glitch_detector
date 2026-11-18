@@ -230,10 +230,13 @@ func enableAT(ctx context.Context, m modem.Modem, vendor atGPSVendor, agps bool)
 	var lastErr error
 	for attempt := 1; attempt <= atEnableRetries; attempt++ {
 		resp, err := atSend(m.Port, cmd, 3*time.Second)
+		log.Printf("gps: [%s] attempt %d/%d: %s -> err=%v resp=%q", m.Port, attempt, atEnableRetries, cmd, err, strings.TrimSpace(resp))
 		if err == nil && strings.Contains(resp, "OK") {
+			log.Printf("gps: [%s] GNSS engine enabled (%s)", m.Port, cmd)
 			return nil
 		}
 		if err == nil && gnssAlreadyRunning(m.Port, stateCmd) {
+			log.Printf("gps: [%s] %s failed but %s confirms the engine is already running — treating as success", m.Port, cmd, stateCmd)
 			return nil
 		}
 		if err != nil {
@@ -253,17 +256,20 @@ func enableAT(ctx context.Context, m modem.Modem, vendor atGPSVendor, agps bool)
 }
 
 // getFixAT queries the modem's current GNSS fix via the vendor-
-// specific AT command and parses the reply.
+// specific AT command and parses the reply. Uses atSendExpectLine, not
+// plain atSend — see that function's doc comment for why: confirmed
+// live on aaeon's SIMCom (SIM8202G-M2) that AT+CGPSINFO's own data line
+// can arrive on either side of the command's "OK".
 func getFixAT(m modem.Modem, vendor atGPSVendor) (Fix, error) {
 	switch vendor {
 	case atGPSVendorSIMCom:
-		resp, err := atSend(m.Port, "AT+CGPSINFO", 3*time.Second)
+		resp, err := atSendExpectLine(m.Port, "AT+CGPSINFO", "+CGPSINFO", 3*time.Second)
 		if err != nil {
 			return Fix{}, fmt.Errorf("AT+CGPSINFO on %s: %w", m.Port, err)
 		}
 		return parseCGPSINFO(resp)
 	case atGPSVendorQuectel:
-		resp, err := atSend(m.Port, "AT+QGPSLOC=2", 3*time.Second)
+		resp, err := atSendExpectLine(m.Port, "AT+QGPSLOC=2", "+QGPSLOC", 3*time.Second)
 		if err != nil {
 			return Fix{}, fmt.Errorf("AT+QGPSLOC=2 on %s: %w", m.Port, err)
 		}
@@ -356,18 +362,53 @@ func parseQGPSLOC(resp string) (Fix, error) {
 	return Fix{Latitude: lat, Longitude: lon, Altitude: alt, Valid: true, Time: time.Now()}, nil
 }
 
-// atSend configures the serial port with `stty` (raw mode, no echo,
-// 115200 8N1) and writes a single AT command, returning whatever the
-// modem replies within the given timeout. Duplicated from
+// atResponseComplete reports whether buf is a complete response for a
+// command whose own unsolicited data line (starting with dataPrefix)
+// is expected alongside "OK"/"ERROR". Confirmed live that the ordering
+// between the two varies by modem/firmware, not just by vendor: on
+// 6global/dawn6g's SIMCom/Quectel modems AT+CGPSINFO/AT+QGPSLOC=2's own
+// data line arrived before "OK", but on aaeon's SIMCom (SIM8202G-M2)
+// "OK" arrives first and the "+CGPSINFO:" line follows moments later —
+// confirmed via manual picocom testing. Neither order can be assumed,
+// so this waits for both, in whichever order they show up. "ERROR"
+// (including Quectel's "+CME ERROR: nnn" no-fix reply) is always
+// terminal on its own: no data line ever follows an error.
+//
+// Searches for dataPrefix+":", not bare dataPrefix — the command echo
+// itself (e.g. "AT+CGPSINFO", "AT+QGPSLOC=2") already contains the bare
+// prefix as a substring, so matching on that alone is satisfied by the
+// echo before any real response line arrives, reproducing the exact
+// truncated-read bug this function exists to fix (caught by this
+// function's own test before it ever reached live hardware again). A
+// real data line is always "+CGPSINFO: ..."/"+QGPSLOC: ..." with a
+// colon right after the prefix; the echoed command never has one there.
+func atResponseComplete(buf, dataPrefix string) bool {
+	if strings.Contains(buf, "ERROR") {
+		return true
+	}
+	return strings.Contains(buf, "OK") && strings.Contains(buf, dataPrefix+":")
+}
+
+// atTransact is atSend/atSendExpectLine's shared implementation: sets
+// up the serial port, writes cmd, and reads until isComplete(buffer
+// accumulated so far) is true or timeout elapses. Duplicated from
 // modem/at.go's unexported sendAT rather than exported across packages
 // for this one shared helper — same reasoning as gps/mmcli.go's
 // parseMmcliKeyValue.
-func atSend(dev, cmd string, timeout time.Duration) (string, error) {
+func atTransact(dev, cmd string, timeout time.Duration, isComplete func(string) bool) (string, error) {
 	// stty commonly exits non-zero here ("unable to perform all requested
-	// operations") even though it applies the settings that matter and the
-	// port works fine afterward — so a failure is logged, not fatal.
-	if err := exec.Command("stty", "-F", dev, "115200", "raw", "-echo").Run(); err != nil {
-		log.Printf("gps: stty %s: %v (continuing anyway)", dev, err)
+	// operations") even as root (confirmed live on aaeon) — but the read
+	// loop below never depends on raw/-echo having actually taken effect:
+	// it only ever substring-searches the accumulated buffer, never
+	// assumes fixed line framing, so a port that still echoes the written
+	// command back doesn't break parsing. Logged with stty's own stderr
+	// (not just the generic exit-status error) so a real misconfiguration
+	// is distinguishable from this already-expected benign failure.
+	sttyCmd := exec.Command("stty", "-F", dev, "115200", "raw", "-echo")
+	var sttyErr strings.Builder
+	sttyCmd.Stderr = &sttyErr
+	if err := sttyCmd.Run(); err != nil {
+		log.Printf("gps: stty %s: %v: %s (continuing anyway)", dev, err, strings.TrimSpace(sttyErr.String()))
 	}
 
 	f, err := os.OpenFile(dev, os.O_RDWR, 0)
@@ -392,7 +433,7 @@ func atSend(dev, cmd string, timeout time.Duration) (string, error) {
 			n, err := f.Read(buf)
 			if n > 0 {
 				sb.Write(buf[:n])
-				if strings.Contains(sb.String(), "OK") || strings.Contains(sb.String(), "ERROR") {
+				if isComplete(sb.String()) {
 					ch <- result{sb.String(), nil}
 					return
 				}
@@ -413,4 +454,23 @@ func atSend(dev, cmd string, timeout time.Duration) (string, error) {
 	case <-time.After(timeout):
 		return "", fmt.Errorf("timeout waiting for response from %s", dev)
 	}
+}
+
+// atSend writes a single AT command and returns whatever the modem
+// replies once "OK" or "ERROR" appears — correct for one-shot
+// settings/query commands (AT+CGPS=1,1, AT+CGPSXE=1, AT+CGPS?, ...),
+// but not for CGPSINFO/QGPSLOC: see atSendExpectLine.
+func atSend(dev, cmd string, timeout time.Duration) (string, error) {
+	return atTransact(dev, cmd, timeout, func(s string) bool {
+		return strings.Contains(s, "OK") || strings.Contains(s, "ERROR")
+	})
+}
+
+// atSendExpectLine is atSend for a command whose own unsolicited data
+// line (starting with dataPrefix) must be waited for alongside
+// "OK"/"ERROR" — see atResponseComplete.
+func atSendExpectLine(dev, cmd, dataPrefix string, timeout time.Duration) (string, error) {
+	return atTransact(dev, cmd, timeout, func(s string) bool {
+		return atResponseComplete(s, dataPrefix)
+	})
 }

@@ -264,6 +264,60 @@ func TestEnableAssistanceData_Quectel_EngineAlreadyRunning(t *testing.T) {
 	}
 }
 
+func TestATResponseComplete_BothOrderings(t *testing.T) {
+	// The real bug this guards against: aaeon's SIMCom (SIM8202G-M2)
+	// sends AT+CGPSINFO's "OK" before its own "+CGPSINFO:" data line —
+	// confirmed live via picocom — the opposite order 6global/dawn6g's
+	// modems showed when getFixAT/parseCGPSINFO were first written. The
+	// old atSend (stop reading as soon as "OK" appears) returned just
+	// "OK" on aaeon, with the data line still in flight, and
+	// parseCGPSINFO correctly failed with "no +CGPSINFO in response".
+	tests := []struct {
+		name       string
+		buf        string
+		dataPrefix string
+		want       bool
+	}{
+		{
+			name:       "data line then OK (6global/dawn6g order) - incomplete after data alone",
+			buf:        "AT+CGPSINFO\r\n+CGPSINFO: ,,,,,,,,\r\n",
+			dataPrefix: "+CGPSINFO",
+			want:       false,
+		},
+		{
+			name:       "data line then OK (6global/dawn6g order) - complete once OK arrives",
+			buf:        "AT+CGPSINFO\r\n+CGPSINFO: ,,,,,,,,\r\n\r\nOK\r\n",
+			dataPrefix: "+CGPSINFO",
+			want:       true,
+		},
+		{
+			name:       "OK then data line (aaeon order) - incomplete after OK alone",
+			buf:        "AT+CGPSINFO\r\n\r\nOK\r\n",
+			dataPrefix: "+CGPSINFO",
+			want:       false,
+		},
+		{
+			name:       "OK then data line (aaeon order) - complete once the data line arrives",
+			buf:        "AT+CGPSINFO\r\n\r\nOK\r\n\r\n+CGPSINFO: ,,,,,,,,\r\n",
+			dataPrefix: "+CGPSINFO",
+			want:       true,
+		},
+		{
+			name:       "CME error is terminal on its own, no data line ever follows",
+			buf:        "AT+QGPSLOC=2\r\n+CME ERROR: 516\r\n",
+			dataPrefix: "+QGPSLOC",
+			want:       true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := atResponseComplete(tt.buf, tt.dataPrefix); got != tt.want {
+				t.Errorf("atResponseComplete(%q, %q) = %v, want %v", tt.buf, tt.dataPrefix, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestParseGNSSState(t *testing.T) {
 	tests := []struct {
 		name string
