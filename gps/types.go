@@ -1,9 +1,10 @@
 // Package gps reads GPS/GNSS fixes from a modem's own GNSS receiver —
-// ModemManager's and raw QMI's location services, specifically (see
-// Supports). It's a standalone package in the same shape as twamp/: its
-// own process (cmd/gps-tool, cmd/gps-exporter), not something wired into
-// dawn-agent's existing active-monitoring loop or the modem/ package's
-// stateless per-call backends.
+// via ModemManager's gps-raw location source or AT-over-serial vendor
+// commands (see Supports; raw QMI is implemented but deliberately
+// disabled). It's a standalone package in the same shape as twamp/:
+// its own process (cmd/gps-tool, cmd/gps-exporter), not something
+// wired into dawn-agent's existing active-monitoring loop or the
+// modem/ package's stateless per-call backends.
 package gps
 
 import "time"

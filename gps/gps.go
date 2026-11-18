@@ -46,6 +46,62 @@ func Detect(ctx context.Context) ([]modem.Modem, error) {
 	return atModems, nil
 }
 
+// DetectWithMethod resolves which modem(s) to use for GPS based on an
+// operator-chosen method ("", "auto" — Detect's own cascade,
+// unchanged; "mm" — ModemManager only; "at" — AT-over-serial only)
+// and, for "at", an optional port override (pin exactly one device
+// instead of scanning every candidate — see DetectATPort). Forcing a
+// method skips the others entirely rather than falling through to
+// them: the whole point of forcing one is to avoid probing/depending
+// on a backend that must not be touched on a given board (e.g.
+// aaeon's hard constraint against ever calling ModemManager's
+// location interface — see CLAUDE.md's gps/ package section).
+// port is only valid together with method "at"; it's an error
+// otherwise, rather than silently ignored.
+func DetectWithMethod(ctx context.Context, method, port string) ([]modem.Modem, error) {
+	if port != "" && method != "at" {
+		return nil, fmt.Errorf("gps: -port requires -method=at (got method %q)", method)
+	}
+	switch method {
+	case "", "auto":
+		return Detect(ctx)
+	case "mm":
+		return modem.DetectModemManager(ctx)
+	case "at":
+		if port != "" {
+			m, err := DetectATPort(ctx, port)
+			if err != nil {
+				return nil, err
+			}
+			return []modem.Modem{m}, nil
+		}
+		return modem.DetectAT(ctx)
+	default:
+		return nil, fmt.Errorf("gps: unknown -method %q (want auto, mm, or at)", method)
+	}
+}
+
+// DescribeMethod renders a human-readable description of what
+// DetectWithMethod(ctx, method, port) is about to do, for a startup
+// log line — describing the real cascade order when auto-detecting,
+// or the forced method/port when one was given, rather than a
+// hardcoded "ModemManager -> raw QMI" that doesn't match either case.
+func DescribeMethod(method, port string) string {
+	switch method {
+	case "", "auto":
+		return "ModemManager -> QMI/MBIM -> AT-over-serial (auto)"
+	case "mm":
+		return "ModemManager only (forced)"
+	case "at":
+		if port != "" {
+			return fmt.Sprintf("AT-over-serial only, pinned to %s (forced)", port)
+		}
+		return "AT-over-serial only (forced)"
+	default:
+		return fmt.Sprintf("unknown method %q", method)
+	}
+}
+
 // anySupported reports whether at least one modem in modems is one
 // Supports actually approves of.
 func anySupported(modems []modem.Modem) bool {
@@ -105,9 +161,12 @@ type Poller struct {
 // the gps-raw location source (best-effort, retried — see
 // enableModemManager) and every Fix call makes a fresh mmcli call. For
 // AT, this enables the modem's own GNSS engine via its vendor-specific
-// command (see enableAT) and every Fix call makes a fresh AT query
-// (see getFixAT) — same one-shot-per-call shape as ModemManager, not
-// a persistent session.
+// command (see enableAT) — optionally preceded by enabling GNSS
+// assistance data if agps is true, see enableAssistanceData — and
+// every Fix call makes a fresh AT query (see getFixAT) — same
+// one-shot-per-call shape as ModemManager, not a persistent session.
+// agps is ignored for ModemManager/QMI, which have no equivalent
+// concept here.
 //
 // The QMI path (NewQMISession — a persistent background NMEA session,
 // since qmicli has no one-shot "get current fix" command) is
@@ -115,7 +174,7 @@ type Poller struct {
 // Supports/NewPollers — see Supports' doc comment for why. This keeps
 // the disable in effect even for a caller that constructs a Poller
 // directly instead of going through NewPollers.
-func NewPoller(ctx context.Context, m modem.Modem) (*Poller, error) {
+func NewPoller(ctx context.Context, m modem.Modem, agps bool) (*Poller, error) {
 	switch m.Method {
 	case modem.MethodModemManager:
 		enableModemManager(ctx, m)
@@ -125,7 +184,7 @@ func NewPoller(ctx context.Context, m modem.Modem) (*Poller, error) {
 		if vendor == atGPSVendorUnknown {
 			return nil, fmt.Errorf("gps: AT GPS not supported for manufacturer %q (only SIMCom/Quectel recognized)", m.Manufacturer)
 		}
-		if err := enableAT(ctx, m, vendor); err != nil {
+		if err := enableAT(ctx, m, vendor, agps); err != nil {
 			return nil, err
 		}
 		return &Poller{m: m, atVendor: vendor}, nil
@@ -164,16 +223,16 @@ func (p *Poller) Modem() modem.Modem {
 
 // NewPollers builds one Poller for every modem in modems that Supports
 // reports as GPS-capable, logging (and skipping) any that don't or
-// that fail to initialize. Callers must Close each returned Poller
-// when done.
-func NewPollers(ctx context.Context, modems []modem.Modem) []*Poller {
+// that fail to initialize. agps is forwarded to NewPoller unchanged.
+// Callers must Close each returned Poller when done.
+func NewPollers(ctx context.Context, modems []modem.Modem, agps bool) []*Poller {
 	var pollers []*Poller
 	for _, m := range modems {
 		if !Supports(m.Method) {
 			log.Printf("gps: [%s] %s (via %s) — GPS not supported for this backend, skipping", m.ID, m.Model, m.Method)
 			continue
 		}
-		p, err := NewPoller(ctx, m)
+		p, err := NewPoller(ctx, m, agps)
 		if err != nil {
 			log.Printf("gps: [%s] NewPoller failed: %v", m.ID, err)
 			continue

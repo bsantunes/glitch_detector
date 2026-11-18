@@ -59,6 +59,30 @@ func PortInUse(dev string) bool {
 	return false
 }
 
+// ProbeATPort sends ATI to exactly dev and returns the Modem it
+// identifies — unlike DetectAT, which scans every candidate device,
+// this touches only the one given. For a caller that already knows
+// which exact port to use (e.g. gps.DetectATPort, for a pinned -port)
+// and has no reason to probe any other port at all. Checked against
+// PortInUse first, same as every DetectAT iteration.
+func ProbeATPort(dev string) (Modem, error) {
+	if PortInUse(dev) {
+		return Modem{}, fmt.Errorf("modem: port %s is already held open by another process", dev)
+	}
+	resp, err := sendAT(dev, "ATI", 2*time.Second)
+	if err != nil {
+		return Modem{}, fmt.Errorf("modem: ATI on %s: %w", dev, err)
+	}
+	manufacturer, model := parseATI(resp)
+	return Modem{
+		ID:           dev,
+		Manufacturer: manufacturer,
+		Model:        model,
+		Port:         dev,
+		Method:       MethodAT,
+	}, nil
+}
+
 // DetectAT scans serial candidate devices for one that answers "AT"
 // with "OK" — the lowest common denominator supported by essentially
 // every cellular modem. This is the last-resort fallback, used only
@@ -66,21 +90,11 @@ func PortInUse(dev string) bool {
 func DetectAT(ctx context.Context) ([]Modem, error) {
 	var modems []Modem
 	for _, dev := range candidateATDevices() {
-		if PortInUse(dev) {
-			continue
-		}
-		resp, err := sendAT(dev, "ATI", 2*time.Second)
+		m, err := ProbeATPort(dev)
 		if err != nil {
 			continue
 		}
-		manufacturer, model := parseATI(resp)
-		modems = append(modems, Modem{
-			ID:           dev,
-			Manufacturer: manufacturer,
-			Model:        model,
-			Port:         dev,
-			Method:       MethodAT,
-		})
+		modems = append(modems, m)
 	}
 	return modems, nil
 }

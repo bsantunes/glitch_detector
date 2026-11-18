@@ -41,6 +41,9 @@ import (
 
 func main() {
 	interval := flag.Duration("interval", 30*time.Second, "how often to poll for a GPS fix and push to InfluxDB")
+	method := flag.String("method", "auto", "detection method: auto (default), mm (ModemManager only), at (AT-over-serial only)")
+	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/dawn-gps); requires -method=at")
+	agps := flag.Bool("agps", true, "enable GNSS assistance data (XTRA) on AT-over-serial backends before starting the engine")
 	influxURL := flag.String("influx-url", "", "InfluxDB base URL, e.g. https://wservices.wavesys.pt:8086 (required)")
 	influxToken := flag.String("influx-token", "", "InfluxDB API token (falls back to INFLUX_TOKEN env var)")
 	influxOrg := flag.String("influx-org", "wavecom", "InfluxDB org")
@@ -69,23 +72,23 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	log.Printf("Detecting GPS-capable modems (ModemManager -> raw QMI)...")
-	modems, err := gps.Detect(ctx)
+	log.Printf("Detecting GPS-capable modems (%s)...", gps.DescribeMethod(*method, *port))
+	modems, err := gps.DetectWithMethod(ctx, *method, *port)
 	if err != nil {
 		log.Printf("gps detection error: %v", err)
 	}
 	if len(modems) == 0 {
-		log.Fatalf("no modems found via ModemManager or raw QMI")
+		log.Fatalf("no modems found via %s", gps.DescribeMethod(*method, *port))
 	}
 
-	pollers := gps.NewPollers(ctx, modems)
+	pollers := gps.NewPollers(ctx, modems, *agps)
 	defer func() {
 		for _, p := range pollers {
 			p.Close()
 		}
 	}()
 	if len(pollers) == 0 {
-		log.Fatalf("no GPS-capable modems found (ModemManager or QMI backends only)")
+		log.Fatalf("no GPS-capable modems found (ModemManager or AT-over-serial only — raw QMI is implemented but deliberately disabled)")
 	}
 	for _, p := range pollers {
 		m := p.Modem()

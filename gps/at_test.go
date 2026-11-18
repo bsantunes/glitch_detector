@@ -64,6 +64,34 @@ func TestParseCGPSINFO_ValidFix(t *testing.T) {
 	}
 }
 
+func TestParseCGPSINFO_RealReferenceFix(t *testing.T) {
+	// Ground-truth check against a real fix obtained via manual
+	// AT-over-serial testing on aaeon's SIMCom modem (antenna
+	// confirmed working, XTRA assistance data enabled) - captured as
+	// $GPRMC,192721.00,A,4132.984808,N,00824.784113,W,... (see
+	// CLAUDE.md's gps/ package section), decoding to 41.549747,
+	// -8.413069 (Portugal). +CGPSINFO uses the same NMEA ddmm.mmmm
+	// lat/lon encoding as the raw $GPRMC sentence, so the reply below
+	// is built from those exact field values, not a literal captured
+	// +CGPSINFO line - the point is testing our parser against known
+	// real-world numbers, not just documented/community examples.
+	resp := "AT+CGPSINFO\r\n+CGPSINFO: 4132.984808,N,00824.784113,W,171126,192721.0,0.0,0.0,\r\n\r\nOK\r\n"
+	fix, err := parseCGPSINFO(resp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !fix.Valid {
+		t.Fatalf("expected Valid=true, got %+v", fix)
+	}
+	const wantLat, wantLon = 41.549747, -8.413069
+	if math.Abs(fix.Latitude-wantLat) > 1e-6 {
+		t.Errorf("Latitude = %v, want %v", fix.Latitude, wantLat)
+	}
+	if math.Abs(fix.Longitude-wantLon) > 1e-6 {
+		t.Errorf("Longitude = %v, want %v", fix.Longitude, wantLon)
+	}
+}
+
 func TestParseCGPSINFO_Malformed(t *testing.T) {
 	for _, resp := range []string{
 		"AT+CGPSINFO\r\nOK\r\n",      // no +CGPSINFO line at all
@@ -118,6 +146,35 @@ func TestParseQGPSLOC_ValidFix(t *testing.T) {
 	}
 	if fix.Altitude != 62.2 {
 		t.Errorf("Altitude = %v, want 62.2", fix.Altitude)
+	}
+}
+
+func TestParseQGPSLOC_WesternLongitudeStaysNegative(t *testing.T) {
+	// AT+QGPSLOC=2 reports lat/lon as signed decimal degrees directly
+	// (not NMEA ddmm.mmmm) - a western longitude must come back
+	// negative, unchanged. This is a synthetic example (same reference
+	// coordinates as aaeon's real SIMCom fix, 41.549747,-8.413069, for
+	// a realistic western-hemisphere case), not a live Quectel
+	// capture - it only confirms our own parser doesn't introduce a
+	// sign error on top of whatever the modem reports. The
+	// community-reported sign bug on some Quectel firmware (positive
+	// values returned for western longitudes) remains UNVERIFIED
+	// either way against real hardware: no Quectel board has gotten a
+	// real fix yet to check against a known reference point.
+	resp := "AT+QGPSLOC=2\r\n+QGPSLOC: 192721.00,41.549747,-8.413069,0.7,0.0,2,0.00,0.0,0.0,171126,09\r\n\r\nOK\r\n"
+	fix, err := parseQGPSLOC(resp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !fix.Valid {
+		t.Fatalf("expected Valid=true, got %+v", fix)
+	}
+	if fix.Longitude >= 0 {
+		t.Errorf("Longitude = %v, want negative (western)", fix.Longitude)
+	}
+	const wantLon = -8.413069
+	if math.Abs(fix.Longitude-wantLon) > 1e-6 {
+		t.Errorf("Longitude = %v, want %v", fix.Longitude, wantLon)
 	}
 }
 

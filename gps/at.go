@@ -30,6 +30,19 @@ const (
 	atGPSVendorQuectel
 )
 
+// DetectATPort treats dev as the one AT GPS port to use, touching
+// only that exact device (modem.ProbeATPort) — for -port, which pins
+// a specific port (e.g. a dedicated, reserved GPS port like
+// /dev/dawn-gps) instead of letting modem.DetectAT scan every
+// ttyUSB/ttyACM candidate and risk probing ports it has no reason to
+// touch. Fails clearly if dev is already held open by another process
+// (modem.PortInUse, checked inside ProbeATPort) rather than silently
+// skipping it the way the general AT cascade does, and fails clearly
+// if dev doesn't answer AT at all.
+func DetectATPort(ctx context.Context, dev string) (modem.Modem, error) {
+	return modem.ProbeATPort(dev)
+}
+
 // detectATGPSVendor maps an AT-detected modem's manufacturer string
 // (from modem.DetectAT's ATI probe) to the GPS command dialect to use.
 func detectATGPSVendor(m modem.Modem) atGPSVendor {
@@ -81,12 +94,77 @@ func gnssAlreadyRunning(port, stateCmd string) bool {
 	return parseGNSSState(resp)
 }
 
+// enableAssistanceData turns on the vendor's own GNSS assistance-data
+// (XTRA) feature. On aaeon's SIMCom modem (real antenna, confirmed
+// working — see CLAUDE.md's gps/ package section) this was the
+// difference between the receiver tracking real satellites at
+// 25-35 dB-Hz indefinitely without ever resolving a position, and
+// getting a real fix: assistance data is required here, not optional,
+// despite the engine nominally working fine without it. Best-effort
+// and silent on failure beyond a log line — never blocks or fails
+// startup, since a missing/failed enable doesn't prevent GPS from
+// working at all, just (on hardware like aaeon's) can mean it may
+// never acquire a fix.
+func enableAssistanceData(m modem.Modem, vendor atGPSVendor) {
+	switch vendor {
+	case atGPSVendorSIMCom:
+		// AT+CGPSXE=1 must be sent before AT+CGPS=1,1 starts the engine
+		// (per SIMCom's own command ordering) — this is called before
+		// the engine-enable retry loop below for exactly that reason.
+		resp, err := atSend(m.Port, "AT+CGPSXE=1", 3*time.Second)
+		if err != nil || !strings.Contains(resp, "OK") {
+			log.Printf("gps: [%s] AT+CGPSXE=1 (enable XTRA assistance data) failed, continuing without it: err=%v resp=%q", m.Port, err, strings.TrimSpace(resp))
+			return
+		}
+		log.Printf("gps: [%s] XTRA assistance data enabled (AT+CGPSXE=1)", m.Port)
+		// AT+CGPSXE? reports whether the setting persists across a
+		// modem reboot — logged for visibility (an operator reading
+		// this log can tell whether it needs re-enabling after every
+		// boot), not acted on differently either way here. SIMCom's
+		// AT command set has no separately documented "auto-download"
+		// toggle distinct from CGPSXE itself as far as could be
+		// confirmed without live hardware access — if one turns up
+		// during live testing, add it here.
+		if state, err := atSend(m.Port, "AT+CGPSXE?", 3*time.Second); err == nil {
+			log.Printf("gps: [%s] AT+CGPSXE? = %q", m.Port, strings.TrimSpace(state))
+		}
+	case atGPSVendorQuectel:
+		// AT+QGPSXTRA=1 must be set while the engine is OFF — called
+		// here, before the engine-enable retry loop, specifically so
+		// it runs while the engine is still off on a clean start. If
+		// the engine happens to already be running (e.g. a restarted
+		// process finding it still on from before), this command is
+		// expected to fail — that's not specially handled, since
+		// either way the outcome here is just "log and continue".
+		resp, err := atSend(m.Port, "AT+QGPSXTRA=1", 3*time.Second)
+		if err != nil || !strings.Contains(resp, "OK") {
+			log.Printf("gps: [%s] AT+QGPSXTRA=1 (enable XTRA assistance data) failed, continuing without it: err=%v resp=%q", m.Port, err, strings.TrimSpace(resp))
+			return
+		}
+		log.Printf("gps: [%s] XTRA assistance data enabled (AT+QGPSXTRA=1)", m.Port)
+		// AT+QGPSXTRADATA? reports whether the downloaded assistance
+		// data is still valid — logged for visibility, same reasoning
+		// as AT+CGPSXE? above.
+		if valid, err := atSend(m.Port, "AT+QGPSXTRADATA?", 3*time.Second); err == nil {
+			log.Printf("gps: [%s] AT+QGPSXTRADATA? = %q", m.Port, strings.TrimSpace(valid))
+		}
+	}
+}
+
 // enableAT turns on the modem's own GNSS engine via the vendor-
 // specific AT command, retried best-effort the same way
 // enableModemManager/NewQMISession's --loc-start are. A failed enable
 // attempt is treated as success if gnssAlreadyRunning confirms the
 // engine is already on — see that function's doc comment for why.
-func enableAT(ctx context.Context, m modem.Modem, vendor atGPSVendor) error {
+// agps controls whether enableAssistanceData runs first (default true
+// at the cmd/ layer; see -agps) — assistance data download happens
+// over the cellular data connection, so it only works while the modem
+// is actually connected.
+func enableAT(ctx context.Context, m modem.Modem, vendor atGPSVendor, agps bool) error {
+	if agps {
+		enableAssistanceData(m, vendor)
+	}
+
 	var cmd, stateCmd string
 	switch vendor {
 	case atGPSVendorSIMCom:
