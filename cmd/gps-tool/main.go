@@ -25,7 +25,7 @@ func main() {
 	interval := flag.Duration("interval", 10*time.Second, "polling interval for GPS fixes")
 	method := flag.String("method", "auto", "detection method: auto (default), mm (ModemManager only), at (AT-over-serial only)")
 	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/ttyUSB3); requires -method=at")
-	agps := flag.Bool("agps", true, "enable GNSS assistance data (XTRA) on AT-over-serial backends before starting the engine")
+	agps := flag.Bool("agps", true, "send the XTRA assistance-data enable command on AT-over-serial backends before starting the engine; the setting itself is stored in the modem and persists across reboots, so -agps=false only skips sending the command, it does not turn off assistance data already enabled")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

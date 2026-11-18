@@ -207,7 +207,11 @@ func engineAlreadyRunning(send atSendFunc, port, stateCmd string) bool {
 // agps controls whether enableAssistanceData runs first (default true
 // at the cmd/ layer; see -agps) — assistance data download happens
 // over the cellular data connection, so it only works while the modem
-// is actually connected.
+// is actually connected. It only controls whether the enable command
+// is sent here: the setting itself is stored in the modem and
+// persists across reboots (confirmed live on aaeon's SIMCom via
+// AT+CGPSXE? after a reboot), so agps=false does not turn off
+// assistance data a previous run already enabled.
 func enableAT(ctx context.Context, m modem.Modem, vendor atGPSVendor, agps bool) error {
 	if agps {
 		enableAssistanceData(m, vendor, atSend)
