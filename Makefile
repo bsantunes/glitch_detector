@@ -11,7 +11,6 @@ GPS_BIN := gps-tool
 GPS_EXPORTER_BIN := gps-exporter
 GLITCH_BIN := glitch-tool
 GLITCH_EXPORTER_BIN := glitch-exporter
-GO_MOD  := go.mod
 INSTALL_DIR := /opt/dawn
 
 # dawn-agent is superseded by glitch-exporter + twamp-exporter +
@@ -25,32 +24,32 @@ all: $(BPF_OBJ)
 # standalone modem detection/signal-quality CLI (modem/ package) — not
 # part of the default build, since it's for developing modem support
 # independently of the eBPF/TWAMP agent.
-modem-tool: deps
+modem-tool:
 	go build -o $(MODEM_BIN) ./cmd/modem-tool
 
 # long-running service that polls modem/ and pushes signal+cell info to
 # InfluxDB — meant to run continuously (systemd/procd), not interactively.
-modem-exporter: deps
+modem-exporter:
 	go build -o $(EXPORTER_BIN) ./cmd/modem-exporter
 
 # standalone native-Go TWAMP-Test prober (twamp/ package) — no external
 # twampy/Python dependency, so it also works on OpenWrt/WaveOS.
-twamp-tool: deps
+twamp-tool:
 	go build -o $(TWAMP_BIN) ./cmd/twamp-tool
 
 # long-running service that probes twamp/ and pushes RTT/jitter/loss to
 # InfluxDB's "network" bucket — meant to run continuously (systemd/procd).
-twamp-exporter: deps
+twamp-exporter:
 	go build -o $(TWAMP_EXPORTER_BIN) ./cmd/twamp-exporter
 
 # standalone GPS/GNSS fix prober (gps/ package) — ModemManager/raw-QMI
 # backends only so far, see gps.Supports.
-gps-tool: deps
+gps-tool:
 	go build -o $(GPS_BIN) ./cmd/gps-tool
 
 # long-running service that polls gps/ and pushes GPS fixes to
 # InfluxDB's "location" bucket — meant to run continuously (systemd/procd).
-gps-exporter: deps
+gps-exporter:
 	go build -o $(GPS_EXPORTER_BIN) ./cmd/gps-exporter
 
 # copy for go:embed — the glitch/ package embeds tc_glitch.o from its
@@ -68,28 +67,17 @@ embed: glitch/tc_glitch.o
 # standalone passive eBPF stall/retransmission monitor (glitch/
 # package) — same event stream as dawn-agent's passive loop, no
 # TWAMP/modem side, no InfluxDB.
-glitch-tool: deps glitch/tc_glitch.o
+glitch-tool: glitch/tc_glitch.o
 	go build -o $(GLITCH_BIN) ./cmd/glitch-tool
 
 # long-running service that runs the eBPF passive monitor and pushes
 # aggregated stall-episode/retransmission stats to InfluxDB's "network"
 # bucket — meant to run continuously (systemd; no OpenWrt procd init
 # script, since the eBPF/TC side doesn't work on WaveOS at all).
-glitch-exporter: deps glitch/tc_glitch.o
+glitch-exporter: glitch/tc_glitch.o
 	go build -o $(GLITCH_EXPORTER_BIN) ./cmd/glitch-exporter
 
-# ensure go.mod exists and dependencies are fetched
-$(GO_MOD):
-	@echo "initializing go module and fetching dependencies"
-	go mod init dawn-agent
-	go get github.com/cilium/ebpf
-	go get github.com/vishvananda/netlink
-	go get github.com/influxdata/influxdb-client-go/v2
-
-deps: $(GO_MOD)
-	go mod tidy
-
-$(GO_BIN): deps
+$(GO_BIN):
 	go build -o $(GO_BIN)
 
 $(BPF_OBJ): $(BPF_SRC)
