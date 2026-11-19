@@ -1,11 +1,21 @@
 #!/bin/bash
 # TEST 3 - gateway-side outage: a short total outage (netem loss 100%
-# on this interface) must be reported as exactly one stall episode on
-# the iperf3 flow (port 5201), with a duration somewhat longer than
-# the outage itself (RTO backoff — see CLAUDE.md's glitch/ package
-# section's "known limitations" on why). Reference results (pinned
-# deps, -capture ebpf, aaeon, 3/3 pass, -outage-seconds 1): 1160.7 ms/
-# 3 steps, 1276.0 ms/3 steps, 2118.4 ms/4 steps.
+# on this interface) must be reported as a stall episode on the
+# iperf3 flow (port 5201) whose duration is at least the outage length
+# itself (RTO backoff — see CLAUDE.md's glitch/ package section's
+# "known limitations" — always makes the real one longer than the
+# outage, never shorter). Reference results (pinned deps, -capture
+# ebpf, aaeon, 3/3 pass, -outage-seconds 1): 1160.7 ms/3 steps,
+# 1276.0 ms/3 steps, 2118.4 ms/4 steps.
+#
+# Pass is "at least one" rather than "exactly one" deliberately —
+# confirmed live that a real cellular link can produce its own short,
+# legitimate stall purely from ordinary jitter during a bulk transfer,
+# completely unrelated to the injected outage (one run saw a 111ms/
+# 1-step episode fire before netem was even added, immediately
+# followed by the real 1212ms/3-step one from the actual outage). Any
+# such extra stall is reported, not treated as a failure — only the
+# injected outage's own detection is scored.
 #
 # Valid for -capture ebpf only: AF_PACKET observes egress after the
 # qdisc, so the netem-dropped originals never reach its tap at all —
@@ -68,10 +78,27 @@ for i in $(seq 1 "$RUNS"); do
 		echo "run $i: NOT SCORED (afpacket, see warning above)"
 		continue
 	fi
-	if [ "$starts" -eq 1 ] && [ "$ends" -eq 1 ] && [ "$retrans" -gt 0 ]; then
-		echo "run $i: PASS"
+
+	# At least one Stall END attributable to the injected outage
+	# (duration >= the outage length) — see this script's own header
+	# for why "at least one" rather than "exactly one."
+	outage_ms=$((OUTAGE_SECONDS * 1000))
+	matched=0
+	while read -r dur; do
+		[ -z "$dur" ] && continue
+		if awk -v d="$dur" -v o="$outage_ms" 'BEGIN { exit !(d >= o) }'; then
+			matched=$((matched + 1))
+		fi
+	done < <(grep "Stall END" "$log" | grep ":5201$" | grep -oE 'duration [0-9.]+ms' | grep -oE '[0-9.]+')
+
+	if [ "$matched" -ge 1 ] && [ "$retrans" -gt 0 ]; then
+		if [ "$ends" -gt "$matched" ]; then
+			echo "run $i: PASS (outage matched by $matched stall(s) >= ${outage_ms}ms; $((ends - matched)) additional shorter stall(s) also seen — incidental link jitter, unrelated to the injected outage)"
+		else
+			echo "run $i: PASS"
+		fi
 	else
-		echo "run $i: FAIL (expected exactly 1 Stall START + 1 Stall END on the iperf3 flow, plus retransmissions)"
+		echo "run $i: FAIL (expected at least one Stall END >= ${outage_ms}ms on the iperf3 flow, plus retransmissions)"
 		overall_pass=0
 	fi
 	echo "log: $log"

@@ -5,8 +5,9 @@
 # afpacket genuinely see the same thing (real data and
 # retransmissions leave the gateway and never get ACKed; a local
 # netem outage drops packets at the gateway itself, which test3's own
-# AF_PACKET warning covers). Same pass criteria as test3_outage.sh,
-# valid for both capture methods.
+# AF_PACKET warning covers). Same pass criteria as test3_outage.sh ("at least
+# one" matching stall, not "exactly one" — see that script's own
+# header for why), valid for both capture methods.
 #
 # wservices side (already provisioned there, not this script's job):
 #   /usr/local/sbin/iperf-outage [seconds] — inserts
@@ -37,7 +38,7 @@ if [ "$OUTAGE_SECONDS" -lt 1 ] || [ "$OUTAGE_SECONDS" -gt 10 ]; then
 fi
 
 SSH_KEY="${TEST3B_SSH_KEY:-$HOME/.ssh/id_ed25519_wservices_outage}"
-SSH_TARGET="idwave@wservices"
+SSH_TARGET="${TEST3B_SSH_TARGET:-idwave@wservices.wavesys.pt}"
 IPERF_TARGET="51.91.57.3"
 
 # Fails loudly rather than letting a leftover DROP rule on a shared,
@@ -89,10 +90,29 @@ for i in $(seq 1 "$RUNS"); do
 	echo "run $i: stall_starts=$starts stall_ends=$ends retrans=$retrans"
 	grep "Stall END" "$log" | grep ":5201$" || true
 
-	if [ "$starts" -eq 1 ] && [ "$ends" -eq 1 ] && [ "$retrans" -gt 0 ]; then
-		echo "run $i: PASS"
+	# At least one Stall END attributable to the injected outage
+	# (duration >= the outage length) — see test3_outage.sh's header
+	# for why "at least one" rather than "exactly one": a real
+	# cellular link can produce its own short, legitimate stall from
+	# ordinary jitter during a bulk transfer, unrelated to the
+	# injected outage.
+	outage_ms=$((OUTAGE_SECONDS * 1000))
+	matched=0
+	while read -r dur; do
+		[ -z "$dur" ] && continue
+		if awk -v d="$dur" -v o="$outage_ms" 'BEGIN { exit !(d >= o) }'; then
+			matched=$((matched + 1))
+		fi
+	done < <(grep "Stall END" "$log" | grep ":5201$" | grep -oE 'duration [0-9.]+ms' | grep -oE '[0-9.]+')
+
+	if [ "$matched" -ge 1 ] && [ "$retrans" -gt 0 ]; then
+		if [ "$ends" -gt "$matched" ]; then
+			echo "run $i: PASS (outage matched by $matched stall(s) >= ${outage_ms}ms; $((ends - matched)) additional shorter stall(s) also seen — incidental link jitter, unrelated to the injected outage)"
+		else
+			echo "run $i: PASS"
+		fi
 	else
-		echo "run $i: FAIL (expected exactly 1 Stall START + 1 Stall END on the iperf3 flow, plus retransmissions)"
+		echo "run $i: FAIL (expected at least one Stall END >= ${outage_ms}ms on the iperf3 flow, plus retransmissions)"
 		overall_pass=0
 	fi
 	echo "log: $log"
