@@ -40,7 +40,7 @@ modem_state,device=<id>,modem_id=<n> operator_name="<s>",registration_state="<s>
 - Go client `github.com/influxdata/influxdb-client-go/v2`, one `WriteAPI` per bucket, batch 500,
   flush 1000 ms, max retries 10, retry buffer 100000 points (RAM only), precision ms.
 
-## `network` bucket: `glitch_summary` / `glitch_event` (eBPF stall/retransmission monitor)
+## `network` bucket: `glitch_summary` / `glitch_event` (stall/retransmission monitor)
 
 Written by `cmd/glitch-exporter` (the `glitch/` package's InfluxDB exporter —
 see `CLAUDE.md`'s `glitch/` package section for the detection logic this
@@ -48,6 +48,17 @@ schema reports on). Confirmed live on `aaeon`: a forced-outage test's points
 matched the kernel's own reported duration/step count exactly, and 10+
 minutes of background-only traffic kept ticking `glitch_summary` with
 `stall_episodes=0` throughout.
+
+**`-capture` (`ebpf`, default, or `afpacket`) selects which capture backend
+produces the events both measurements below report on — added this session
+as part of unifying the detection algorithm (`glitch/core`, ported from
+`bpf_src/tc_glitch.bpf.c`) behind either capture method, for boards with no
+clsact/TC-BPF support at all (confirmed on WaveOS). Both measurements carry
+an additive `capture` tag recording which one produced each point. Results
+from the two methods are not directly comparable: AF_PACKET observes egress
+traffic after the qdisc and after GSO segmentation; eBPF observes it before
+— a side-by-side validation of the two is tracked as separate follow-up
+work, not done yet.**
 
 **`glitch_summary`** — one point per `-interval` (default 10s), **always
 written even when every field is zero** (a heartbeat — unlike `radio_cell`/
@@ -62,7 +73,7 @@ written even when every field is zero** (a heartbeat — unlike `radio_cell`/
 | `retrans_count` | int | count | Retransmissions seen this interval. |
 | `dropped_events` | uint | count | Delta of `glitch.Handle.Dropped()` since the last tick — kernel ring-buffer events the Go side's internal channel couldn't keep up with. Should stay 0 under normal load. |
 
-Tags: `device`, `iface`. **Never an IP address or port** — see `glitch_event` below for where those actually live.
+Tags: `device`, `iface`, `capture` (`ebpf`/`afpacket` — additive, see above). **Never an IP address or port** — see `glitch_event` below for where those actually live.
 
 **`glitch_event`** — one point per `stall_start`/`stall_end`/`stall_abandoned`.
 **No point for a retransmission** — those are counted only, via
@@ -84,7 +95,7 @@ across all three types; anything the limit drops still counts in
 | `steps` | int | count | **`stall_end`/`stall_abandoned` only.** Number of qualifying gaps folded into the episode (matches the visible retry/backoff count). Always 0 for `stall_abandoned` — the kernel only ever reports a step count on `STALL_END`, which by definition never arrived, so the real count is genuinely unknown, not a plausible-looking default. |
 
 Tags: `device`, `iface`, `type` (`"stall_start"` / `"stall_end"` /
-`"stall_abandoned"`).
+`"stall_abandoned"`), `capture` (`ebpf`/`afpacket` — additive, see above).
 
 **Deliberately never a tag on an IP address or port anywhere in this
 schema** — unlike `radio_cell`'s `device`/`modem_id` or `twamp`'s

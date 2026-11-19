@@ -1,8 +1,16 @@
-// Command glitch-tool is a standalone passive eBPF stall/retransmission
+// Command glitch-tool is a standalone passive stall/retransmission
 // monitor built on the glitch/ package — the same printed event shape
 // as dawn-agent's own passive loop, but no TWAMP/modem active-
-// monitoring side and no InfluxDB. Requires root to load the eBPF
-// program and attach the clsact qdisc/filter, same as dawn-agent.
+// monitoring side and no InfluxDB. Two capture backends, selected via
+// -capture: "ebpf" (default on Debian; requires root to load the
+// program and attach the clsact qdisc/filter, same as dawn-agent) or
+// "afpacket" (glitch/afpacket — for boards with no clsact/TC-BPF
+// kernel support at all, confirmed on WaveOS; also requires root, for
+// the raw AF_PACKET socket). Both run the identical algorithm
+// (glitch/core, ported from bpf_src/tc_glitch.bpf.c) — see
+// CLAUDE.md's glitch/ package section for why results from the two
+// are not directly comparable (AF_PACKET sees egress after the qdisc
+// and after GSO segmentation; eBPF sees it before).
 package main
 
 import (
@@ -12,10 +20,12 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
 	"dawn-agent/glitch"
+	"dawn-agent/glitch/afpacket"
 )
 
 func main() {
@@ -32,18 +42,36 @@ func main() {
 
 func run() error {
 	iface := flag.String("iface", "wwan0", "network interface to attach to")
+	capture := flag.String("capture", "ebpf", "capture backend: ebpf (default) or afpacket (for boards with no clsact/TC-BPF support)")
 	flag.Parse()
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	h, err := glitch.Open(*iface)
-	if err != nil {
-		return fmt.Errorf("glitch.Open(%s): %w", *iface, err)
+	var h glitch.Source
+	switch *capture {
+	case "", "ebpf":
+		var err error
+		h, err = glitch.Open(*iface)
+		if err != nil {
+			return fmt.Errorf("glitch.Open(%s): %w", *iface, err)
+		}
+	case "afpacket":
+		var err error
+		h, err = afpacket.Open(*iface, nil)
+		if err != nil {
+			return fmt.Errorf("afpacket.Open(%s): %w", *iface, err)
+		}
+	default:
+		return fmt.Errorf("unknown -capture %q (want ebpf or afpacket)", *capture)
 	}
 	defer h.Close()
 
-	fmt.Printf("🚀 glitch-tool watching %s (Ctrl+C to stop)\n", *iface)
+	fmt.Printf("🚀 glitch-tool watching %s via %s (Ctrl+C to stop)\n", *iface, *capture)
+	tag := strings.ToUpper(*capture)
+	if tag == "" {
+		tag = "EBPF"
+	}
 
 	// Printed periodically, not just on a clean exit: a SIGKILL skips
 	// every deferred/exit-path print, so this is the only way to see
@@ -66,11 +94,11 @@ func run() error {
 			}
 			switch ev.Type {
 			case glitch.KindRetrans:
-				fmt.Printf("🔴 [KERNEL] TCP Loss Detected | %s %s:%d -> %s:%d\n", protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Printf("🔴 [%s] TCP Loss Detected | %s %s:%d -> %s:%d\n", tag, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallStart:
-				fmt.Printf("🟡 [KERNEL] Stall START: gap %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Printf("🟡 [%s] Stall START: gap %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallEnd:
-				fmt.Printf("✅ [KERNEL] Stall END: duration %.1fms, steps=%d (baseline %.1fms) | %s %s:%d -> %s:%d\n", float64(ev.Value)/1e6, ev.Steps, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Printf("✅ [%s] Stall END: duration %.1fms, steps=%d (baseline %.1fms) | %s %s:%d -> %s:%d\n", tag, float64(ev.Value)/1e6, ev.Steps, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			}
 		}
 	}

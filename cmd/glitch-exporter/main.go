@@ -1,16 +1,26 @@
-// Command glitch-exporter runs the eBPF passive stall/retransmission
+// Command glitch-exporter runs the passive stall/retransmission
 // monitor (glitch/ package) continuously and pushes aggregated stats to
 // InfluxDB's "network" bucket - meant to run as a service (systemd on
-// the Debian gateway; no OpenWrt procd init script, since the eBPF/TC
-// side this package depends on doesn't work on WaveOS at all - see
-// CLAUDE.md). For ad hoc/interactive inspection without InfluxDB, use
-// cmd/glitch-tool instead.
+// the Debian gateway; no OpenWrt procd init script yet for the
+// afpacket backend, though unlike the eBPF one it works on WaveOS -
+// see CLAUDE.md). For ad hoc/interactive inspection without InfluxDB,
+// use cmd/glitch-tool instead.
+//
+// Two capture backends, selected via -capture: "ebpf" (default;
+// requires root, Debian/clsact-capable boards only) or "afpacket"
+// (glitch/afpacket - works on WaveOS, which has no clsact/TC-BPF
+// support at all; also requires root, for the raw AF_PACKET socket).
+// Both run the identical algorithm (glitch/core, ported from
+// bpf_src/tc_glitch.bpf.c) - see CLAUDE.md's glitch/ package section
+// for why results from the two are not directly comparable (AF_PACKET
+// sees egress after the qdisc and after GSO segmentation; eBPF sees
+// it before).
 //
 // Schema:
 //
 //   - measurement "glitch_summary", one point per -interval, always
 //     written even when every field is zero (a heartbeat).
-//     Tags: device, iface.
+//     Tags: device, iface, capture (ebpf/afpacket - additive).
 //     Fields: stall_episodes (STALL_ENDs seen this interval),
 //     stall_max_ms, stall_sum_ms, stall_open (episodes started but not
 //     yet ended as of this point), retrans_count, dropped_events (the
@@ -21,7 +31,7 @@
 //     kernel event's own time (or, for stall_abandoned, the moment the
 //     timeout was detected - there is no kernel event to read a time
 //     from), not InfluxDB write time.
-//     Tags: device, iface, type.
+//     Tags: device, iface, type, capture (ebpf/afpacket - additive).
 //     Fields: proto, src_port, dst_port, dst_ip (string), baseline_ms,
 //     and - stall_end/stall_abandoned only - duration_ms and steps.
 //     Rate-limited to -max-events-per-sec points/second, shared across
@@ -52,6 +62,7 @@ import (
 	"github.com/influxdata/influxdb-client-go/v2/api/write"
 
 	"dawn-agent/glitch"
+	"dawn-agent/glitch/afpacket"
 )
 
 // abandonedCheckInterval is how often Aggregator.CheckAbandoned runs -
@@ -69,6 +80,7 @@ func main() {
 
 func run() error {
 	iface := flag.String("iface", "wwan0", "network interface to attach to")
+	capture := flag.String("capture", "ebpf", "capture backend: ebpf (default) or afpacket (for boards with no clsact/TC-BPF support)")
 	interval := flag.Duration("interval", 10*time.Second, "how often to write a glitch_summary point")
 	influxURL := flag.String("influx-url", "", "InfluxDB base URL, e.g. https://wservices.wavesys.pt:8086 (required)")
 	influxToken := flag.String("influx-token", "", "InfluxDB API token (falls back to INFLUX_TOKEN env var)")
@@ -99,9 +111,22 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	h, err := glitch.Open(*iface)
-	if err != nil {
-		return fmt.Errorf("glitch.Open(%s): %w", *iface, err)
+	var h glitch.Source
+	switch *capture {
+	case "", "ebpf":
+		var err error
+		h, err = glitch.Open(*iface)
+		if err != nil {
+			return fmt.Errorf("glitch.Open(%s): %w", *iface, err)
+		}
+	case "afpacket":
+		var err error
+		h, err = afpacket.Open(*iface, nil)
+		if err != nil {
+			return fmt.Errorf("afpacket.Open(%s): %w", *iface, err)
+		}
+	default:
+		return fmt.Errorf("unknown -capture %q (want ebpf or afpacket)", *capture)
 	}
 	defer h.Close()
 
@@ -116,8 +141,8 @@ func run() error {
 
 	agg := NewAggregator(time.Now, *maxEventsPerSec)
 
-	log.Printf("exporting glitch stats for %s to %s (org=%s bucket=%s device=%s) every %s",
-		*iface, *influxURL, *influxOrg, *influxBucket, *deviceID, *interval)
+	log.Printf("exporting glitch stats for %s via %s to %s (org=%s bucket=%s device=%s) every %s",
+		*iface, *capture, *influxURL, *influxOrg, *influxBucket, *deviceID, *interval)
 
 	summaryTicker := time.NewTicker(*interval)
 	defer summaryTicker.Stop()
@@ -135,26 +160,27 @@ func run() error {
 				return h.Err()
 			}
 			for _, p := range agg.HandleEvent(ev) {
-				writeAPI.WritePoint(eventInfluxPoint(*deviceID, *iface, p))
+				writeAPI.WritePoint(eventInfluxPoint(*deviceID, *iface, *capture, p))
 			}
 		case <-abandonedTicker.C:
 			for _, p := range agg.CheckAbandoned() {
-				writeAPI.WritePoint(eventInfluxPoint(*deviceID, *iface, p))
+				writeAPI.WritePoint(eventInfluxPoint(*deviceID, *iface, *capture, p))
 			}
 		case <-summaryTicker.C:
 			dropped := h.Dropped()
 			delta := dropped - lastDropped
 			lastDropped = dropped
-			writeAPI.WritePoint(summaryInfluxPoint(*deviceID, *iface, agg.Summary(delta)))
+			writeAPI.WritePoint(summaryInfluxPoint(*deviceID, *iface, *capture, agg.Summary(delta)))
 		}
 	}
 }
 
-func eventInfluxPoint(deviceID, iface string, p eventPoint) *write.Point {
+func eventInfluxPoint(deviceID, iface, capture string, p eventPoint) *write.Point {
 	tags := map[string]string{
-		"device": deviceID,
-		"iface":  iface,
-		"type":   p.Type,
+		"device":  deviceID,
+		"iface":   iface,
+		"type":    p.Type,
+		"capture": capture,
 	}
 	fields := map[string]interface{}{
 		"proto":       p.Proto,
@@ -170,8 +196,8 @@ func eventInfluxPoint(deviceID, iface string, p eventPoint) *write.Point {
 	return influxdb2.NewPoint("glitch_event", tags, fields, p.Time)
 }
 
-func summaryInfluxPoint(deviceID, iface string, s summaryPoint) *write.Point {
-	tags := map[string]string{"device": deviceID, "iface": iface}
+func summaryInfluxPoint(deviceID, iface, capture string, s summaryPoint) *write.Point {
+	tags := map[string]string{"device": deviceID, "iface": iface, "capture": capture}
 	fields := map[string]interface{}{
 		"stall_episodes": s.StallEpisodes,
 		"stall_max_ms":   s.StallMaxMs,
