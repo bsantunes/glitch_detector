@@ -113,10 +113,8 @@ No Grafana panel for this yet — same open "TODO 2"-style gap as the
 
 Written by `cmd/gps-exporter` (the `gps/` package's InfluxDB exporter — see
 `CLAUDE.md`'s `gps/` package section for the detection/backend logic this
-schema reports on). Deployed and running on `6global`/`dawn6g` via the
-AT-over-serial backend; `aaeon`'s `gps-exporter` is currently stopped/
-disabled (independent of hardware — `aaeon` does have a working GNSS
-antenna, confirmed via manual testing, see `CLAUDE.md`).
+schema reports on). Deployed and running on `6global`/`dawn6g`/`aaeon`, all
+via the AT-over-serial backend.
 
 **`gps_fix`** — one point per poll interval (default 30s), **only written
 when the fix is actually valid** — unlike `radio_cell`/`twamp`, there is no
@@ -129,17 +127,32 @@ with meaningless zeros.
 | `latitude` | float | degrees | Signed decimal degrees. |
 | `longitude` | float | degrees | Signed decimal degrees. |
 | `altitude` | float | meters | — |
+| `speed_knots` | float | knots | Additive, NMEA-reader-only (see below) — NaN-omitted. |
+| `course_deg` | float | degrees | Additive, NMEA-reader-only — NaN-omitted. |
+| `hdop` | float | — | Additive, NMEA-reader-only — NaN-omitted. |
+| `satellites` | int | count | Additive, NMEA-reader-only. |
 
 Tags: `device`, `modem_id`, `method` (`"ModemManager"` or `"AT"` — raw QMI
-is implemented but deliberately disabled, see `CLAUDE.md`).
+is implemented but deliberately disabled, see `CLAUDE.md`), and `source`
+(`"nmea"`, additive — only present on an NMEA-reader-sourced point).
 
-**No real `gps_fix` point has landed from `6global`/`dawn6g` yet** — both
-run cleanly with zero errors but have no GPS antenna connected, so they
-never get past "engine enabled, polling, no fix." `aaeon` does have a
-working antenna (confirmed via manual AT testing, decoding to
-41.549747, -8.413069 — see `CLAUDE.md`), but that was outside
-`gps-exporter`, which remains stopped there; no point has been written to
-this bucket from any device yet as of this writing.
+**Additive NMEA reader** (`gps/nmea.go`, `-nmea-port`): `AT+QGPSLOC=2` can
+intermittently report "no fix" even with a continuous lock (confirmed live
+on `dawn6g`'s Quectel), so a background reader on the modem's dedicated NMEA
+port (interface 01) can be used instead for reading fixes — AT still owns
+engine start/stop and assistance data regardless. Opt-in only (empty
+`-nmea-port` = unchanged AT-only behavior, still the default everywhere as
+of this writing). **Live status, not yet resolved**: confirmed the port
+resolves correctly and the modem's own `AT+QGPSCFG` reports NMEA output
+enabled and routed there, but no NMEA data was actually observed arriving
+during a live check on `dawn6g` — see `CLAUDE.md`'s `gps/` package section.
+Not deployed to any running `gps-exporter` yet.
+
+**Real fixes confirmed landing from `dawn6g`** (its Quectel, via the plain
+AT path) and from manual testing on `aaeon`'s SIMCom (`gps-exporter` there
+now also running, via AT, on its reserved port — see `CLAUDE.md`'s Phase
+C/D); `6global` has no GPS antenna on either modem, so it stays at "engine
+enabled, polling, no fix."
 
 Deliberately its own bucket, not folded into `radio` — the plan is to
 **join at query time** (Flux `join()` on the `device` tag against the
