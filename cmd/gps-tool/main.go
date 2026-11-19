@@ -19,14 +19,23 @@ import (
 	"time"
 
 	"dawn-agent/gps"
+	"dawn-agent/modem"
 )
 
 func main() {
 	interval := flag.Duration("interval", 10*time.Second, "polling interval for GPS fixes")
 	method := flag.String("method", "auto", "detection method: auto (default), mm (ModemManager only), at (AT-over-serial only)")
-	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/ttyUSB3); requires -method=at")
+	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/ttyUSB3, or usb:<vid>:<pid>:<ifnum> e.g. usb:2c7c:0801:03 to survive ttyUSB numbers shifting across a reboot); requires -method=at")
 	agps := flag.Bool("agps", true, "send the XTRA assistance-data enable command on AT-over-serial backends before starting the engine; the setting itself is stored in the modem and persists across reboots, so -agps=false only skips sending the command, it does not turn off assistance data already enabled")
 	flag.Parse()
+
+	if *port != "" {
+		resolved, err := modem.ResolvePort(*port)
+		if err != nil {
+			log.Fatalf("-port: %v", err)
+		}
+		*port = resolved
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

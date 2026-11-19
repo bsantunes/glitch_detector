@@ -17,6 +17,14 @@
 # doesn't expose real GPS coordinates either way (its "location" method
 # is cell-ID/LAC-CI only, not GNSS), so AT-over-serial is what this
 # board actually uses.
+#
+# -port is pinned by USB vendor/product/interface (usb:<vid>:<pid>:<ifnum>),
+# not a ttyUSB number — confirmed live that ttyUSB numbering is not
+# stable across a reboot on a board with more than one modem, the same
+# reason aaeon's dedicated port got a udev rule instead. The default
+# below is the Quectel RM520N-GL's secondary AT port (interface 03) —
+# dawn6g/6global's fixed hardware is modem 0 = SIMCom (1e0e:9001),
+# modem 1 = Quectel (2c7c:0801); see CLAUDE.md's Project Overview.
 
 START=98
 STOP=1
@@ -30,6 +38,8 @@ DEVICE_ID=6global
 INFLUX_URL=https://wservices.wavesys.pt:8086
 INFLUX_ORG=wavecom
 INFLUX_BUCKET=location
+GPS_METHOD=at
+GPS_PORT=usb:2c7c:0801:03
 
 start_service() {
 	INFLUX_TOKEN=""
@@ -37,6 +47,8 @@ start_service() {
 
 	procd_open_instance
 	procd_set_param command "$PROG" \
+		-method "$GPS_METHOD" \
+		-port "$GPS_PORT" \
 		-interval 30s \
 		-influx-url "$INFLUX_URL" \
 		-influx-org "$INFLUX_ORG" \

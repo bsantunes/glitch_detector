@@ -4,21 +4,29 @@
 # Install as /etc/init.d/gps-tool: cp this file there, chmod +x, then
 # `/etc/init.d/gps-tool enable && /etc/init.d/gps-tool start`.
 #
-# Only useful on modems reached via raw QMI (gps.Supports) — WaveOS's
-# ubus "qmi" object doesn't expose real GPS coordinates (its "location"
-# method is cell-ID/LAC-CI only, not GNSS), so detection falling through
-# to ubus before raw QMI means gps-tool finds nothing to poll. See
-# gps/gps.go's Supports doc comment.
+# Uses the AT-over-serial backend (gps.Supports is true for
+# ModemManager and AT-over-serial; raw QMI is implemented but
+# deliberately disabled — see CLAUDE.md's gps/ package section).
+# WaveOS's ubus "qmi" object doesn't expose real GPS coordinates either
+# way (its "location" method is cell-ID/LAC-CI only, not GNSS).
+#
+# -port is pinned by USB vendor/product/interface (usb:<vid>:<pid>:<ifnum>),
+# not a ttyUSB number — see gps-exporter.init's comment for why. The
+# default below is the Quectel RM520N-GL's secondary AT port
+# (interface 03); dawn6g/6global's fixed hardware is modem 0 = SIMCom
+# (1e0e:9001), modem 1 = Quectel (2c7c:0801).
 
 START=96
 STOP=3
 USE_PROCD=1
 
 PROG=/opt/dawn/gps-tool
+GPS_METHOD=at
+GPS_PORT=usb:2c7c:0801:03
 
 start_service() {
 	procd_open_instance
-	procd_set_param command "$PROG" -interval 10s
+	procd_set_param command "$PROG" -method "$GPS_METHOD" -port "$GPS_PORT" -interval 10s
 	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
 	procd_set_param stdout 1
 	procd_set_param stderr 1
