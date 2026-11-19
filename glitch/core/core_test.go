@@ -240,6 +240,141 @@ func TestEngine_NonFirstFragment_Skipped(t *testing.T) {
 	}
 }
 
+func egressPktPort(t time.Time, srcPort uint16, seq uint32, payloadLen uint16) PacketMeta {
+	pm := egressPkt(t, seq, payloadLen)
+	pm.SrcPort = srcPort
+	return pm
+}
+
+func flowKeyForPort(srcPort uint16) flowKey {
+	key := testFlowKey()
+	key.srcPort = srcPort
+	return key
+}
+
+func TestEngine_Sweep_IdleFlowEvicted(t *testing.T) {
+	e := NewEngine(nil)
+	base := time.Now()
+	e.HandlePacket(egressPkt(base, 1000, 100))
+	if len(e.flows) != 1 {
+		t.Fatalf("expected one flow, got %d", len(e.flows))
+	}
+
+	// Not idle long enough yet — must survive.
+	if events := e.Sweep(base.Add(idleTimeout - time.Second)); len(events) != 0 {
+		t.Errorf("expected no events from a sweep before idleTimeout, got %+v", events)
+	}
+	if len(e.flows) != 1 {
+		t.Fatalf("flow evicted too early, len(e.flows)=%d", len(e.flows))
+	}
+
+	// Past idleTimeout, and the flow was never in a stall — evicted
+	// silently, no event.
+	events := e.Sweep(base.Add(idleTimeout + time.Second))
+	if len(events) != 0 {
+		t.Errorf("expected no events for a non-stalling idle flow, got %+v", events)
+	}
+	if len(e.flows) != 0 {
+		t.Errorf("expected the idle flow to be evicted, len(e.flows)=%d", len(e.flows))
+	}
+	if got := e.Evictions(); got != 1 {
+		t.Errorf("Evictions() = %d, want 1", got)
+	}
+}
+
+func TestEngine_Sweep_AbandonsOpenEpisode(t *testing.T) {
+	e := NewEngine(nil)
+	base := time.Now()
+	tm, seq := warmUp(e, base, stallMinPackets, 10*time.Millisecond, 100)
+
+	// Trigger a stall — then the connection goes silent forever (no
+	// more packets), the real-world shape an abandoned episode has.
+	tm = tm.Add(500 * time.Millisecond)
+	events := e.HandlePacket(egressPkt(tm, seq, 100))
+	if len(events) != 1 || events[0].Type != glitch.KindStallStart {
+		t.Fatalf("expected a StallStart to set up this test, got %+v", events)
+	}
+
+	events = e.Sweep(tm.Add(idleTimeout + time.Second))
+	if len(events) != 1 || events[0].Type != glitch.KindStallAbandoned {
+		t.Fatalf("expected one StallAbandoned event, got %+v", events)
+	}
+	if events[0].Value == 0 {
+		t.Errorf("expected a non-zero abandoned-episode duration, got 0")
+	}
+	if len(e.flows) != 0 {
+		t.Errorf("expected the abandoned flow to be removed, len(e.flows)=%d", len(e.flows))
+	}
+}
+
+func TestEngine_CapEviction_EvictsLeastRecentlySeen(t *testing.T) {
+	e := NewEngine(nil)
+	base := time.Now()
+	for i := 0; i < maxFlows; i++ {
+		e.HandlePacket(egressPktPort(base.Add(time.Duration(i)*time.Millisecond), uint16(i), 1000, 100))
+	}
+	if len(e.flows) != maxFlows {
+		t.Fatalf("expected %d flows after warm-up, got %d", maxFlows, len(e.flows))
+	}
+
+	// One more flow, past the cap — must evict exactly the oldest
+	// (port 0, inserted first) to make room.
+	e.HandlePacket(egressPktPort(base.Add(maxFlows*time.Millisecond), uint16(maxFlows), 1000, 100))
+
+	if len(e.flows) != maxFlows {
+		t.Fatalf("expected the table to stay at the cap (%d), got %d", maxFlows, len(e.flows))
+	}
+	if _, stillThere := e.flows[flowKeyForPort(0)]; stillThere {
+		t.Errorf("expected the oldest flow (port 0) to have been evicted")
+	}
+	if _, present := e.flows[flowKeyForPort(1)]; !present {
+		t.Errorf("expected the second-oldest flow (port 1) to still be present")
+	}
+	if _, present := e.flows[flowKeyForPort(maxFlows)]; !present {
+		t.Errorf("expected the newly-inserted flow to be present")
+	}
+	if got := e.Evictions(); got != 1 {
+		t.Errorf("Evictions() = %d, want 1", got)
+	}
+}
+
+func TestEngine_CapEviction_AbandonsOpenEpisodeOnEvict(t *testing.T) {
+	e := NewEngine(nil)
+	base := time.Now()
+
+	// Flow 0 (will be the oldest) gets warmed up and driven into an
+	// open stall, then goes silent — exactly like
+	// TestEngine_Sweep_AbandonsOpenEpisode, just evicted by the cap
+	// instead of Sweep's idle timeout.
+	tm, seq := warmUp(e, base, stallMinPackets, 10*time.Millisecond, 100)
+	tm = tm.Add(500 * time.Millisecond)
+	events := e.HandlePacket(egressPkt(tm, seq, 100))
+	if len(events) != 1 || events[0].Type != glitch.KindStallStart {
+		t.Fatalf("expected a StallStart to set up this test, got %+v", events)
+	}
+
+	// Fill the rest of the table with ordinary flows, all newer than
+	// flow 0's own last packet.
+	fillBase := tm.Add(time.Second)
+	for i := 1; i < maxFlows; i++ {
+		e.HandlePacket(egressPktPort(fillBase.Add(time.Duration(i)*time.Millisecond), uint16(i), 1000, 100))
+	}
+	if len(e.flows) != maxFlows {
+		t.Fatalf("expected %d flows after filling to the cap, got %d", maxFlows, len(e.flows))
+	}
+
+	// One more flow past the cap: flow 0 is still the oldest (it went
+	// silent right after its StallStart, every other flow is newer)
+	// and must be evicted, producing a StallAbandoned event for it.
+	events = e.HandlePacket(egressPktPort(fillBase.Add(maxFlows*time.Millisecond), uint16(maxFlows), 1000, 100))
+	if len(events) != 1 || events[0].Type != glitch.KindStallAbandoned {
+		t.Fatalf("expected one StallAbandoned event from the cap-triggered eviction, got %+v", events)
+	}
+	if _, stillThere := e.flows[testFlowKey()]; stillThere { // flow 0's key (default srcPort)
+		t.Errorf("expected flow 0 (the stalling one) to have been evicted")
+	}
+}
+
 func TestEngine_EWMA_NotPollutedByStallGap(t *testing.T) {
 	e := NewEngine(nil)
 	base := time.Now()

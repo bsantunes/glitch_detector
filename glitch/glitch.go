@@ -70,6 +70,15 @@ const (
 	KindStallStart Kind = 1
 	KindRetrans    Kind = 2
 	KindStallEnd   Kind = 3
+	// KindStallAbandoned marks a stall episode whose flow was evicted
+	// from glitch/core's own bounded flow table (idle timeout, or the
+	// table reaching its cap) while the episode was still open — only
+	// ever produced by glitch/core (the AF_PACKET path); the eBPF path
+	// has no equivalent at this level, since the kernel's own
+	// flow_tracker eviction is instead noticed indirectly, by
+	// cmd/glitch-exporter's own Aggregator.CheckAbandoned timing out on
+	// a missing STALL_END (see that file's own abandonedAfter comment).
+	KindStallAbandoned Kind = 4
 )
 
 func (k Kind) String() string {
@@ -80,6 +89,8 @@ func (k Kind) String() string {
 		return "retrans"
 	case KindStallEnd:
 		return "stall_end"
+	case KindStallAbandoned:
+		return "stall_abandoned"
 	default:
 		return "unknown"
 	}

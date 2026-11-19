@@ -81,6 +81,11 @@ const (
 	// statsPollInterval is how often readLoop asks the kernel for
 	// PACKET_STATISTICS — see Dropped's doc comment.
 	statsPollInterval = 2 * time.Second
+	// sweepInterval is how often readLoop calls c.engine.Sweep to
+	// evict long-idle flows — see core.Engine's own doc comment for
+	// why this package is the one responsible for calling it
+	// periodically (Engine itself runs no timer).
+	sweepInterval = 30 * time.Second
 )
 
 // Capture reads raw packets off one interface via a TPACKET_V3
@@ -236,6 +241,7 @@ func (c *Capture) readLoop() {
 
 	blockIdx := 0
 	nextStatsPoll := time.Now().Add(statsPollInterval)
+	nextSweep := time.Now().Add(sweepInterval)
 	for {
 		select {
 		case <-c.stop:
@@ -251,6 +257,7 @@ func (c *Capture) readLoop() {
 				c.setErr(fmt.Errorf("glitch/afpacket: poll: %w", perr))
 				return
 			}
+			c.maybeSweep(&nextSweep)
 			continue
 		}
 
@@ -261,6 +268,28 @@ func (c *Capture) readLoop() {
 		if now := time.Now(); now.After(nextStatsPoll) {
 			c.pollKernelDrops()
 			nextStatsPoll = now.Add(statsPollInterval)
+		}
+		c.maybeSweep(&nextSweep)
+	}
+}
+
+// maybeSweep calls engine.Sweep once nextSweep has passed, forwarding
+// any resulting events (stall_abandoned for flows evicted while an
+// episode was open) the same non-blocking way processBlock forwards
+// everything else. Checked on every loop iteration, including the
+// poll-timeout path, so a long-idle interface still gets swept
+// promptly instead of only when real traffic happens to arrive.
+func (c *Capture) maybeSweep(nextSweep *time.Time) {
+	now := time.Now()
+	if now.Before(*nextSweep) {
+		return
+	}
+	*nextSweep = now.Add(sweepInterval)
+	for _, ev := range c.engine.Sweep(now) {
+		select {
+		case c.events <- ev:
+		default:
+			atomic.AddUint64(&c.userDropped, 1)
 		}
 	}
 }
@@ -427,6 +456,15 @@ func (c *Capture) Dropped() uint64 {
 // output) rather than silently seeing nothing.
 func (c *Capture) PacketsSeen() uint64 {
 	return atomic.LoadUint64(&c.packetsSeen)
+}
+
+// Evictions returns the cumulative count of flows evicted from the
+// underlying core.Engine's flow table (idle timeout or the cap being
+// reached) — see core.Engine.Evictions and the maxFlows/idleTimeout
+// bounding this package relies on to run unattended for weeks without
+// unbounded memory growth.
+func (c *Capture) Evictions() uint64 {
+	return c.engine.Evictions()
 }
 
 // Close stops the capture loop and releases the socket/ring. Safe to

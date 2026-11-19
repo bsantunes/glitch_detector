@@ -109,22 +109,45 @@ const (
 	// stallMinPackets mirrors STALL_MIN_PACKETS — a flow's EWMA isn't
 	// trusted as representative until it's seen this many packets.
 	stallMinPackets = 8
+
+	// maxFlows mirrors flow_tracker's own BPF_MAP_TYPE_LRU_HASH
+	// max_entries — once the table is this full, inserting a new flow
+	// evicts the least-recently-seen one first, the same way the
+	// kernel's own map would (see evictLRU). Added this session so
+	// glitch/afpacket can run unattended for weeks on WaveOS without
+	// the table growing without bound, the way the eBPF path's own
+	// kernel-bounded map never could in the first place.
+	maxFlows = 10000
+	// idleTimeout bounds how long a flow may go without a packet
+	// before Sweep evicts it outright — a much longer horizon than
+	// maxFlows' cap-triggered eviction, meant to reclaim long-idle
+	// flows well before the table ever gets close to full under
+	// normal load, not as the primary bounding mechanism.
+	idleTimeout = 5 * time.Minute
 )
 
 // Engine tracks per-flow state and applies tc_glitch.bpf.c's stall/
 // retransmission logic to a stream of packets from any capture
 // source. Safe for concurrent use; construct with NewEngine.
 //
-// Deliberately does not replicate the kernel's flow_tracker being a
-// size-10,000 LRU hash map — flows here live in a plain Go map with
-// no eviction at all. Acceptable for this phase (validation, run
-// alongside the real eBPF path, not replacing it yet — see Phase 2),
-// but a real limitation to close before Phase 4 retires the kernel
-// map as the thing actually bounding memory use in production.
+// The flow table is bounded two ways, mirroring why the kernel's own
+// flow_tracker (a size-10,000 LRU hash map) can never grow without
+// bound either: a periodic Sweep call evicts anything idle longer
+// than idleTimeout, and inserting a new flow once the table already
+// holds maxFlows entries evicts the least-recently-seen one first
+// (evictLRU) — the caller driving Engine (currently only
+// glitch/afpacket.Capture) is responsible for calling Sweep
+// periodically; Engine itself runs no background goroutine. An
+// eviction that catches a flow with an open stall episode emits a
+// KindStallAbandoned Event for it, the same way losing a kernel
+// flow_tracker entry mid-episode is noticed — just directly here,
+// instead of indirectly via cmd/glitch-exporter's own
+// Aggregator.CheckAbandoned timing out on a missing STALL_END.
 type Engine struct {
 	mu              sync.Mutex
 	flows           map[flowKey]*flowState
 	udpMonitorPorts map[uint16]bool
+	evictions       uint64
 }
 
 // NewEngine constructs an Engine. udpMonitorPorts mirrors
@@ -193,13 +216,17 @@ func (e *Engine) handleEgress(pm PacketMeta, srcKey, dstKey [4]byte) []glitch.Ev
 	if !ok {
 		// New flow — see tc_glitch.bpf.c's new-flow branch for why
 		// highestAck is seeded from this packet's own seq, not 0.
+		var evicted []glitch.Event
+		if len(e.flows) >= maxFlows {
+			evicted = e.evictLRU(pm.Time)
+		}
 		state = &flowState{lastTs: pm.Time, pktCount: 1}
 		if isTCP {
 			state.endSeq = pm.Seq + uint32(pm.PayloadLen)
 			state.highestAck = pm.Seq
 		}
 		e.flows[key] = state
-		return nil
+		return evicted
 	}
 
 	var events []glitch.Event
@@ -308,4 +335,91 @@ func (e *Engine) handleIngress(pm PacketMeta, srcKey, dstKey [4]byte) []glitch.E
 		state.highestAck = pm.Ack
 	}
 	return nil
+}
+
+// Sweep evicts every flow that has gone longer than idleTimeout without
+// a packet, returning a KindStallAbandoned Event for each one that had
+// an open stall episode — see Engine's own doc comment. The caller
+// (glitch/afpacket.Capture) is responsible for calling this
+// periodically; Engine runs no timer of its own. Safe to call from any
+// goroutine, same as HandlePacket.
+func (e *Engine) Sweep(now time.Time) []glitch.Event {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	var events []glitch.Event
+	for key, state := range e.flows {
+		if now.Sub(state.lastTs) > idleTimeout {
+			events = append(events, e.evictFlow(key, state, now)...)
+		}
+	}
+	return events
+}
+
+// Evictions returns the cumulative count of flows evicted so far,
+// whether by Sweep's idle timeout or handleEgress's cap-triggered
+// evictLRU — a basic liveness/sizing signal for whoever drives Engine,
+// distinct from the Events a given eviction may or may not have
+// produced.
+func (e *Engine) Evictions() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.evictions
+}
+
+// evictLRU removes the single least-recently-seen flow — called only
+// when the table is already at maxFlows and a new flow needs room,
+// mirroring what the kernel's own BPF_MAP_TYPE_LRU_HASH would do on an
+// insert into a full map. A full O(n) scan, not a real LRU structure
+// (a doubly-linked list alongside the map) — deliberately: this
+// project's own history is full of subtle bugs in exactly this kind of
+// "clever" data structure, and at maxFlows=10,000 a linear scan on an
+// insert into an already-full table is cheap enough for this traffic
+// profile (control-plane-ish, plus a short opt-in UDP port list — see
+// glitch/afpacket's own sizing comment) to not be worth that risk.
+// Revisit only if profiling on real hardware ever shows otherwise.
+func (e *Engine) evictLRU(now time.Time) []glitch.Event {
+	var oldestKey flowKey
+	var oldestState *flowState
+	for key, state := range e.flows {
+		if oldestState == nil || state.lastTs.Before(oldestState.lastTs) {
+			oldestKey, oldestState = key, state
+		}
+	}
+	if oldestState == nil { // table is empty — maxFlows must be 0, not a real scenario
+		return nil
+	}
+	return e.evictFlow(oldestKey, oldestState, now)
+}
+
+// evictFlow removes key from the flow table and, if it had an open
+// stall episode, returns a single KindStallAbandoned Event for it.
+// baseline is recomputed from the flow's own avgGapNs rather than
+// stored separately at STALL_START time: avgGapNs is never updated
+// while a stall is open (see handleEgress's EWMA-update comment), so
+// it is still exactly what it was when the episode started — no extra
+// field needed to recover it here.
+func (e *Engine) evictFlow(key flowKey, state *flowState, now time.Time) []glitch.Event {
+	delete(e.flows, key)
+	e.evictions++
+	if !state.stallOpen {
+		return nil
+	}
+	baseline := time.Duration(state.avgGapNs * stallK)
+	if baseline < stallThreshold {
+		baseline = stallThreshold
+	}
+	return []glitch.Event{{
+		Time:    now,
+		SrcIP:   net.IP(append([]byte(nil), key.srcIP[:]...)),
+		DstIP:   net.IP(append([]byte(nil), key.dstIP[:]...)),
+		SrcPort: key.srcPort, DstPort: key.dstPort,
+		Value:    uint64(now.Sub(state.stallStartTs).Nanoseconds()),
+		Baseline: baseline,
+		Type:     glitch.KindStallAbandoned,
+		// Steps stays 0 — genuinely unknown, same reasoning as
+		// cmd/glitch-exporter's own CheckAbandoned: the real count is
+		// only ever known on a STALL_END, which by definition never
+		// arrived for an abandoned episode.
+		Proto: key.proto,
+	}}
 }

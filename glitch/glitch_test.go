@@ -81,6 +81,7 @@ func TestKindString(t *testing.T) {
 		{KindStallStart, "stall_start"},
 		{KindRetrans, "retrans"},
 		{KindStallEnd, "stall_end"},
+		{KindStallAbandoned, "stall_abandoned"},
 		{Kind(99), "unknown"},
 	}
 	for _, tt := range tests {

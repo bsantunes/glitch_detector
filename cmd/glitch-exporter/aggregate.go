@@ -178,6 +178,33 @@ func (a *Aggregator) HandleEvent(ev glitch.Event) []eventPoint {
 			DurationMs: durationMs,
 			Steps:      ev.Steps,
 		}}
+
+	case glitch.KindStallAbandoned:
+		// Only ever produced by glitch/core (the AF_PACKET path, via
+		// its own bounded flow table — see that package's Sweep/
+		// evictLRU) — the eBPF path has no equivalent event; its own
+		// abandonment is instead caught below by CheckAbandoned timing
+		// out on a missing STALL_END. Remove the open-episode entry
+		// immediately rather than leaving it for that same 30s
+		// timeout to find independently — this is the more specific,
+		// more prompt signal of the two. Does NOT count toward
+		// glitch_summary's stall_episodes/stall_max_ms/stall_sum_ms,
+		// same rule CheckAbandoned's own points follow.
+		delete(a.open, keyFor(ev))
+		if !a.allow() {
+			return nil
+		}
+		return []eventPoint{{
+			Time:       ev.Time,
+			Type:       "stall_abandoned",
+			Proto:      ev.Proto,
+			SrcPort:    ev.SrcPort,
+			DstPort:    ev.DstPort,
+			DstIP:      ev.DstIP.String(),
+			BaselineMs: ev.Baseline.Seconds() * 1000,
+			DurationMs: float64(ev.Value) / 1e6,
+			Steps:      0, // genuinely unknown — see eventPoint's own Steps comment
+		}}
 	}
 	return nil
 }
