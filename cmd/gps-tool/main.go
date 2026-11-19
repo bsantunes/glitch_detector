@@ -26,15 +26,26 @@ func main() {
 	interval := flag.Duration("interval", 10*time.Second, "polling interval for GPS fixes")
 	method := flag.String("method", "auto", "detection method: auto (default), mm (ModemManager only), at (AT-over-serial only)")
 	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/ttyUSB3, or usb:<vid>:<pid>:<ifnum> e.g. usb:2c7c:0801:03 to survive ttyUSB numbers shifting across a reboot); requires -method=at")
+	nmeaPort := flag.String("nmea-port", "", "read fixes from this NMEA port instead of AT+CGPSINFO/AT+QGPSLOC=2 (same forms as -port; typically the modem's interface 01) — AT still starts the engine and assistance data; requires -method=at")
 	agps := flag.Bool("agps", true, "send the XTRA assistance-data enable command on AT-over-serial backends before starting the engine; the setting itself is stored in the modem and persists across reboots, so -agps=false only skips sending the command, it does not turn off assistance data already enabled")
 	flag.Parse()
 
+	if *nmeaPort != "" && *method != "at" {
+		log.Fatalf("-nmea-port requires -method=at (got method %q)", *method)
+	}
 	if *port != "" {
 		resolved, err := modem.ResolvePort(*port)
 		if err != nil {
 			log.Fatalf("-port: %v", err)
 		}
 		*port = resolved
+	}
+	if *nmeaPort != "" {
+		resolved, err := modem.ResolvePort(*nmeaPort)
+		if err != nil {
+			log.Fatalf("-nmea-port: %v", err)
+		}
+		*nmeaPort = resolved
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -49,7 +60,7 @@ func main() {
 		log.Fatalf("no modems found via %s", gps.DescribeMethod(*method, *port))
 	}
 
-	pollers := gps.NewPollers(ctx, modems, *agps)
+	pollers := gps.NewPollers(ctx, modems, *agps, *nmeaPort)
 	defer func() {
 		for _, p := range pollers {
 			p.Close()
@@ -81,6 +92,11 @@ func main() {
 				}
 				if !fix.Valid {
 					fmt.Printf("[%s] no GPS fix yet\n", id)
+					continue
+				}
+				if fix.Source == "nmea" {
+					fmt.Printf("[%s] lat=%.6f lon=%.6f alt=%.1fm speed=%.1fkn course=%.1f sats=%d hdop=%.1f\n",
+						id, fix.Latitude, fix.Longitude, fix.Altitude, fix.SpeedKnots, fix.CourseDeg, fix.Satellites, fix.HDOP)
 					continue
 				}
 				fmt.Printf("[%s] lat=%.6f lon=%.6f alt=%.1fm\n", id, fix.Latitude, fix.Longitude, fix.Altitude)

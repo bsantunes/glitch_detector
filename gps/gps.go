@@ -155,6 +155,7 @@ type Poller struct {
 	m        modem.Modem
 	session  *QMISession // nil for ModemManager/AT
 	atVendor atGPSVendor // atGPSVendorUnknown for ModemManager/QMI
+	nmea     *NMEAReader // non-nil only for an AT-backed poller given -nmea-port
 }
 
 // NewPoller sets up GPS polling for m. For ModemManager, this enables
@@ -174,7 +175,18 @@ type Poller struct {
 // Supports/NewPollers — see Supports' doc comment for why. This keeps
 // the disable in effect even for a caller that constructs a Poller
 // directly instead of going through NewPollers.
-func NewPoller(ctx context.Context, m modem.Modem, agps bool) (*Poller, error) {
+//
+// nmeaPort, if non-empty, opens a background NMEAReader on the
+// modem's dedicated NMEA port (already resolved to a real device path
+// by the caller — see modem.ResolvePort — same as -port itself) and
+// makes Fix prefer it over the AT request/response path. Only valid
+// together with method AT (m.Method == modem.MethodAT); NewPoller
+// doesn't enforce that itself — see DetectWithMethod/cmd/ layer for
+// the -nmea-port/-method validation — it simply has no effect for any
+// other method. See CLAUDE.md's gps/ package section for why: AT+QGPSLOC=2
+// can intermittently report "no fix" even with a continuous lock,
+// confirmed live, while the modem's own NMEA stream does not.
+func NewPoller(ctx context.Context, m modem.Modem, agps bool, nmeaPort string) (*Poller, error) {
 	switch m.Method {
 	case modem.MethodModemManager:
 		enableModemManager(ctx, m)
@@ -187,7 +199,11 @@ func NewPoller(ctx context.Context, m modem.Modem, agps bool) (*Poller, error) {
 		if err := enableAT(ctx, m, vendor, agps); err != nil {
 			return nil, err
 		}
-		return &Poller{m: m, atVendor: vendor}, nil
+		p := &Poller{m: m, atVendor: vendor}
+		if nmeaPort != "" {
+			p.nmea = OpenNMEAReader(ctx, nmeaPort)
+		}
+		return p, nil
 	case modem.MethodQMI:
 		return nil, fmt.Errorf("gps: QMI backend is disabled (see Supports' doc comment) — refusing to start a session for %s", m.Port)
 	default:
@@ -195,10 +211,15 @@ func NewPoller(ctx context.Context, m modem.Modem, agps bool) (*Poller, error) {
 	}
 }
 
-// Fix returns the current GPS fix for this poller's modem. For
-// ModemManager/AT this makes a fresh mmcli/AT call; for QMI it's an
-// instant read of the background session's cache (see QMISession.Fix).
+// Fix returns the current GPS fix for this poller's modem. The NMEA
+// reader, when configured (see NewPoller's nmeaPort), is preferred
+// over everything else; otherwise this makes a fresh mmcli/AT call,
+// or for QMI, an instant read of the background session's cache (see
+// QMISession.Fix).
 func (p *Poller) Fix(ctx context.Context) (Fix, error) {
+	if p.nmea != nil {
+		return p.nmea.Fix(), nil
+	}
 	if p.session != nil {
 		return p.session.Fix()
 	}
@@ -209,10 +230,14 @@ func (p *Poller) Fix(ctx context.Context) (Fix, error) {
 }
 
 // Close releases any resources this poller holds (the QMI backend's
-// background session; a no-op for ModemManager).
+// background session, or the NMEA reader's; a no-op for ModemManager
+// with neither).
 func (p *Poller) Close() {
 	if p.session != nil {
 		p.session.Close()
+	}
+	if p.nmea != nil {
+		p.nmea.Close()
 	}
 }
 
@@ -223,16 +248,16 @@ func (p *Poller) Modem() modem.Modem {
 
 // NewPollers builds one Poller for every modem in modems that Supports
 // reports as GPS-capable, logging (and skipping) any that don't or
-// that fail to initialize. agps is forwarded to NewPoller unchanged.
-// Callers must Close each returned Poller when done.
-func NewPollers(ctx context.Context, modems []modem.Modem, agps bool) []*Poller {
+// that fail to initialize. agps/nmeaPort are forwarded to NewPoller
+// unchanged. Callers must Close each returned Poller when done.
+func NewPollers(ctx context.Context, modems []modem.Modem, agps bool, nmeaPort string) []*Poller {
 	var pollers []*Poller
 	for _, m := range modems {
 		if !Supports(m.Method) {
 			log.Printf("gps: [%s] %s (via %s) — GPS not supported for this backend, skipping", m.ID, m.Model, m.Method)
 			continue
 		}
-		p, err := NewPoller(ctx, m, agps)
+		p, err := NewPoller(ctx, m, agps, nmeaPort)
 		if err != nil {
 			log.Printf("gps: [%s] NewPoller failed: %v", m.ID, err)
 			continue

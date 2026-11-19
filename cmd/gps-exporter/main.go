@@ -14,6 +14,11 @@
 //     entirely rather than written with meaningless zeros.
 //     Tags: device, modem_id, method. Fields: latitude, longitude,
 //     altitude (floats).
+//   - Additive, NMEA-reader-only (see gps/nmea.go and -nmea-port; a
+//     fix.Source other than "nmea" writes none of these): tag source
+//     ("nmea"); fields speed_knots, course_deg, hdop (floats,
+//     NaN-omitted, same convention as modem-exporter's radio_cell) and
+//     satellites (int).
 //
 // Deliberately its own bucket ("location"), not folded into "radio" —
 // GPS isn't a radio metric despite coming from the same modem
@@ -26,6 +31,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"math"
 	"os"
 	"os/signal"
 	"syscall"
@@ -43,6 +49,7 @@ func main() {
 	interval := flag.Duration("interval", 30*time.Second, "how often to poll for a GPS fix and push to InfluxDB")
 	method := flag.String("method", "auto", "detection method: auto (default), mm (ModemManager only), at (AT-over-serial only)")
 	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/dawn-gps, or usb:<vid>:<pid>:<ifnum> e.g. usb:2c7c:0801:03 to survive ttyUSB numbers shifting across a reboot); requires -method=at")
+	nmeaPort := flag.String("nmea-port", "", "read fixes from this NMEA port instead of AT+CGPSINFO/AT+QGPSLOC=2 (same forms as -port; typically the modem's interface 01) — AT still starts the engine and assistance data; requires -method=at")
 	agps := flag.Bool("agps", true, "send the XTRA assistance-data enable command on AT-over-serial backends before starting the engine; the setting itself is stored in the modem and persists across reboots, so -agps=false only skips sending the command, it does not turn off assistance data already enabled")
 	influxURL := flag.String("influx-url", "", "InfluxDB base URL, e.g. https://wservices.wavesys.pt:8086 (required)")
 	influxToken := flag.String("influx-token", "", "InfluxDB API token (falls back to INFLUX_TOKEN env var)")
@@ -68,12 +75,22 @@ func main() {
 		}
 		*deviceID = h
 	}
+	if *nmeaPort != "" && *method != "at" {
+		log.Fatalf("-nmea-port requires -method=at (got method %q)", *method)
+	}
 	if *port != "" {
 		resolved, err := modem.ResolvePort(*port)
 		if err != nil {
 			log.Fatalf("-port: %v", err)
 		}
 		*port = resolved
+	}
+	if *nmeaPort != "" {
+		resolved, err := modem.ResolvePort(*nmeaPort)
+		if err != nil {
+			log.Fatalf("-nmea-port: %v", err)
+		}
+		*nmeaPort = resolved
 	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -88,7 +105,7 @@ func main() {
 		log.Fatalf("no modems found via %s", gps.DescribeMethod(*method, *port))
 	}
 
-	pollers := gps.NewPollers(ctx, modems, *agps)
+	pollers := gps.NewPollers(ctx, modems, *agps, *nmeaPort)
 	defer func() {
 		for _, p := range pollers {
 			p.Close()
@@ -161,6 +178,22 @@ func gpsFixPoint(deviceID string, m modem.Modem, fix gps.Fix) *write.Point {
 		"latitude":  fix.Latitude,
 		"longitude": fix.Longitude,
 		"altitude":  fix.Altitude,
+	}
+	// Additive, NMEA-reader-only fields — see this file's package doc
+	// comment. AT/ModemManager/QMI fixes leave fix.Source empty, so
+	// none of this is ever written for them.
+	if fix.Source == "nmea" {
+		tags["source"] = fix.Source
+		if !math.IsNaN(fix.SpeedKnots) {
+			fields["speed_knots"] = fix.SpeedKnots
+		}
+		if !math.IsNaN(fix.CourseDeg) {
+			fields["course_deg"] = fix.CourseDeg
+		}
+		if !math.IsNaN(fix.HDOP) {
+			fields["hdop"] = fix.HDOP
+		}
+		fields["satellites"] = fix.Satellites
 	}
 	return influxdb2.NewPoint("gps_fix", tags, fields, time.Now())
 }

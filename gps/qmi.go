@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -215,9 +216,18 @@ func parseNMEAGGA(line string) (Fix, bool) {
 	if len(fields) < 10 {
 		return Fix{}, false
 	}
+	// Satellites/HDOP are additive (see Fix's doc comment) — populated
+	// whenever present, even on a no-fix sentence (empty in that case
+	// on every live capture seen so far, leaving the zero value/NaN).
+	numSats, _ := strconv.Atoi(fields[7])
+	hdop, err := strconv.ParseFloat(fields[8], 64)
+	if err != nil {
+		hdop = math.NaN()
+	}
+
 	quality, err := strconv.Atoi(fields[6])
 	if err != nil || quality == 0 {
-		return Fix{Time: time.Now()}, true // valid GGA sentence, just no fix
+		return Fix{Time: time.Now(), Satellites: numSats, HDOP: hdop}, true // valid GGA sentence, just no fix
 	}
 	lat, ok := nmeaCoordToDecimal(fields[2], fields[3])
 	if !ok {
@@ -228,7 +238,7 @@ func parseNMEAGGA(line string) (Fix, bool) {
 		return Fix{}, false
 	}
 	alt, _ := strconv.ParseFloat(fields[9], 64)
-	return Fix{Latitude: lat, Longitude: lon, Altitude: alt, Valid: true, Time: time.Now()}, true
+	return Fix{Latitude: lat, Longitude: lon, Altitude: alt, Valid: true, Time: time.Now(), Satellites: numSats, HDOP: hdop}, true
 }
 
 // nmeaCoordToDecimal converts NMEA's ddmm.mmmm (latitude) or

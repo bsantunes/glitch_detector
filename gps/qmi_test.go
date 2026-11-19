@@ -35,6 +35,27 @@ func TestParseNMEAGGA_ValidFix(t *testing.T) {
 	if fix.Altitude != 545.4 {
 		t.Errorf("Altitude = %v, want 545.4", fix.Altitude)
 	}
+	// Satellites/HDOP are additive (gps/nmea.go's reader) — this
+	// sentence's own fields 7/8 are "08"/"0.9".
+	if fix.Satellites != 8 {
+		t.Errorf("Satellites = %d, want 8", fix.Satellites)
+	}
+	if fix.HDOP != 0.9 {
+		t.Errorf("HDOP = %v, want 0.9", fix.HDOP)
+	}
+}
+
+func TestParseNMEAGGA_NoFix_SatellitesAndHDOPUnknown(t *testing.T) {
+	fix, ok := parseNMEAGGA("$GPGGA,,,,,,0,,,,,,,,*66")
+	if !ok {
+		t.Fatalf("expected ok=true")
+	}
+	if fix.Satellites != 0 {
+		t.Errorf("Satellites = %d, want 0 (unknown, blank field)", fix.Satellites)
+	}
+	if !math.IsNaN(fix.HDOP) {
+		t.Errorf("HDOP = %v, want NaN (unknown, blank field)", fix.HDOP)
+	}
 }
 
 func TestParseNMEAGGA_NotAGGASentence(t *testing.T) {

@@ -40,6 +40,12 @@ INFLUX_ORG=wavecom
 INFLUX_BUCKET=location
 GPS_METHOD=at
 GPS_PORT=usb:2c7c:0801:03
+# NMEA port (interface 01) — preferred over AT+QGPSLOC=2/AT+CGPSINFO
+# for reading fixes once the engine's running, confirmed live to be
+# more reliable (AT+QGPSLOC=2 intermittently reports "no fix" even
+# with a continuous lock) — see CLAUDE.md's gps/ package section.
+# AT (above) still owns engine start/stop and XTRA regardless.
+GPS_NMEA_PORT=usb:2c7c:0801:01
 
 start_service() {
 	INFLUX_TOKEN=""
@@ -49,6 +55,7 @@ start_service() {
 	procd_set_param command "$PROG" \
 		-method "$GPS_METHOD" \
 		-port "$GPS_PORT" \
+		-nmea-port "$GPS_NMEA_PORT" \
 		-interval 30s \
 		-influx-url "$INFLUX_URL" \
 		-influx-org "$INFLUX_ORG" \

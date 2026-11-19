@@ -23,10 +23,14 @@ USE_PROCD=1
 PROG=/opt/dawn/gps-tool
 GPS_METHOD=at
 GPS_PORT=usb:2c7c:0801:03
+# See gps-exporter.init's comment — NMEA (interface 01) is preferred
+# over AT+QGPSLOC=2/AT+CGPSINFO for reading fixes; AT still starts the
+# engine and XTRA.
+GPS_NMEA_PORT=usb:2c7c:0801:01
 
 start_service() {
 	procd_open_instance
-	procd_set_param command "$PROG" -method "$GPS_METHOD" -port "$GPS_PORT" -interval 10s
+	procd_set_param command "$PROG" -method "$GPS_METHOD" -port "$GPS_PORT" -nmea-port "$GPS_NMEA_PORT" -interval 10s
 	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
 	procd_set_param stdout 1
 	procd_set_param stderr 1
