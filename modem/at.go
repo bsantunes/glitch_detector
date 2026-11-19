@@ -140,16 +140,23 @@ func parseIDMMPortIgnore(udevadmOutput string) bool {
 	return false
 }
 
-// sendAT configures the serial port with `stty` (raw mode, no echo,
-// 115200 8N1 — a safe common default for USB cellular modems) and
-// writes a single AT command, returning whatever the modem replies
-// within the given timeout.
+// sendAT configures the serial port with `stty` (raw mode, no echo —
+// no explicit baud; see below) and writes a single AT command,
+// returning whatever the modem replies within the given timeout.
 func sendAT(dev, cmd string, timeout time.Duration) (string, error) {
-	// stty commonly exits non-zero here ("unable to perform all requested
-	// operations") even though it applies the settings that matter and the
-	// port works fine afterward — so a failure is logged, not fatal.
-	if err := exec.Command("stty", "-F", dev, "115200", "raw", "-echo").Run(); err != nil {
-		log.Printf("modem: stty %s: %v (continuing anyway)", dev, err)
+	// stty commonly exits non-zero here if a baud rate is given — these
+	// are virtual USB-serial ports (CDC-ACM-style), and confirmed live on
+	// both aaeon and dawn6g that the kernel driver rejects setting an
+	// explicit speed on them specifically ("unable to perform all
+	// requested operations") while accepting raw/-echo on their own just
+	// fine, so the speed argument is dropped rather than tolerated.
+	// Logged with stty's own stderr (not just the generic exit-status
+	// error) in case a real misconfiguration ever surfaces here instead.
+	sttyCmd := exec.Command("stty", "-F", dev, "raw", "-echo")
+	var sttyErr strings.Builder
+	sttyCmd.Stderr = &sttyErr
+	if err := sttyCmd.Run(); err != nil {
+		log.Printf("modem: stty %s: %v: %s (continuing anyway)", dev, err, strings.TrimSpace(sttyErr.String()))
 	}
 
 	f, err := os.OpenFile(dev, os.O_RDWR, 0)
@@ -157,6 +164,22 @@ func sendAT(dev, cmd string, timeout time.Duration) (string, error) {
 		return "", err
 	}
 	defer f.Close()
+
+	// Discard any bytes already sitting in dev's input buffer before
+	// writing this command — confirmed live in gps/at.go's identical
+	// atTransact that stale leftover bytes from a previous exchange can
+	// otherwise get read as part of this one's response. Best-effort:
+	// if SetReadDeadline isn't supported here, draining is silently
+	// skipped.
+	_ = f.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	drainBuf := make([]byte, 4096)
+	for {
+		n, err := f.Read(drainBuf)
+		if n == 0 || err != nil {
+			break
+		}
+	}
+	_ = f.SetReadDeadline(time.Time{})
 
 	if _, err := f.WriteString(cmd + "\r\n"); err != nil {
 		return "", err

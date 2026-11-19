@@ -94,6 +94,25 @@ func TestParseCGPSINFO_RealReferenceFix(t *testing.T) {
 	}
 }
 
+func TestParseCGPSINFO_StaleEmptyBesideFreshFix(t *testing.T) {
+	// Same contamination pattern as TestParseQGPSLOC_StaleErrorBesideFreshFix,
+	// for SIMCom: a stale, empty "+CGPSINFO: ,,,,,,,," left over from a
+	// previous exchange, with a genuinely fresh, valid "+CGPSINFO:" reply
+	// in the same buffer. The fresh (last) occurrence must win.
+	resp := "AT+CGPSINFO\r\n+CGPSINFO: ,,,,,,,,\r\n\r\nAT+CGPSINFO\r\n+CGPSINFO: 4132.984808,N,00824.784113,W,171126,192721.0,0.0,0.0,\r\n\r\nOK\r\n"
+	fix, err := parseCGPSINFO(resp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !fix.Valid {
+		t.Fatalf("expected the fresh fix to win over the stale empty reading, got %+v", fix)
+	}
+	const wantLat, wantLon = 41.549747, -8.413069
+	if math.Abs(fix.Latitude-wantLat) > 1e-6 || math.Abs(fix.Longitude-wantLon) > 1e-6 {
+		t.Errorf("fix = %+v, want (%v,%v)", fix, wantLat, wantLon)
+	}
+}
+
 func TestParseCGPSINFO_Malformed(t *testing.T) {
 	for _, resp := range []string{
 		"AT+CGPSINFO\r\nOK\r\n",      // no +CGPSINFO line at all
@@ -177,6 +196,28 @@ func TestParseQGPSLOC_WesternLongitudeStaysNegative(t *testing.T) {
 	const wantLon = -8.413069
 	if math.Abs(fix.Longitude-wantLon) > 1e-6 {
 		t.Errorf("Longitude = %v, want %v", fix.Longitude, wantLon)
+	}
+}
+
+func TestParseQGPSLOC_StaleErrorBesideFreshFix(t *testing.T) {
+	// Reproduces the live dawn6g bug directly: NMEA on a second port
+	// showed a continuous real fix (86/86 valid RMC over 60s), but
+	// gps-tool alternated between the real fix and "no GPS fix yet" on
+	// every other poll. Traced to a stale "+CME ERROR: 516" left over
+	// from a previous exchange landing in the same buffer as a
+	// genuinely fresh, valid "+QGPSLOC:" reply — the original code
+	// checked for a CME error before ever looking for real data, so it
+	// returned "no fix" despite the real fix being right there too.
+	resp := "AT+QGPSLOC=2\r\n+CME ERROR: 516\r\n\r\nAT+QGPSLOC=2\r\n+QGPSLOC: 141950.00,41.548050,-8.416490,0.7,200.9,2,0.00,0.0,0.0,191126,09\r\n\r\nOK\r\n"
+	fix, err := parseQGPSLOC(resp)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !fix.Valid {
+		t.Fatalf("expected the fresh fix to win over the stale CME error, got %+v", fix)
+	}
+	if fix.Latitude != 41.548050 || fix.Longitude != -8.416490 {
+		t.Errorf("fix = %+v, want the fresh reading (41.548050,-8.416490)", fix)
 	}
 }
 

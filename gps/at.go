@@ -267,15 +267,33 @@ func getFixAT(m modem.Modem, vendor atGPSVendor) (Fix, error) {
 		if err != nil {
 			return Fix{}, fmt.Errorf("AT+CGPSINFO on %s: %w", m.Port, err)
 		}
-		return parseCGPSINFO(resp)
+		fix, err := parseCGPSINFO(resp)
+		logNoFixResponse(m.Port, "AT+CGPSINFO", resp, fix, err)
+		return fix, err
 	case atGPSVendorQuectel:
 		resp, err := atSendExpectLine(m.Port, "AT+QGPSLOC=2", "+QGPSLOC", 3*time.Second)
 		if err != nil {
 			return Fix{}, fmt.Errorf("AT+QGPSLOC=2 on %s: %w", m.Port, err)
 		}
-		return parseQGPSLOC(resp)
+		fix, err := parseQGPSLOC(resp)
+		logNoFixResponse(m.Port, "AT+QGPSLOC=2", resp, fix, err)
+		return fix, err
 	default:
 		return Fix{}, fmt.Errorf("gps: AT GPS not supported for manufacturer %q", m.Manufacturer)
+	}
+}
+
+// logNoFixResponse logs the raw AT response whenever a poll comes back
+// "no fix yet" — confirmed live (dawn6g's Quectel) that this exact case
+// can be a misread: NMEA on a separate port showed a continuous real
+// fix while our own reader classified every other poll as "no fix",
+// traced to stale bytes from a previous exchange and the modem's own
+// command echo (stty failing to set raw/-echo) corrupting the buffer.
+// Logging the raw response here is what makes a future misread like
+// that visible instead of silently looking like "no antenna yet".
+func logNoFixResponse(port, cmd, resp string, fix Fix, err error) {
+	if err == nil && !fix.Valid {
+		log.Printf("gps: [%s] no fix yet, raw %s response: %q", port, cmd, strings.TrimSpace(resp))
 	}
 }
 
@@ -290,11 +308,19 @@ var cgpsinfoRe = regexp.MustCompile(`\+CGPSINFO:\s*(.*)`)
 // "+CGPSINFO: ,,,,,,,,\r\n\r\nOK" — all 9 fields empty means "GNSS
 // engine running, no fix yet", a valid state (Valid=false), not an
 // error.
+//
+// Takes the LAST "+CGPSINFO:" occurrence in resp, not the first —
+// drainPort is the primary defense against stale bytes from a
+// previous exchange lingering in the port's input buffer, but if any
+// still slip through alongside the genuine new reply, the most recent
+// one (closest to the end of the buffer) is the real answer to the
+// command this call actually sent.
 func parseCGPSINFO(resp string) (Fix, error) {
-	m := cgpsinfoRe.FindStringSubmatch(resp)
-	if m == nil {
+	matches := cgpsinfoRe.FindAllStringSubmatch(resp, -1)
+	if len(matches) == 0 {
 		return Fix{}, fmt.Errorf("no +CGPSINFO in response: %q", strings.TrimSpace(resp))
 	}
+	m := matches[len(matches)-1]
 	fields := strings.Split(strings.TrimSpace(m[1]), ",")
 	if len(fields) < 7 {
 		return Fix{}, fmt.Errorf("malformed +CGPSINFO reply (got %d fields): %q", len(fields), m[1])
@@ -328,38 +354,46 @@ const qgpslocNoFixError = "516"
 // fields — UTC time, latitude, longitude, HDOP, altitude, fix mode,
 // course, speed(km/h), speed(knots), date, satellite count. Mode 2
 // reports latitude/longitude directly as signed decimal degrees, not
-// NMEA ddmm.mmmm (confirmed via Quectel documentation/community
-// examples — not confirmed live, since no real fix has been obtained
-// on either board yet). Some Quectel firmware/modules are
-// community-reported to return an incorrect (positive) sign on
-// longitude in mode 2 — worth double-checking against a known
-// reference point once a real fix is available on this RM520N-GL
-// specifically, not yet verified either way.
+// NMEA ddmm.mmmm. Confirmed live on dawn6g's Quectel RM520N-GL against
+// a simultaneous NMEA fix on a second port (41.548050,-8.416490 vs
+// 41.548052,-8.416491, matching to 1e-6): the sign is correct on this
+// firmware — the community-reported western-longitude sign bug does
+// NOT reproduce here, though it may still exist on other firmware.
+//
+// Checks for a real "+QGPSLOC:" data line BEFORE a "+CME ERROR:", and
+// takes the LAST occurrence of either, not the first — drainPort is
+// the primary defense against stale bytes from a previous exchange
+// lingering in the port's input buffer, but confirmed live (dawn6g)
+// that even with that, a leftover "+CME ERROR: 516" from an old reply
+// could still land in the same buffer as a genuinely valid new
+// +QGPSLOC: line; checking for the error first (the original order)
+// misclassified a continuous real fix as "no fix" on every other poll.
 func parseQGPSLOC(resp string) (Fix, error) {
-	if m := cmeErrorRe.FindStringSubmatch(resp); m != nil {
+	if matches := qgpslocRe.FindAllStringSubmatch(resp, -1); len(matches) > 0 {
+		m := matches[len(matches)-1]
+		fields := strings.Split(strings.TrimSpace(m[1]), ",")
+		if len(fields) < 5 {
+			return Fix{}, fmt.Errorf("malformed +QGPSLOC reply (got %d fields): %q", len(fields), m[1])
+		}
+		lat, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			return Fix{}, fmt.Errorf("unparseable latitude in +QGPSLOC: %q", m[1])
+		}
+		lon, err := strconv.ParseFloat(fields[2], 64)
+		if err != nil {
+			return Fix{}, fmt.Errorf("unparseable longitude in +QGPSLOC: %q", m[1])
+		}
+		alt, _ := strconv.ParseFloat(fields[4], 64)
+		return Fix{Latitude: lat, Longitude: lon, Altitude: alt, Valid: true, Time: time.Now()}, nil
+	}
+	if matches := cmeErrorRe.FindAllStringSubmatch(resp, -1); len(matches) > 0 {
+		m := matches[len(matches)-1]
 		if m[1] == qgpslocNoFixError {
 			return Fix{Time: time.Now()}, nil
 		}
 		return Fix{}, fmt.Errorf("AT+QGPSLOC=2 CME ERROR %s: %q", m[1], strings.TrimSpace(resp))
 	}
-	m := qgpslocRe.FindStringSubmatch(resp)
-	if m == nil {
-		return Fix{}, fmt.Errorf("no +QGPSLOC in response: %q", strings.TrimSpace(resp))
-	}
-	fields := strings.Split(strings.TrimSpace(m[1]), ",")
-	if len(fields) < 5 {
-		return Fix{}, fmt.Errorf("malformed +QGPSLOC reply (got %d fields): %q", len(fields), m[1])
-	}
-	lat, err := strconv.ParseFloat(fields[1], 64)
-	if err != nil {
-		return Fix{}, fmt.Errorf("unparseable latitude in +QGPSLOC: %q", m[1])
-	}
-	lon, err := strconv.ParseFloat(fields[2], 64)
-	if err != nil {
-		return Fix{}, fmt.Errorf("unparseable longitude in +QGPSLOC: %q", m[1])
-	}
-	alt, _ := strconv.ParseFloat(fields[4], 64)
-	return Fix{Latitude: lat, Longitude: lon, Altitude: alt, Valid: true, Time: time.Now()}, nil
+	return Fix{}, fmt.Errorf("no +QGPSLOC in response: %q", strings.TrimSpace(resp))
 }
 
 // atResponseComplete reports whether buf is a complete response for a
@@ -389,22 +423,48 @@ func atResponseComplete(buf, dataPrefix string) bool {
 	return strings.Contains(buf, "OK") && strings.Contains(buf, dataPrefix+":")
 }
 
+// drainPort discards any bytes already sitting in dev's input buffer
+// before a new command is written. Confirmed live (dawn6g's Quectel)
+// that this matters, not just defensively: the read loop below stops
+// as soon as isComplete() is satisfied, so any bytes the modem sends
+// afterward are never read and linger in the kernel's tty input queue
+// — the NEXT call's first read can then pick those up before the new
+// command's own real reply arrives, mixing a stale reply (e.g. an old
+// "+CME ERROR: 516") into the buffer this call accumulates. That
+// combination, checked in the wrong order, is exactly what made a
+// continuous real GPS fix come back as "no fix" on every other poll —
+// see parseQGPSLOC's doc comment. Best-effort: if SetReadDeadline
+// isn't supported on this fd, the read below returns its error
+// immediately and draining is silently skipped, same as a real empty
+// buffer would look.
+func drainPort(f *os.File) {
+	_ = f.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	buf := make([]byte, 4096)
+	for {
+		n, err := f.Read(buf)
+		if n == 0 || err != nil {
+			break
+		}
+	}
+	_ = f.SetReadDeadline(time.Time{})
+}
+
 // atTransact is atSend/atSendExpectLine's shared implementation: sets
-// up the serial port, writes cmd, and reads until isComplete(buffer
-// accumulated so far) is true or timeout elapses. Duplicated from
-// modem/at.go's unexported sendAT rather than exported across packages
-// for this one shared helper — same reasoning as gps/mmcli.go's
-// parseMmcliKeyValue.
+// up the serial port, drains any stale leftover bytes, writes cmd, and
+// reads until isComplete(buffer accumulated so far) is true or timeout
+// elapses. Duplicated from modem/at.go's unexported sendAT rather than
+// exported across packages for this one shared helper — same
+// reasoning as gps/mmcli.go's parseMmcliKeyValue.
 func atTransact(dev, cmd string, timeout time.Duration, isComplete func(string) bool) (string, error) {
-	// stty commonly exits non-zero here ("unable to perform all requested
-	// operations") even as root (confirmed live on aaeon) — but the read
-	// loop below never depends on raw/-echo having actually taken effect:
-	// it only ever substring-searches the accumulated buffer, never
-	// assumes fixed line framing, so a port that still echoes the written
-	// command back doesn't break parsing. Logged with stty's own stderr
-	// (not just the generic exit-status error) so a real misconfiguration
-	// is distinguishable from this already-expected benign failure.
-	sttyCmd := exec.Command("stty", "-F", dev, "115200", "raw", "-echo")
+	// stty commonly exits non-zero here if a baud rate is given — these
+	// are virtual USB-serial ports (CDC-ACM-style), and confirmed live on
+	// both aaeon and dawn6g that the kernel driver rejects setting an
+	// explicit speed on them specifically ("unable to perform all
+	// requested operations") while accepting raw/-echo on their own just
+	// fine, so the speed argument is dropped rather than tolerated.
+	// Logged with stty's own stderr (not just the generic exit-status
+	// error) in case a real misconfiguration ever surfaces here instead.
+	sttyCmd := exec.Command("stty", "-F", dev, "raw", "-echo")
 	var sttyErr strings.Builder
 	sttyCmd.Stderr = &sttyErr
 	if err := sttyCmd.Run(); err != nil {
@@ -416,6 +476,8 @@ func atTransact(dev, cmd string, timeout time.Duration, isComplete func(string) 
 		return "", err
 	}
 	defer f.Close()
+
+	drainPort(f)
 
 	if _, err := f.WriteString(cmd + "\r\n"); err != nil {
 		return "", err
