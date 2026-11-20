@@ -92,13 +92,16 @@ func run() error {
 			if !ok {
 				return h.Err()
 			}
+			ts := ev.Time.UTC().Format(time.RFC3339Nano)
 			switch ev.Type {
 			case glitch.KindRetrans:
-				fmt.Printf("🔴 [%s] TCP Loss Detected | %s %s:%d -> %s:%d\n", tag, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Printf("%s 🔴 [%s] TCP Loss Detected | %s %s:%d -> %s:%d\n", ts, tag, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallStart:
-				fmt.Printf("🟡 [%s] Stall START: gap %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Printf("%s 🟡 [%s] Stall START: gap %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallEnd:
-				fmt.Printf("✅ [%s] Stall END: duration %.1fms, steps=%d (baseline %.1fms) | %s %s:%d -> %s:%d\n", tag, float64(ev.Value)/1e6, ev.Steps, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Printf("%s ✅ [%s] Stall END: duration %.1fms, steps=%d (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Steps, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+			case glitch.KindStallAbandoned:
+				fmt.Printf("%s 💀 [%s] Stall ABANDONED: duration %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			}
 		}
 	}

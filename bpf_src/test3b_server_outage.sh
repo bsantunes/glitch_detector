@@ -5,9 +5,12 @@
 # afpacket genuinely see the same thing (real data and
 # retransmissions leave the gateway and never get ACKed; a local
 # netem outage drops packets at the gateway itself, which test3's own
-# AF_PACKET warning covers). Same pass criteria as test3_outage.sh ("at least
-# one" matching stall, not "exactly one" — see that script's own
-# header for why), valid for both capture methods.
+# AF_PACKET warning covers). Same pass criteria as test3_outage.sh
+# (exactly one episode overlapping the outage's own wall-clock
+# window, duration > the outage length — see that script's own
+# header), valid for both capture methods. Also reports iperf3's own
+# Retr total for this run, for comparison against our own retrans
+# count (see CLAUDE.md's glitch/ package section on GSO coalescing).
 #
 # wservices side (already provisioned there, not this script's job):
 #   /usr/local/sbin/iperf-outage [seconds] — inserts
@@ -72,15 +75,19 @@ for i in $(seq 1 "$RUNS"); do
 	stop_glitch_exporter_if_needed
 	log="/tmp/test3b_${CAPTURE}_${i}.log"
 
+	iperf_log="/tmp/test3b_iperf3_${CAPTURE}_${i}.log"
+
 	start_glitch_tool "$log"
 	sleep 2
 
-	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t 10 >/dev/null 2>&1 &
+	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t 10 >"$iperf_log" 2>&1 &
 	iperf_pid=$!
 	sleep 3
 
+	outage_start=$(date -u +%s.%N)
 	echo "triggering server-side outage (${OUTAGE_SECONDS}s)..."
 	ssh $SSH_OPTS -i "$SSH_KEY" "$SSH_TARGET" "outage $OUTAGE_SECONDS"
+	outage_end=$(date -u +%s.%N)
 
 	wait "$iperf_pid" || true
 	sleep 1
@@ -97,32 +104,22 @@ for i in $(seq 1 "$RUNS"); do
 	echo "run $i: stall_starts=$starts stall_ends=$ends retrans=$retrans"
 	grep "Stall END" "$log" | grep ":5201$" || true
 
-	# At least one Stall END attributable to the injected outage
-	# (duration >= the outage length) — see test3_outage.sh's header
-	# for why "at least one" rather than "exactly one": a real
-	# cellular link can produce its own short, legitimate stall from
-	# ordinary jitter during a bulk transfer, unrelated to the
-	# injected outage.
-	outage_ms=$((OUTAGE_SECONDS * 1000))
-	matched=0
-	while read -r dur; do
-		[ -z "$dur" ] && continue
-		if awk -v d="$dur" -v o="$outage_ms" 'BEGIN { exit !(d >= o) }'; then
-			matched=$((matched + 1))
-		fi
-	done < <(grep "Stall END" "$log" | grep ":5201$" | grep -oE 'duration [0-9.]+ms' | grep -oE '[0-9.]+')
+	# iperf3's sender summary line ends "<Retr count>  sender" — the
+	# second-to-last field on that line. Reported for comparison
+	# against our own retrans count (see test2_loss.sh and CLAUDE.md's
+	# GSO-coalescing note).
+	iperf_retr=$(awk '/sender/{print $(NF-1)}' "$iperf_log" | tail -1)
+	echo "run $i: iperf3_retr=${iperf_retr:-unknown}"
 
-	if [ "$matched" -ge 1 ] && [ "$retrans" -gt 0 ]; then
-		if [ "$ends" -gt "$matched" ]; then
-			echo "run $i: PASS (outage matched by $matched stall(s) >= ${outage_ms}ms; $((ends - matched)) additional shorter stall(s) also seen — incidental link jitter, unrelated to the injected outage)"
-		else
-			echo "run $i: PASS"
-		fi
+	score_out=$(python3 bpf_src/score_outage.py "$log" ":5201" "$outage_start" "$outage_end" "$OUTAGE_SECONDS" || true)
+	echo "$score_out"
+	if echo "$score_out" | grep -q "^RESULT: PASS" && [ "$retrans" -gt 0 ]; then
+		echo "run $i: PASS"
 	else
-		echo "run $i: FAIL (expected at least one Stall END >= ${outage_ms}ms on the iperf3 flow, plus retransmissions)"
+		echo "run $i: FAIL"
 		overall_pass=0
 	fi
-	echo "log: $log"
+	echo "glitch-tool log: $log  iperf3 log: $iperf_log"
 
 	check_no_leftover_rule
 	echo "(confirmed: no leftover 5201 rule on wservices)"
