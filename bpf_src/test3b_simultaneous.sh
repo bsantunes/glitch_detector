@@ -48,26 +48,11 @@ if [ "$OUTAGE_SECONDS" -lt 1 ] || [ "$OUTAGE_SECONDS" -gt 10 ]; then
 	exit 1
 fi
 
-SSH_KEY="${TEST3B_SSH_KEY:-$HOME/.ssh/id_ed25519_wservices_outage}"
-SSH_TARGET="${TEST3B_SSH_TARGET:-idwave@wservices.wavesys.pt}"
-SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
-IPERF_TARGET="51.91.57.3"
 # AF_PACKET's own documented worst-case lag behind eBPF (block-retire
 # timeout) plus a margin — see this script's header and CLAUDE.md.
+# SSH_KEY/SSH_TARGET/SSH_OPTS/IPERF_TARGET and check_no_leftover_rule/
+# trigger_outage are shared, see test_common.sh.
 START_TOLERANCE_MS=250
-
-check_no_leftover_rule() {
-	local rules
-	if ! rules=$(ssh $SSH_OPTS -i "$SSH_KEY" "$SSH_TARGET" check5201 2>&1); then
-		echo "FATAL: could not check wservices for a leftover iptables rule: $rules" >&2
-		exit 1
-	fi
-	if echo "$rules" | grep -q 5201; then
-		echo "FATAL: a dport-5201 DROP rule is still present on wservices after the outage — iperf-outage did not clean up. Stopping, not safe to continue." >&2
-		echo "$rules" >&2
-		exit 1
-	fi
-}
 
 EBPF_PID=""
 AFPACKET_PID=""
@@ -114,10 +99,8 @@ for i in $(seq 1 "$RUNS"); do
 	iperf_pid=$!
 	sleep 3
 
-	outage_start=$(date -u +%s.%N)
 	echo "triggering server-side outage (${OUTAGE_SECONDS}s)..."
-	ssh $SSH_OPTS -i "$SSH_KEY" "$SSH_TARGET" "outage $OUTAGE_SECONDS"
-	outage_end=$(date -u +%s.%N)
+	read -r outage_start outage_end < <(trigger_outage "$OUTAGE_SECONDS")
 
 	wait "$iperf_pid" || true
 	sleep 1

@@ -129,3 +129,39 @@ cleanup_common() {
 	remove_netem
 	restore_glitch_exporter
 }
+
+# test3b's real server-side outage trigger and its iperf3 target —
+# shared by every script that forces one via the restricted SSH key
+# (see CLAUDE.md's "test3b's SSH key setup" note for why this is locked
+# to exactly two remote commands: "outage N" and "check5201"). Was
+# duplicated per-script before; one copy here, same as everything else
+# in this file.
+SSH_KEY="${TEST3B_SSH_KEY:-$HOME/.ssh/id_ed25519_wservices_outage}"
+SSH_TARGET="${TEST3B_SSH_TARGET:-idwave@wservices.wavesys.pt}"
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+IPERF_TARGET="${TEST3B_IPERF_TARGET:-51.91.57.3}"
+
+check_no_leftover_rule() {
+	local rules
+	if ! rules=$(ssh $SSH_OPTS -i "$SSH_KEY" "$SSH_TARGET" check5201 2>&1); then
+		echo "FATAL: could not check wservices for a leftover iptables rule: $rules" >&2
+		exit 1
+	fi
+	if echo "$rules" | grep -q 5201; then
+		echo "FATAL: a dport-5201 DROP rule is still present on wservices after the outage — iperf-outage did not clean up. Stopping, not safe to continue." >&2
+		echo "$rules" >&2
+		exit 1
+	fi
+}
+
+# trigger_outage runs the real server-side outage (blocking for its
+# duration) and prints "<start_epoch> <end_epoch>" — each a
+# `date -u +%s.%N` value bracketing the SSH call — for the caller to
+# capture via e.g. `read -r outage_start outage_end < <(trigger_outage N)`.
+trigger_outage() {
+	local seconds="$1" start end
+	start=$(date -u +%s.%N)
+	ssh $SSH_OPTS -i "$SSH_KEY" "$SSH_TARGET" "outage $seconds" >&2
+	end=$(date -u +%s.%N)
+	echo "$start $end"
+}

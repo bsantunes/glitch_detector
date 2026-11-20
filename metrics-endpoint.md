@@ -72,6 +72,10 @@ written even when every field is zero** (a heartbeat — unlike `radio_cell`/
 | `stall_open` | int | count | Episodes started but not yet ended **as of this point** — a live snapshot of in-progress stalls, not accumulated over the interval like the fields above. |
 | `retrans_count` | int | count | Retransmissions seen this interval. |
 | `dropped_events` | uint | count | Delta of `glitch.Handle.Dropped()` since the last tick — kernel ring-buffer events the Go side's internal channel couldn't keep up with. Should stay 0 under normal load. |
+| `kernel_dropped_events` | uint | count | `afpacket.Capture.KernelDropped()` delta — the kernel's own `PACKET_STATISTICS` couldn't queue a packet into the ring at all. Always 0 for `-capture ebpf` (no equivalent exists there). |
+| `user_dropped_events` | uint | count | `afpacket.Capture.UserDropped()` delta — this process's own `Events()` channel wasn't drained fast enough. Always 0 for `-capture ebpf`. |
+| `untruncated_over_limit_events` | uint | count | `afpacket.Capture.UntruncatedOverLimit()` delta — ring packets the classic BPF filter's truncation didn't actually apply to. Expected to stay 0; a correctness check on the capture filter, not a capacity one. Always 0 for `-capture ebpf`. |
+| `write_queue_dropped_events` | uint | count | Points dropped by the bounded queue in front of the InfluxDB write client, when it was full — i.e. this device's own write path couldn't keep up (e.g. its uplink was down at the same time as a stall burst). Should stay 0; a sustained nonzero run here means points are being lost outright, not just delayed. |
 
 Tags: `device`, `iface`, `capture` (`ebpf`/`afpacket` — additive, see above). **Never an IP address or port** — see `glitch_event` below for where those actually live.
 
