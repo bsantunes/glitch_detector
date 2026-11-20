@@ -14,6 +14,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
@@ -83,27 +84,43 @@ func run() error {
 	dropTicker := time.NewTicker(5 * time.Second)
 	defer dropTicker.Stop()
 
+	// Buffered instead of one fmt.Printf (one Write syscall) per event:
+	// under a burst of hundreds of events in well under a second, that
+	// per-event syscall overhead was enough on its own to backpressure
+	// the 256-slot Events() channel and drop events — confirmed live,
+	// this process's own stdout loop was the bottleneck, not AF_PACKET's
+	// capture (KernelDropped/UntruncatedOverLimit stayed 0 throughout).
+	// Flushed on the same 5s cadence as the drop-count line above, plus
+	// on every exit path, so a log file never has more than ~5s of
+	// unflushed tail — ample for this tool's own scoring (test3b's
+	// scripts kill it, which runs the ctx.Done() flush, before reading
+	// the log).
+	out := bufio.NewWriterSize(os.Stdout, 64*1024)
+
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Printf("📊 %s (final)\n", droppedLine(h, afCap))
+			fmt.Fprintf(out, "📊 %s (final)\n", droppedLine(h, afCap))
+			out.Flush()
 			return nil
 		case <-dropTicker.C:
-			fmt.Printf("📊 %s\n", droppedLine(h, afCap))
+			fmt.Fprintf(out, "📊 %s\n", droppedLine(h, afCap))
+			out.Flush()
 		case ev, ok := <-h.Events():
 			if !ok {
+				out.Flush()
 				return h.Err()
 			}
 			ts := ev.Time.UTC().Format(time.RFC3339Nano)
 			switch ev.Type {
 			case glitch.KindRetrans:
-				fmt.Printf("%s 🔴 [%s] TCP Loss Detected | %s %s:%d -> %s:%d\n", ts, tag, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Fprintf(out, "%s 🔴 [%s] TCP Loss Detected | %s %s:%d -> %s:%d\n", ts, tag, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallStart:
-				fmt.Printf("%s 🟡 [%s] Stall START: gap %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Fprintf(out, "%s 🟡 [%s] Stall START: gap %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallEnd:
-				fmt.Printf("%s ✅ [%s] Stall END: duration %.1fms, steps=%d (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Steps, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Fprintf(out, "%s ✅ [%s] Stall END: duration %.1fms, steps=%d (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Steps, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallAbandoned:
-				fmt.Printf("%s 💀 [%s] Stall ABANDONED: duration %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
+				fmt.Fprintf(out, "%s 💀 [%s] Stall ABANDONED: duration %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			}
 		}
 	}

@@ -31,7 +31,7 @@ import re
 import sys
 from datetime import datetime, timezone
 
-LINE_RE = re.compile(r"^(?P<ts>\S+) .*\[(?P<tag>\w+)\] Stall (?P<kind>START|END):.*\| \S+ \S+ -> \S+(?P<port>:\d+)$")
+LINE_RE = re.compile(r"^(?P<ts>\S+) .*\[(?P<tag>\w+)\] Stall (?P<kind>START|END):.*\| (?P<proto>\S+) (?P<src>\S+) -> (?P<dst>\S+)$")
 DURATION_RE = re.compile(r"duration ([0-9.]+)ms")
 
 
@@ -50,8 +50,16 @@ def main():
     outage_end = float(outage_end)
     outage_ms = float(outage_seconds) * 1000.0
 
+    # Keyed per flow (proto, src ip:port, dst ip:port), not a single
+    # scalar — a run with more than one concurrent flow to the same
+    # dst port (e.g. iperf3 -P N) interleaves each flow's own
+    # START/END lines in the log, and a single open_start variable
+    # confuses flow A's START with flow B's END. Confirmed live: a -P 4
+    # run produced spurious "START seen while another was already
+    # open" warnings and false episode-split FAILs purely from this
+    # scoring bug, not a glitch/core defect.
     episodes = []
-    open_start = None
+    open_by_flow = {}
     unmatched_ends = 0
     with open(log_path, "r", errors="replace") as f:
         for line in f:
@@ -62,22 +70,22 @@ def main():
             if not m:
                 continue
             ts = parse_ts(m.group("ts"))
+            flow_key = (m.group("proto"), m.group("src"), m.group("dst"))
             if m.group("kind") == "START":
-                if open_start is not None:
-                    print(f"WARNING: Stall START seen while another was already open (at {m.group('ts')}) — unexpected, treating the earlier one as unmatched", file=sys.stderr)
-                open_start = ts
+                if flow_key in open_by_flow:
+                    print(f"WARNING: Stall START seen for {flow_key} while another was already open (at {m.group('ts')}) — unexpected, treating the earlier one as unmatched", file=sys.stderr)
+                open_by_flow[flow_key] = ts
             else:  # END
                 dm = DURATION_RE.search(line)
                 duration_ms = float(dm.group(1)) if dm else None
-                if open_start is None:
+                if flow_key not in open_by_flow:
                     unmatched_ends += 1
-                    print(f"WARNING: Stall END with no preceding START (at {m.group('ts')})", file=sys.stderr)
+                    print(f"WARNING: Stall END with no preceding START for {flow_key} (at {m.group('ts')})", file=sys.stderr)
                     continue
-                episodes.append((open_start, ts, duration_ms))
-                open_start = None
+                episodes.append((open_by_flow.pop(flow_key), ts, duration_ms))
 
-    if open_start is not None:
-        print(f"NOTE: an episode started but never closed by end of log (start={open_start})", file=sys.stderr)
+    for flow_key, start in open_by_flow.items():
+        print(f"NOTE: an episode started but never closed by end of log (flow={flow_key} start={start})", file=sys.stderr)
 
     overlapping = []
     for start, end, duration_ms in episodes:

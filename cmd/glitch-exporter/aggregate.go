@@ -58,16 +58,35 @@ type eventPoint struct {
 	// defaulted to a plausible-looking number.
 }
 
+// DropCounts is every drop-related delta since the last Summary call.
+// main.go is the only thing that knows about the concrete capture
+// backend (to read KernelDropped/UserDropped/UntruncatedOverLimit,
+// afpacket-only - see glitch/afpacket.Capture) and the bounded write
+// queue in front of the InfluxDB client (to read WriteQueueDropped),
+// so it computes all of these and passes the struct in whole; the
+// aggregator itself never touches either.
+type DropCounts struct {
+	Total                uint64 // glitch.Source.Dropped() delta - always populated
+	Kernel               uint64 // afpacket.Capture.KernelDropped() delta - 0 for -capture ebpf
+	User                 uint64 // afpacket.Capture.UserDropped() delta - 0 for -capture ebpf
+	UntruncatedOverLimit uint64 // afpacket.Capture.UntruncatedOverLimit() delta - 0 for -capture ebpf
+	WriteQueue           uint64 // points dropped because the bounded queue in front of writeAPI was full
+}
+
 // summaryPoint is one glitch_summary point - see the package doc comment
 // for the schema. Always produced once per interval by main.go, even
 // when every field is zero (a heartbeat).
 type summaryPoint struct {
-	StallEpisodes int
-	StallMaxMs    float64
-	StallSumMs    float64
-	StallOpen     int
-	RetransCount  int
-	DroppedEvents uint64
+	StallEpisodes              int
+	StallMaxMs                 float64
+	StallSumMs                 float64
+	StallOpen                  int
+	RetransCount               int
+	DroppedEvents              uint64
+	KernelDroppedEvents        uint64
+	UserDroppedEvents          uint64
+	UntruncatedOverLimitEvents uint64
+	WriteQueueDroppedEvents    uint64
 }
 
 // Aggregator turns a stream of glitch.Events into the points
@@ -248,17 +267,21 @@ func (a *Aggregator) CheckAbandoned() []eventPoint {
 // counters, then resets them for the next interval - StallOpen (a live
 // snapshot of len(open)) is the one field that is not itself
 // accumulated/reset, since it describes "right now," not "during this
-// interval." droppedEvents is the caller's own responsibility to
-// compute (the delta of Handle.Dropped() since the last tick) and pass
-// in, since Dropped() belongs to the glitch.Handle, not this aggregator.
-func (a *Aggregator) Summary(droppedEvents uint64) summaryPoint {
+// interval." drops is the caller's own responsibility to compute (see
+// DropCounts' own doc comment) and pass in, since none of it belongs to
+// this aggregator.
+func (a *Aggregator) Summary(drops DropCounts) summaryPoint {
 	s := summaryPoint{
-		StallEpisodes: a.stallEpisodes,
-		StallMaxMs:    a.stallMaxMs,
-		StallSumMs:    a.stallSumMs,
-		StallOpen:     len(a.open),
-		RetransCount:  a.retransCount,
-		DroppedEvents: droppedEvents,
+		StallEpisodes:              a.stallEpisodes,
+		StallMaxMs:                 a.stallMaxMs,
+		StallSumMs:                 a.stallSumMs,
+		StallOpen:                  len(a.open),
+		RetransCount:               a.retransCount,
+		DroppedEvents:              drops.Total,
+		KernelDroppedEvents:        drops.Kernel,
+		UserDroppedEvents:          drops.User,
+		UntruncatedOverLimitEvents: drops.UntruncatedOverLimit,
+		WriteQueueDroppedEvents:    drops.WriteQueue,
 	}
 	a.stallEpisodes = 0
 	a.stallMaxMs = 0

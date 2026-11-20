@@ -24,7 +24,13 @@
 //     Fields: stall_episodes (STALL_ENDs seen this interval),
 //     stall_max_ms, stall_sum_ms, stall_open (episodes started but not
 //     yet ended as of this point), retrans_count, dropped_events (the
-//     delta of Handle.Dropped() since the last tick).
+//     delta of Handle.Dropped() since the last tick), plus its
+//     breakdown: kernel_dropped_events/user_dropped_events/
+//     untruncated_over_limit_events (afpacket.Capture-only, always 0
+//     for -capture ebpf - see glitch/afpacket's own doc comments) and
+//     write_queue_dropped_events (points dropped by the bounded queue
+//     in front of the InfluxDB write client when it couldn't keep up -
+//     see the writeQueue comment in run()).
 //   - measurement "glitch_event", one point per stall_start/stall_end/
 //     stall_abandoned - never for a retransmission, which is counted
 //     only, via glitch_summary.retrans_count. Timestamped with the
@@ -55,6 +61,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -64,6 +71,13 @@ import (
 	"dawn-agent/glitch"
 	"dawn-agent/glitch/afpacket"
 )
+
+// writeQueueSize bounds the queue between the event-consumer loop and
+// writeAPI.WritePoint. Sized generously above anything a normal
+// -interval heartbeat plus a stall burst should produce between two
+// drains, since its only job is absorbing a temporary write stall, not
+// steady-state throughput.
+const writeQueueSize = 4096
 
 // abandonedCheckInterval is how often Aggregator.CheckAbandoned runs -
 // independent of, and shorter than, -interval, so a dead connection's
@@ -112,6 +126,7 @@ func run() error {
 	defer cancel()
 
 	var h glitch.Source
+	var afCap *afpacket.Capture // non-nil only for -capture afpacket, for its own drop-breakdown counters below
 	switch *capture {
 	case "", "ebpf":
 		var err error
@@ -121,10 +136,11 @@ func run() error {
 		}
 	case "afpacket":
 		var err error
-		h, err = afpacket.Open(*iface, nil)
+		afCap, err = afpacket.Open(*iface, nil)
 		if err != nil {
 			return fmt.Errorf("afpacket.Open(%s): %w", *iface, err)
 		}
+		h = afCap
 	default:
 		return fmt.Errorf("unknown -capture %q (want ebpf or afpacket)", *capture)
 	}
@@ -139,6 +155,42 @@ func run() error {
 		}
 	}()
 
+	// writeAPI.WritePoint sends on an unbuffered channel to a background
+	// goroutine that itself sends on another unbuffered channel to the
+	// goroutine actually doing the HTTP write — so if that HTTP write is
+	// stuck (e.g. this device's own uplink is down, same outage the
+	// capture side is trying to report on, and the underlying TCP
+	// connection is blackholed rather than refused), WritePoint can
+	// block for as long as that write takes to time out. Confirmed by
+	// reading the client library's own source (unbuffered the whole
+	// way down), not assumed. Calling WritePoint directly from this
+	// loop would mean a stuck write starves h.Events() of attention,
+	// producing exactly the kind of consumer-side drop glitch-tool's
+	// own synchronous print loop already showed under a much smaller
+	// burst than a real outage can produce — except gated on network
+	// retry/timeout behavior instead of a stdout syscall, so potentially
+	// far longer-lived. writeQueue decouples the two: this loop only
+	// ever does a non-blocking send into a bounded channel, drained by
+	// its own dedicated goroutine that's free to sit blocked in
+	// WritePoint for as long as it takes. A full queue drops the point
+	// and counts it (writeQueueDropped) rather than blocking — reported
+	// in glitch_summary so a sustained problem here is visible, not
+	// just a few points quietly late.
+	writeQueue := make(chan *write.Point, writeQueueSize)
+	var writeQueueDropped uint64
+	go func() {
+		for p := range writeQueue {
+			writeAPI.WritePoint(p)
+		}
+	}()
+	enqueue := func(p *write.Point) {
+		select {
+		case writeQueue <- p:
+		default:
+			atomic.AddUint64(&writeQueueDropped, 1)
+		}
+	}
+
 	agg := NewAggregator(time.Now, *maxEventsPerSec)
 
 	log.Printf("exporting glitch stats for %s via %s to %s (org=%s bucket=%s device=%s) every %s",
@@ -149,7 +201,7 @@ func run() error {
 	abandonedTicker := time.NewTicker(abandonedCheckInterval)
 	defer abandonedTicker.Stop()
 
-	var lastDropped uint64
+	var lastDropped, lastKernelDropped, lastUserDropped, lastUntruncated, lastWriteQueueDropped uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -160,17 +212,31 @@ func run() error {
 				return h.Err()
 			}
 			for _, p := range agg.HandleEvent(ev) {
-				writeAPI.WritePoint(eventInfluxPoint(*deviceID, *iface, *capture, p))
+				enqueue(eventInfluxPoint(*deviceID, *iface, *capture, p))
 			}
 		case <-abandonedTicker.C:
 			for _, p := range agg.CheckAbandoned() {
-				writeAPI.WritePoint(eventInfluxPoint(*deviceID, *iface, *capture, p))
+				enqueue(eventInfluxPoint(*deviceID, *iface, *capture, p))
 			}
 		case <-summaryTicker.C:
 			dropped := h.Dropped()
-			delta := dropped - lastDropped
+			drops := DropCounts{Total: dropped - lastDropped}
 			lastDropped = dropped
-			writeAPI.WritePoint(summaryInfluxPoint(*deviceID, *iface, *capture, agg.Summary(delta)))
+			if afCap != nil {
+				kernel, user, untrunc := afCap.KernelDropped(), afCap.UserDropped(), afCap.UntruncatedOverLimit()
+				drops.Kernel = kernel - lastKernelDropped
+				drops.User = user - lastUserDropped
+				drops.UntruncatedOverLimit = untrunc - lastUntruncated
+				lastKernelDropped, lastUserDropped, lastUntruncated = kernel, user, untrunc
+			}
+			wqd := atomic.LoadUint64(&writeQueueDropped)
+			drops.WriteQueue = wqd - lastWriteQueueDropped
+			lastWriteQueueDropped = wqd
+			if drops != (DropCounts{}) {
+				log.Printf("drops this interval: total=%d kernel=%d user=%d untruncated_over_limit=%d write_queue=%d",
+					drops.Total, drops.Kernel, drops.User, drops.UntruncatedOverLimit, drops.WriteQueue)
+			}
+			enqueue(summaryInfluxPoint(*deviceID, *iface, *capture, agg.Summary(drops)))
 		}
 	}
 }
@@ -205,6 +271,16 @@ func summaryInfluxPoint(deviceID, iface, capture string, s summaryPoint) *write.
 		"stall_open":     s.StallOpen,
 		"retrans_count":  s.RetransCount,
 		"dropped_events": s.DroppedEvents,
+		// Breakdown of dropped_events, additive — kernel/user/
+		// untruncated_over_limit are always 0 for -capture ebpf (no
+		// equivalent split exists there), write_queue_dropped is 0
+		// unless the bounded queue in front of the InfluxDB write
+		// client had to drop a point rather than block the consumer
+		// loop. See DropCounts' own doc comment.
+		"kernel_dropped_events":         s.KernelDroppedEvents,
+		"user_dropped_events":           s.UserDroppedEvents,
+		"untruncated_over_limit_events": s.UntruncatedOverLimitEvents,
+		"write_queue_dropped_events":    s.WriteQueueDroppedEvents,
 	}
 	return influxdb2.NewPoint("glitch_summary", tags, fields, time.Now())
 }
