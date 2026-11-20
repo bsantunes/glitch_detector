@@ -6,3 +6,9 @@ $dawn-agent
 # Editor/temp files
 *~
 *.swp
+
+# OS cruft
+.DS_Store
+
+# Local Claude Code settings (machine-specific permission overrides)
+.claude/settings.local.json
