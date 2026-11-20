@@ -125,12 +125,24 @@ csv_field() { # $1=csv $2=field name -> prints that field's _value (first match)
 }
 
 EXPORTER_PID=""
+# Set by stop_test_exporter — whether the process was still alive right
+# before being asked to stop. A run where it had already died partway
+# through (crash, OOM, anything) must FAIL even if every other signal
+# looked clean, since a dead exporter trivially shows "0 drops" by not
+# running at all — exactly the blind spot that let the first 7-run
+# batch's silent failure go unnoticed.
+EXPORTER_WAS_ALIVE=0
 start_test_exporter() { # $1 = log file path
 	sudo bash "$EXPORTER_LAUNCH_SCRIPT" >"$1" 2>&1 &
 	EXPORTER_PID=$!
 }
 stop_test_exporter() {
 	if [ -n "$EXPORTER_PID" ]; then
+		if sudo kill -0 "$EXPORTER_PID" 2>/dev/null; then
+			EXPORTER_WAS_ALIVE=1
+		else
+			EXPORTER_WAS_ALIVE=0
+		fi
 		sudo kill -TERM "$EXPORTER_PID" 2>/dev/null || true
 		wait "$EXPORTER_PID" 2>/dev/null || true
 		EXPORTER_PID=""
@@ -255,6 +267,10 @@ EOF
 	echo "run $i: kernel_dropped=${kernel_dropped:-?} user_dropped=${user_dropped:-?} untruncated_over_limit=${untrunc:-?} write_queue_dropped=${wqd:-?}"
 
 	run_pass=1
+	if [ "$EXPORTER_WAS_ALIVE" -ne 1 ]; then
+		echo "run $i: test glitch-exporter was NOT running when the run ended (died partway through) — FAIL regardless of what else looks clean"
+		run_pass=0
+	fi
 	if [ -z "$kernel_dropped" ] || [ -z "$user_dropped" ]; then
 		echo "run $i: could not read kernel/user dropped sums from InfluxDB (query may have failed, or no summary point landed in the window) — treating as FAIL"
 		run_pass=0
