@@ -188,7 +188,7 @@ const clockOffsetRefreshInterval = 10 * time.Second
 // starts reading its ring buffer in the background. Call Close when
 // done.
 //
-// Exclusivity is enforced by an flock on /run/glitch-<iface>.lock, held
+// Exclusivity is enforced by an flock on /var/run/glitch-<iface>.lock, held
 // for the Handle's lifetime — not by the tc filter's own presence. A tc
 // filter is kernel state that outlives the process that installed it:
 // after a crash, SIGKILL, or OOM kill, a stale filter would otherwise
@@ -209,7 +209,11 @@ const clockOffsetRefreshInterval = 10 * time.Second
 // clock step after boot (e.g. an NTP correction once connectivity
 // comes up) doesn't permanently skew every later event's Time.
 func Open(iface string) (h *Handle, err error) {
-	lockFile, err := os.OpenFile(fmt.Sprintf("/run/glitch-%s.lock", iface), os.O_CREATE|os.O_RDWR, 0o644)
+	// /var/run, not /run — see glitch/afpacket.Open's matching comment;
+	// this path is never exercised on WaveOS itself (no eBPF there),
+	// but keeping both lock paths consistent avoids the same portability
+	// surprise if that ever changes.
+	lockFile, err := os.OpenFile(fmt.Sprintf("/var/run/glitch-%s.lock", iface), os.O_CREATE|os.O_RDWR, 0o644)
 	if err != nil {
 		return nil, fmt.Errorf("glitch: open lock file: %w", err)
 	}

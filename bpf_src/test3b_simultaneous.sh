@@ -15,8 +15,8 @@
 # count is timing-sensitive, not deterministic. This script removes
 # that confound: both tools observe literally the same packets of the
 # same connection during the same real outage, using their
-# independently-scoped exclusivity locks (/run/glitch-<iface>.lock
-# for eBPF, /run/glitch-afpacket-<iface>.lock for AF_PACKET — see
+# independently-scoped exclusivity locks (/var/run/glitch-<iface>.lock
+# for eBPF, /var/run/glitch-afpacket-<iface>.lock for AF_PACKET — see
 # glitch/afpacket's own doc comment) so both can attach to the same
 # interface at once without contention.
 #

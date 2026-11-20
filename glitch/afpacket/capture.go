@@ -120,9 +120,9 @@ type Capture struct {
 // agrees with what the kernel filter actually let through) in the
 // background. Call Close when done.
 //
-// Exclusivity is its own flock on /run/glitch-afpacket-<iface>.lock —
+// Exclusivity is its own flock on /var/run/glitch-afpacket-<iface>.lock —
 // deliberately a different lock file than glitch.Handle's
-// /run/glitch-<iface>.lock, not shared with it: the two capture
+// /var/run/glitch-<iface>.lock, not shared with it: the two capture
 // backends must be able to run side by side on the same interface at
 // once (Phase 2's whole point is comparing eBPF and AF_PACKET against
 // identical live traffic), so AF_PACKET's own lock only has to stop
@@ -134,7 +134,15 @@ func Open(iface string, udpMonitorPorts []uint16) (c *Capture, err error) {
 		return nil, fmt.Errorf("glitch/afpacket: InterfaceByName(%s): %w", iface, lerr)
 	}
 
-	lockFile, lferr := os.OpenFile(fmt.Sprintf("/run/glitch-afpacket-%s.lock", iface), os.O_CREATE|os.O_RDWR, 0o644)
+	// /var/run, not /run: confirmed live on dawn6g (WaveOS) that /run
+	// doesn't exist there at all (no tmpfs mounted at that path) — only
+	// /var/run does. On Debian/aaeon /var/run is the standard symlink
+	// to /run, so this is a no-op change there; on WaveOS it's the only
+	// path that actually works. Found deploying Phase 3: glitch-exporter
+	// crash-looped on dawn6g with "open lock file: ... no such file or
+	// directory" until this was traced to the path itself, not a
+	// permissions or ordering problem.
+	lockFile, lferr := os.OpenFile(fmt.Sprintf("/var/run/glitch-afpacket-%s.lock", iface), os.O_CREATE|os.O_RDWR, 0o644)
 	if lferr != nil {
 		return nil, fmt.Errorf("glitch/afpacket: open lock file: %w", lferr)
 	}
