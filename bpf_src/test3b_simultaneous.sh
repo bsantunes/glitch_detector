@@ -95,9 +95,14 @@ for i in $(seq 1 "$RUNS"); do
 	echo "=== test3b_simultaneous run $i/$RUNS (iface=$IFACE outage=${OUTAGE_SECONDS}s) ==="
 	stop_glitch_exporter_if_needed
 
-	ebpf_log="/tmp/test3b_sim_ebpf_${i}.log"
-	afpacket_log="/tmp/test3b_sim_afpacket_${i}.log"
-	iperf_log="/tmp/test3b_sim_iperf3_${i}.log"
+	# Log names carry OUTAGE_SECONDS/PARALLEL so consecutive invocations
+	# with different flags (e.g. a 2s run then a 3s run) don't overwrite
+	# each other's logs at the same index -- bit us the first time this
+	# script was run with more than one configuration back to back.
+	run_tag="o${OUTAGE_SECONDS}_p${PARALLEL}_${i}"
+	ebpf_log="/tmp/test3b_sim_ebpf_${run_tag}.log"
+	afpacket_log="/tmp/test3b_sim_afpacket_${run_tag}.log"
+	iperf_log="/tmp/test3b_sim_iperf3_${run_tag}.log"
 
 	sudo "$GLITCH_BIN" -iface "$IFACE" -capture ebpf >"$ebpf_log" 2>&1 &
 	EBPF_PID=$!
