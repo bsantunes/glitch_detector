@@ -124,6 +124,26 @@ const (
 	// flows well before the table ever gets close to full under
 	// normal load, not as the primary bounding mechanism.
 	idleTimeout = 5 * time.Minute
+
+	// burstWindow: a packet arriving within this long of the flow's
+	// previous packet is treated as the same logical send, not an
+	// independent inter-packet gap — see handleEgress's own comment.
+	// tc_glitch.bpf.c has no equivalent of this at all, because eBPF's
+	// clsact hook sits before GSO segmentation: a GSO super-packet is
+	// exactly one packet to it, so this artifact can't arise there in
+	// the first place. It is needed here because glitch/afpacket taps
+	// the wire after GSO has split that same send into multiple
+	// segments, microseconds apart — confirmed live (Phase 2
+	// simultaneous eBPF/AF_PACKET comparison on aaeon): without this,
+	// such a segment's near-zero gap satisfies "not stalling" and
+	// spuriously closes a stall episode AF_PACKET itself just opened
+	// moments earlier, fragmenting one real outage into two reported
+	// episodes where eBPF (seeing only the one coalesced packet)
+	// reports a single continuous one. 1ms comfortably covers same-
+	// send segmentation gaps (observed: tens of microseconds) while
+	// being far below stallThreshold, so it can never mask a real
+	// stall.
+	burstWindow = 1 * time.Millisecond
 )
 
 // Engine tracks per-flow state and applies tc_glitch.bpf.c's stall/
@@ -233,60 +253,66 @@ func (e *Engine) handleEgress(pm PacketMeta, srcKey, dstKey [4]byte) []glitch.Ev
 	state.pktCount++ // this packet counts as seen before the check below
 
 	// 1. Stall check (idle-vs-fault aware) — see STALL_K/
-	// STALL_MIN_PACKETS comment in tc_glitch.bpf.c.
+	// STALL_MIN_PACKETS comment in tc_glitch.bpf.c. Skipped entirely
+	// for a same-burst packet (see burstWindow's own comment) — it must
+	// not close an open episode, count as a qualifying gap, or update
+	// the EWMA; tc_glitch.bpf.c has no equivalent skip because this
+	// situation can't arise for it in the first place.
 	delta := pm.Time.Sub(state.lastTs)
-	eligible := false
-	if state.pktCount >= stallMinPackets {
-		switch {
-		case isTCP:
-			eligible = int32(state.endSeq-state.highestAck) > 0
-		case isUDP:
-			eligible = e.udpPortMonitored(pm.SrcPort) || e.udpPortMonitored(pm.DstPort)
+	if delta > burstWindow {
+		eligible := false
+		if state.pktCount >= stallMinPackets {
+			switch {
+			case isTCP:
+				eligible = int32(state.endSeq-state.highestAck) > 0
+			case isUDP:
+				eligible = e.udpPortMonitored(pm.SrcPort) || e.udpPortMonitored(pm.DstPort)
+			}
 		}
-	}
 
-	baseline := time.Duration(state.avgGapNs * stallK)
-	if baseline < stallThreshold {
-		baseline = stallThreshold
-	}
+		baseline := time.Duration(state.avgGapNs * stallK)
+		if baseline < stallThreshold {
+			baseline = stallThreshold
+		}
 
-	if eligible && delta > baseline {
-		if !state.stallOpen {
-			state.stallOpen = true
-			state.stallStartTs = state.lastTs // episode began at the last good packet
-			state.stallSteps = 1
-			events = append(events, glitch.Event{
-				Time: pm.Time, SrcIP: pm.SrcIP, DstIP: pm.DstIP,
-				SrcPort: pm.SrcPort, DstPort: pm.DstPort,
-				Value:    uint64(delta.Nanoseconds()),
-				Baseline: baseline,
-				Type:     glitch.KindStallStart,
-				Proto:    pm.Proto,
-			})
+		if eligible && delta > baseline {
+			if !state.stallOpen {
+				state.stallOpen = true
+				state.stallStartTs = state.lastTs // episode began at the last good packet
+				state.stallSteps = 1
+				events = append(events, glitch.Event{
+					Time: pm.Time, SrcIP: pm.SrcIP, DstIP: pm.DstIP,
+					SrcPort: pm.SrcPort, DstPort: pm.DstPort,
+					Value:    uint64(delta.Nanoseconds()),
+					Baseline: baseline,
+					Type:     glitch.KindStallStart,
+					Proto:    pm.Proto,
+				})
+			} else {
+				state.stallSteps++
+			}
+			// Not folded into the EWMA — see tc_glitch.bpf.c: it's the
+			// anomaly just counted, not the flow's normal pace.
 		} else {
-			state.stallSteps++
+			if state.stallOpen {
+				duration := pm.Time.Sub(state.stallStartTs)
+				events = append(events, glitch.Event{
+					Time: pm.Time, SrcIP: pm.SrcIP, DstIP: pm.DstIP,
+					SrcPort: pm.SrcPort, DstPort: pm.DstPort,
+					Value:    uint64(duration.Nanoseconds()),
+					Baseline: baseline,
+					Type:     glitch.KindStallEnd,
+					Steps:    state.stallSteps,
+					Proto:    pm.Proto,
+				})
+				state.stallOpen = false
+				state.stallSteps = 0
+			}
+			// EWMA update, signed shift-8 — matches tc_glitch.bpf.c's
+			// (s64) arithmetic exactly; Go's >> on a signed integer is
+			// arithmetic (sign-extending), same as the BPF compiler emits.
+			state.avgGapNs += (delta.Nanoseconds() - state.avgGapNs) >> 3
 		}
-		// Not folded into the EWMA — see tc_glitch.bpf.c: it's the
-		// anomaly just counted, not the flow's normal pace.
-	} else {
-		if state.stallOpen {
-			duration := pm.Time.Sub(state.stallStartTs)
-			events = append(events, glitch.Event{
-				Time: pm.Time, SrcIP: pm.SrcIP, DstIP: pm.DstIP,
-				SrcPort: pm.SrcPort, DstPort: pm.DstPort,
-				Value:    uint64(duration.Nanoseconds()),
-				Baseline: baseline,
-				Type:     glitch.KindStallEnd,
-				Steps:    state.stallSteps,
-				Proto:    pm.Proto,
-			})
-			state.stallOpen = false
-			state.stallSteps = 0
-		}
-		// EWMA update, signed shift-8 — matches tc_glitch.bpf.c's
-		// (s64) arithmetic exactly; Go's >> on a signed integer is
-		// arithmetic (sign-extending), same as the BPF compiler emits.
-		state.avgGapNs += (delta.Nanoseconds() - state.avgGapNs) >> 3
 	}
 
 	// 2. Retransmission check (TCP only), independent of the stall

@@ -101,10 +101,11 @@ type Capture struct {
 	blockNr   int
 	engine    *core.Engine
 
-	events        chan glitch.Event
-	userDropped   uint64 // atomic — events dropped because Events() wasn't drained fast enough
-	kernelDropped uint64 // atomic — unix.TpacketStatsV3.Drops, polled periodically (see pollKernelDrops)
-	packetsSeen   uint64 // atomic — every packet the filter let through and this package parsed, regardless of whether it produced an Event
+	events          chan glitch.Event
+	userDropped     uint64 // atomic — events dropped because Events() wasn't drained fast enough
+	kernelDropped   uint64 // atomic — unix.TpacketStatsV3.Drops, polled periodically (see pollKernelDrops)
+	packetsSeen     uint64 // atomic — every packet the filter let through and this package parsed, regardless of whether it produced an Event
+	untruncatedOver uint64 // atomic — see UntruncatedOverLimit
 
 	mu   sync.Mutex
 	err  error
@@ -306,8 +307,21 @@ func (c *Capture) processBlock(blockOff int) {
 		sec := binary.LittleEndian.Uint32(c.ring[pktOff+4:])
 		nsec := binary.LittleEndian.Uint32(c.ring[pktOff+8:])
 		snaplen := binary.LittleEndian.Uint32(c.ring[pktOff+12:])
+		tpLen := binary.LittleEndian.Uint32(c.ring[pktOff+16:]) // tp_len: the packet's real on-wire length, before any filter truncation
 		mac := binary.LittleEndian.Uint16(c.ring[pktOff+24:])
 		pkttype := c.ring[pktOff+pkttypeOffset]
+
+		// Confirms the classic BPF filter's RetConstant{Val: snapLen}
+		// (see filter.go) actually truncates in the ring, as opposed to
+		// a full packet landing there regardless — the leading
+		// candidate explanation investigated for a live capacity
+		// question (562 kernel/user drops seen on aaeon during a
+		// congestion-recovery burst, Phase 2). snaplen == tpLen on a
+		// packet longer than the filter's own 128-byte limit means
+		// truncation did NOT happen for it.
+		if snaplen == tpLen && tpLen > snapLen {
+			atomic.AddUint64(&c.untruncatedOver, 1)
+		}
 
 		dataStart := pktOff + int(mac)
 		dataEnd := dataStart + int(snaplen)
@@ -446,6 +460,42 @@ func (c *Capture) Err() error {
 // don't.
 func (c *Capture) Dropped() uint64 {
 	return atomic.LoadUint64(&c.userDropped) + atomic.LoadUint64(&c.kernelDropped)
+}
+
+// KernelDropped and UserDropped break Dropped() apart into its two,
+// causally distinct halves — not part of the Source interface (which
+// only promises the combined Dropped(), the one thing glitch.Handle's
+// own, differently-shaped drop counting can also express), for a
+// caller (currently just cmd/glitch-tool's -capture afpacket path)
+// that wants to tell them apart. Added after a test run reported
+// Dropped()=562 during a congestion-recovery burst with no way to
+// tell whether that meant the kernel ring itself couldn't keep up
+// (KernelDropped — a real AF_PACKET capacity problem, relevant to
+// Phase 3 sizing on WaveOS) or this process's own 256-slot Events()
+// channel simply wasn't being drained fast enough by that particular
+// consumer (UserDropped — e.g. glitch-tool synchronously fmt.Printf-
+// ing one line per event to a redirected file, a property of that
+// tool, not of capture/Engine; glitch-exporter's own async batching
+// WriteAPI consumer is a different shape and may not reproduce it at
+// all). Investigate KernelDropped first; it's the one that would
+// also affect glitch-exporter in production.
+func (c *Capture) KernelDropped() uint64 {
+	return atomic.LoadUint64(&c.kernelDropped)
+}
+
+func (c *Capture) UserDropped() uint64 {
+	return atomic.LoadUint64(&c.userDropped)
+}
+
+// UntruncatedOverLimit returns the cumulative count of ring packets
+// longer than the classic BPF filter's own 128-byte snapLen (see
+// filter.go) whose tp_snaplen nonetheless equals their real tp_len —
+// i.e. the filter's truncation did not take effect for them. Expected
+// to stay at 0; a nonzero count means full, untruncated packets are
+// consuming many times their expected ring footprint, which is a
+// direct, concrete explanation for KernelDropped during a burst.
+func (c *Capture) UntruncatedOverLimit() uint64 {
+	return atomic.LoadUint64(&c.untruncatedOver)
 }
 
 // PacketsSeen returns the cumulative count of packets the kernel

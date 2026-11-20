@@ -375,6 +375,93 @@ func TestEngine_CapEviction_AbandonsOpenEpisodeOnEvict(t *testing.T) {
 	}
 }
 
+// TestEngine_BurstWindow_SameSendDoesNotSplitEpisode replicates the
+// exact sequence seen live in the Phase 2 simultaneous eBPF/AF_PACKET
+// comparison on aaeon: a stall-triggering packet, a second segment of
+// the same GSO-coalesced send 47us later (which must not close the
+// episode it just opened), then the real recovery (two retransmission
+// retries, then a normal-paced packet). Before burstWindow, the 47us
+// segment satisfied "not stalling" and closed the episode immediately,
+// fragmenting what eBPF (seeing only the one pre-GSO-split packet)
+// reports as a single continuous episode into two.
+func TestEngine_BurstWindow_SameSendDoesNotSplitEpisode(t *testing.T) {
+	e := NewEngine(nil)
+	base := time.Now()
+	tm, seq := warmUp(e, base, stallMinPackets, 10*time.Millisecond, 100)
+	s := seq // first byte of the stalled send, kept for the retries below
+
+	// P1: the stall-triggering packet — genuinely new data, not itself
+	// a retransmission.
+	tm = tm.Add(137 * time.Millisecond)
+	events := e.HandlePacket(egressPkt(tm, s, 100))
+	if len(events) != 1 || events[0].Type != glitch.KindStallStart {
+		t.Fatalf("P1: expected one StallStart, got %+v", events)
+	}
+
+	// P2: the same send's second GSO segment, 47us later — same flow,
+	// continuing data (not a retransmission), within burstWindow.
+	tm = tm.Add(47 * time.Microsecond)
+	events = e.HandlePacket(egressPkt(tm, s+100, 50))
+	if len(events) != 0 {
+		t.Fatalf("P2 (same-burst segment): expected no events at all, got %+v", events)
+	}
+
+	// P3: first retry — a retransmission, well past burstWindow. Must
+	// not reopen (already open) or close (still genuinely stalled).
+	tm = tm.Add(320 * time.Millisecond)
+	events = e.HandlePacket(egressPkt(tm, s, 100)) // resend from s
+	if len(events) != 1 || events[0].Type != glitch.KindRetrans {
+		t.Fatalf("P3 (first retry): expected one Retrans, got %+v", events)
+	}
+
+	// P4: second retry — another retransmission.
+	tm = tm.Add(270 * time.Millisecond)
+	events = e.HandlePacket(egressPkt(tm, s+50, 50)) // resend from s+50
+	if len(events) != 1 || events[0].Type != glitch.KindRetrans {
+		t.Fatalf("P4 (second retry): expected one Retrans, got %+v", events)
+	}
+
+	// P5: recovery — normal-paced, genuinely new data closes the
+	// episode. Exactly one episode end to end, with all three
+	// qualifying gaps (P1, P3, P4) folded into it — the real outage
+	// reported once, not fragmented by P2.
+	tm = tm.Add(10 * time.Millisecond)
+	events = e.HandlePacket(egressPkt(tm, s+150, 100))
+	if len(events) != 1 || events[0].Type != glitch.KindStallEnd {
+		t.Fatalf("P5 (recovery): expected one StallEnd, got %+v", events)
+	}
+	if events[0].Steps != 3 {
+		t.Errorf("Steps = %d, want 3 (P1 opens + P3 + P4 each extend)", events[0].Steps)
+	}
+}
+
+// TestEngine_BurstWindow_OrdinaryBulkTransfer_NoFalseStall confirms the
+// burstWindow skip doesn't itself introduce a false stall during
+// perfectly normal traffic: a steady bulk transfer where every "send"
+// happens to arrive as two GSO-split segments a few microseconds
+// apart, same as real post-split AF_PACKET capture of ordinary
+// traffic, not just the stall scenario above.
+func TestEngine_BurstWindow_OrdinaryBulkTransfer_NoFalseStall(t *testing.T) {
+	e := NewEngine(nil)
+	base := time.Now()
+	tm := base
+	seq := uint32(1000)
+	for i := 0; i < stallMinPackets+20; i++ {
+		e.HandlePacket(egressPkt(tm, seq, 100))
+		seq += 100
+		tm = tm.Add(50 * time.Microsecond) // same-burst second segment
+		events := e.HandlePacket(egressPkt(tm, seq, 50))
+		seq += 50
+		if len(events) != 0 {
+			t.Fatalf("iteration %d: same-burst segment produced events during ordinary traffic: %+v", i, events)
+		}
+		tm = tm.Add(10 * time.Millisecond) // normal pace to the next send
+	}
+	if state := e.flows[testFlowKey()]; state.stallOpen {
+		t.Errorf("expected no stall open after an uninterrupted bulk transfer")
+	}
+}
+
 func TestEngine_EWMA_NotPollutedByStallGap(t *testing.T) {
 	e := NewEngine(nil)
 	base := time.Now()

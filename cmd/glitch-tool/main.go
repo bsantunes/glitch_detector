@@ -49,6 +49,7 @@ func run() error {
 	defer cancel()
 
 	var h glitch.Source
+	var afCap *afpacket.Capture // non-nil only for -capture afpacket, for its own breakdown counters below
 	switch *capture {
 	case "", "ebpf":
 		var err error
@@ -58,10 +59,11 @@ func run() error {
 		}
 	case "afpacket":
 		var err error
-		h, err = afpacket.Open(*iface, nil)
+		afCap, err = afpacket.Open(*iface, nil)
 		if err != nil {
 			return fmt.Errorf("afpacket.Open(%s): %w", *iface, err)
 		}
+		h = afCap
 	default:
 		return fmt.Errorf("unknown -capture %q (want ebpf or afpacket)", *capture)
 	}
@@ -84,10 +86,10 @@ func run() error {
 	for {
 		select {
 		case <-ctx.Done():
-			fmt.Printf("📊 dropped=%d (final)\n", h.Dropped())
+			fmt.Printf("📊 %s (final)\n", droppedLine(h, afCap))
 			return nil
 		case <-dropTicker.C:
-			fmt.Printf("📊 dropped=%d\n", h.Dropped())
+			fmt.Printf("📊 %s\n", droppedLine(h, afCap))
 		case ev, ok := <-h.Events():
 			if !ok {
 				return h.Err()
@@ -105,6 +107,22 @@ func run() error {
 			}
 		}
 	}
+}
+
+// droppedLine reports the combined Dropped() count always, plus — for
+// -capture afpacket only — the kernel/user/truncation breakdown that
+// distinguishes a real AF_PACKET ring-capacity problem (kernelDropped,
+// relevant to Phase 3 sizing on WaveOS) from this process's own
+// Events() channel just not being drained fast enough (userDropped, a
+// property of this consumer, not of capture itself) — see
+// afpacket.Capture.KernelDropped's own doc comment for why this
+// session's first test run couldn't tell the two apart.
+func droppedLine(h glitch.Source, afCap *afpacket.Capture) string {
+	if afCap == nil {
+		return fmt.Sprintf("dropped=%d", h.Dropped())
+	}
+	return fmt.Sprintf("dropped=%d (kernel=%d user=%d untruncated_over_limit=%d)",
+		h.Dropped(), afCap.KernelDropped(), afCap.UserDropped(), afCap.UntruncatedOverLimit())
 }
 
 func protoName(proto uint8) string {
