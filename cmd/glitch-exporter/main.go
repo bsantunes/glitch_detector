@@ -85,6 +85,24 @@ const writeQueueSize = 4096
 // minutes away on a long -interval) before being reported as abandoned.
 const abandonedCheckInterval = 5 * time.Second
 
+// healthCheckInterval/healthWriteTimeout govern the one place in this
+// program that calls InfluxDB's BLOCKING write API, deliberately: the
+// async WriteAPI used for everything else is fire-and-forget by design
+// (see writeQueue's own comment) and genuinely cannot tell this
+// process whether a write ever actually succeeded - a silent total
+// write failure (wrong URL, bad token, a token that can write some
+// tags but not others, the write path down) looks identical in its
+// logs to "working fine," which is exactly what happened the first
+// time this exporter was pointed at a bad token: zero errors logged,
+// zero points written, nothing to suggest anything was wrong short of
+// noticing the absence of data days later. This goroutine is isolated
+// from the main event loop (its own ticker, its own timeout) so a
+// stuck or failing health write can never block h.Events().
+const (
+	healthCheckInterval = 30 * time.Second
+	healthWriteTimeout  = 20 * time.Second
+)
+
 func main() {
 	if err := run(); err != nil {
 		log.Print(err)
@@ -102,6 +120,7 @@ func run() error {
 	influxBucket := flag.String("influx-bucket", "network", "InfluxDB bucket")
 	deviceID := flag.String("device-id", "", "tag identifying this device in InfluxDB (defaults to hostname)")
 	maxEventsPerSec := flag.Int("max-events-per-sec", 20, "max glitch_event points written per second (excess is still counted in glitch_summary)")
+	noWriteAlertAfter := flag.Duration("no-write-alert-after", 2*time.Minute, "log an error if no InfluxDB write has been confirmed successful for this long (see the health-check goroutine)")
 	flag.Parse()
 
 	if *influxURL == "" {
@@ -149,8 +168,10 @@ func run() error {
 	client := influxdb2.NewClient(*influxURL, token)
 	defer client.Close()
 	writeAPI := client.WriteAPI(*influxOrg, *influxBucket)
+	var asyncWriteErrors uint64
 	go func() {
 		for werr := range writeAPI.Errors() {
+			atomic.AddUint64(&asyncWriteErrors, 1)
 			log.Printf("influx async write error: %v", werr)
 		}
 	}()
@@ -177,7 +198,7 @@ func run() error {
 	// in glitch_summary so a sustained problem here is visible, not
 	// just a few points quietly late.
 	writeQueue := make(chan *write.Point, writeQueueSize)
-	var writeQueueDropped uint64
+	var writeQueueDropped, pointsEnqueued uint64
 	go func() {
 		for p := range writeQueue {
 			writeAPI.WritePoint(p)
@@ -186,10 +207,48 @@ func run() error {
 	enqueue := func(p *write.Point) {
 		select {
 		case writeQueue <- p:
+			atomic.AddUint64(&pointsEnqueued, 1)
 		default:
 			atomic.AddUint64(&writeQueueDropped, 1)
 		}
 	}
+
+	// The one place this program calls InfluxDB's BLOCKING write API —
+	// see healthCheckInterval's own doc comment for why. Isolated in
+	// its own goroutine with its own ticker and a bounded per-attempt
+	// context, so it can never affect the main event loop below.
+	var lastSuccessfulWrite atomic.Int64
+	lastSuccessfulWrite.Store(time.Now().Unix())
+	writeAPIBlocking := client.WriteAPIBlocking(*influxOrg, *influxBucket)
+	go func() {
+		ticker := time.NewTicker(healthCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				wctx, cancel := context.WithTimeout(context.Background(), healthWriteTimeout)
+				p := influxdb2.NewPoint("glitch_exporter_health",
+					map[string]string{"device": *deviceID, "iface": *iface, "capture": *capture},
+					map[string]interface{}{"up": 1}, time.Now())
+				err := writeAPIBlocking.WritePoint(wctx, p)
+				cancel()
+				since := time.Since(time.Unix(lastSuccessfulWrite.Load(), 0))
+				if err != nil {
+					log.Printf("InfluxDB health-check write FAILED: %v (last confirmed success: %s ago)", err, since.Round(time.Second))
+				} else {
+					lastSuccessfulWrite.Store(time.Now().Unix())
+					since = 0
+				}
+				log.Printf("influx health: points_enqueued=%d write_queue_dropped=%d async_write_errors=%d last_confirmed_success=%s ago",
+					atomic.LoadUint64(&pointsEnqueued), atomic.LoadUint64(&writeQueueDropped), atomic.LoadUint64(&asyncWriteErrors), since.Round(time.Second))
+				if since > *noWriteAlertAfter {
+					log.Printf("ERROR: no InfluxDB write confirmed successful in over %s — writes may be silently failing (check URL/org/bucket/token/network)", noWriteAlertAfter)
+				}
+			}
+		}
+	}()
 
 	agg := NewAggregator(time.Now, *maxEventsPerSec)
 

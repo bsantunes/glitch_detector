@@ -36,7 +36,12 @@
 # "ebpf" specifically to make stop_glitch_exporter_if_needed fire
 # unconditionally here), restarts it after.
 #
-# Usage: ./test3b_exporter_load.sh [-iface IFACE] [-runs N] [-outage-seconds N] [-parallel N]
+# Usage: ./test3b_exporter_load.sh [-iface IFACE] [-runs N] [-outage-seconds N] [-parallel N] [-iperf-duration N] [-outage-delay N]
+# -iperf-duration: iperf3 -t (default 10). -outage-delay: seconds after
+# iperf3 starts before the outage triggers (default 3) - e.g.
+# -iperf-duration 30 -outage-delay 12 for an outage at t=12s of a 30s
+# transfer, giving the flow room to ramp up and recover well before
+# iperf3 itself ends.
 # Run bare, no leading sudo — see glitch-detector-internals skill's
 # sudo-wrapping pitfall note, same reasoning applies here.
 set -euo pipefail
@@ -79,7 +84,17 @@ EXPORTER_LAUNCH_SCRIPT="$(mktemp)"
 QUERY_SCRIPT="$(mktemp)"
 cat >"$EXPORTER_LAUNCH_SCRIPT" <<SCRIPT
 #!/bin/bash
+# set -a (allexport): plain "source" only sets a shell variable, which
+# exec does NOT carry into the replaced process's environment — only
+# genuinely exported variables survive exec. Without this, glitch-
+# exporter's os.Getenv("INFLUX_TOKEN") finds nothing and exits
+# immediately via log.Fatalf, before ever attempting a write — exactly
+# what happened the first time this script ran (confirmed from the
+# log: every one of 7 runs died within milliseconds on "InfluxDB token
+# required", not a URL/org/bucket/write-queue problem).
+set -a
 source "$ENV_FILE"
+set +a
 exec "$EXPORTER_BIN" -iface "$IFACE" -capture afpacket -interval 2s -influx-url "$INFLUX_URL" -influx-org "$INFLUX_ORG" -influx-bucket "$INFLUX_BUCKET" -device-id "$TEST_DEVICE"
 SCRIPT
 cat >"$QUERY_SCRIPT" <<SCRIPT
@@ -147,16 +162,32 @@ for i in $(seq 1 "$RUNS"); do
 	echo "=== test3b_exporter_load run $i/$RUNS (iface=$IFACE outage=${OUTAGE_SECONDS}s parallel=$PARALLEL) ==="
 	stop_glitch_exporter_if_needed
 
-	run_tag="o${OUTAGE_SECONDS}_p${PARALLEL}_${i}"
+	run_tag="o${OUTAGE_SECONDS}_p${PARALLEL}_t${IPERF_DURATION}_d${OUTAGE_DELAY}_${i}"
 	exporter_log="/tmp/test3b_exload_exporter_${run_tag}.log"
 	iperf_log="/tmp/test3b_exload_iperf3_${run_tag}.log"
 
 	start_test_exporter "$exporter_log"
 	sleep 2
+	# Confirm it's actually still running before spending a whole run on
+	# it — the exact gap that let all 7 runs silently die on a startup
+	# error last time (sudo+kill+wait on an already-dead PID all no-op
+	# via `|| true`, so nothing in this script's own control flow would
+	# have caught it without this check).
+	if ! sudo kill -0 "$EXPORTER_PID" 2>/dev/null; then
+		echo "FATAL: test glitch-exporter (pid $EXPORTER_PID) is not running 2s after launch — it exited immediately. Log:" >&2
+		cat "$exporter_log" >&2
+		exit 1
+	fi
+	if ! grep -q "exporting glitch stats" "$exporter_log" 2>/dev/null; then
+		echo "FATAL: test glitch-exporter never logged its startup line — something is wrong. Log so far:" >&2
+		cat "$exporter_log" >&2
+		exit 1
+	fi
+	echo "startup confirmed: $(grep 'exporting glitch stats' "$exporter_log")"
 
-	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t 10 -P "$PARALLEL" >"$iperf_log" 2>&1 &
+	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t "$IPERF_DURATION" -P "$PARALLEL" >"$iperf_log" 2>&1 &
 	iperf_pid=$!
-	sleep 3
+	sleep "$OUTAGE_DELAY"
 
 	echo "blocking this device's own InfluxDB writes (dport $INFLUX_DPORT on $IFACE) for the outage window..."
 	block_influx_writes

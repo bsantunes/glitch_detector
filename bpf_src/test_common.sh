@@ -15,6 +15,8 @@ CAPTURE=ebpf
 RUNS=1
 OUTAGE_SECONDS=1
 PARALLEL=1
+IPERF_DURATION=10
+OUTAGE_DELAY=3
 GLITCH_BIN="${GLITCH_TOOL_BIN:-./glitch-tool}"
 
 parse_common_args() {
@@ -38,6 +40,14 @@ parse_common_args() {
 			;;
 		-parallel)
 			PARALLEL="$2"
+			shift 2
+			;;
+		-iperf-duration)
+			IPERF_DURATION="$2"
+			shift 2
+			;;
+		-outage-delay)
+			OUTAGE_DELAY="$2"
 			shift 2
 			;;
 		*)
