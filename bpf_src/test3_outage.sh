@@ -45,8 +45,7 @@ for i in $(seq 1 "$RUNS"); do
 	stop_glitch_exporter_if_needed
 	log="/tmp/test3_${CAPTURE}_${i}.log"
 
-	sudo "$GLITCH_BIN" -iface "$IFACE" -capture "$CAPTURE" >"$log" 2>&1 &
-	glitch_pid=$!
+	start_glitch_tool "$log"
 	sleep 2
 
 	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t 10 >/dev/null 2>&1 &
@@ -59,8 +58,7 @@ for i in $(seq 1 "$RUNS"); do
 
 	wait "$iperf_pid" || true
 	sleep 1
-	sudo kill -TERM "$glitch_pid" 2>/dev/null || true
-	wait "$glitch_pid" 2>/dev/null || true
+	stop_glitch_tool
 	restore_glitch_exporter
 
 	# :5201 at end of line — that's the dst port position in

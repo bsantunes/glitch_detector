@@ -26,8 +26,7 @@ for i in $(seq 1 "$RUNS"); do
 	log="/tmp/test2_${CAPTURE}_${i}.log"
 	iperf_log="/tmp/test2_iperf3_${i}.log"
 
-	sudo "$GLITCH_BIN" -iface "$IFACE" -capture "$CAPTURE" >"$log" 2>&1 &
-	glitch_pid=$!
+	start_glitch_tool "$log"
 	sleep 2
 
 	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t 10 >"$iperf_log" 2>&1 &
@@ -39,8 +38,7 @@ for i in $(seq 1 "$RUNS"); do
 	wait "$iperf_pid" || true
 	remove_netem
 	sleep 1
-	sudo kill -TERM "$glitch_pid" 2>/dev/null || true
-	wait "$glitch_pid" 2>/dev/null || true
+	stop_glitch_tool
 	restore_glitch_exporter
 
 	retrans=$(grep -c "TCP Loss Detected" "$log" || true)

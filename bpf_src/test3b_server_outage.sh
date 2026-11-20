@@ -39,6 +39,15 @@ fi
 
 SSH_KEY="${TEST3B_SSH_KEY:-$HOME/.ssh/id_ed25519_wservices_outage}"
 SSH_TARGET="${TEST3B_SSH_TARGET:-idwave@wservices.wavesys.pt}"
+# BatchMode: never block waiting for a password/passphrase this
+# key will never have one of; accept-new: trust a host key seen
+# for the first time without an interactive prompt (still rejects
+# a *changed* key, same as the default) -- confirmed live that the
+# interactive version of this prompt can stall the script for an
+# arbitrary amount of real time, well past when the already-running
+# iperf3/glitch-tool background processes finish on their own,
+# silently invalidating the whole run.
+SSH_OPTS="-o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 IPERF_TARGET="51.91.57.3"
 
 # Fails loudly rather than letting a leftover DROP rule on a shared,
@@ -46,7 +55,7 @@ IPERF_TARGET="51.91.57.3"
 # fleet, and Nagios) go unnoticed between runs.
 check_no_leftover_rule() {
 	local rules
-	if ! rules=$(ssh -i "$SSH_KEY" "$SSH_TARGET" check5201 2>&1); then
+	if ! rules=$(ssh $SSH_OPTS -i "$SSH_KEY" "$SSH_TARGET" check5201 2>&1); then
 		echo "FATAL: could not check wservices for a leftover iptables rule: $rules" >&2
 		exit 1
 	fi
@@ -63,8 +72,7 @@ for i in $(seq 1 "$RUNS"); do
 	stop_glitch_exporter_if_needed
 	log="/tmp/test3b_${CAPTURE}_${i}.log"
 
-	sudo "$GLITCH_BIN" -iface "$IFACE" -capture "$CAPTURE" >"$log" 2>&1 &
-	glitch_pid=$!
+	start_glitch_tool "$log"
 	sleep 2
 
 	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t 10 >/dev/null 2>&1 &
@@ -72,12 +80,11 @@ for i in $(seq 1 "$RUNS"); do
 	sleep 3
 
 	echo "triggering server-side outage (${OUTAGE_SECONDS}s)..."
-	ssh -i "$SSH_KEY" "$SSH_TARGET" "outage $OUTAGE_SECONDS"
+	ssh $SSH_OPTS -i "$SSH_KEY" "$SSH_TARGET" "outage $OUTAGE_SECONDS"
 
 	wait "$iperf_pid" || true
 	sleep 1
-	sudo kill -TERM "$glitch_pid" 2>/dev/null || true
-	wait "$glitch_pid" 2>/dev/null || true
+	stop_glitch_tool
 	restore_glitch_exporter
 
 	# :5201 at end of line — the dst port position in glitch-tool's

@@ -86,7 +86,41 @@ remove_netem() {
 	fi
 }
 
+# GLITCH_PID / start_glitch_tool / stop_glitch_tool — every script
+# backgrounds glitch-tool via start_glitch_tool and must tear it down
+# via stop_glitch_tool, not a one-off inline `sudo kill` at the
+# "normal" end of its loop body. Confirmed live why this matters: an
+# early script abort (e.g. the SSH call in test3b failing before its
+# own manual kill/wait ever ran) left two root-owned glitch-tool
+# processes running indefinitely, each still holding its own
+# exclusivity lock -- invisible until the *next* invocation failed
+# with "another glitch monitor is already attached," and in the
+# meantime both kept writing into whatever log path they'd been
+# redirected to, long after the script that started them had already
+# exited, corrupting a later run's own log file (a shell's `>`
+# redirection truncates the existing inode in place; the orphaned
+# process's own file descriptor, opened earlier at a far larger
+# offset, then resumes writing from *its* cursor, leaving a block of
+# NUL bytes in between). Routing every start/stop through here, under
+# the same trap cleanup_common EXIT every script already registers,
+# closes that gap: no code path can finish without either normally
+# stopping glitch-tool or hitting the trap that does it instead.
+GLITCH_PID=""
+start_glitch_tool() {
+	# $1 = log file path
+	sudo "$GLITCH_BIN" -iface "$IFACE" -capture "$CAPTURE" >"$1" 2>&1 &
+	GLITCH_PID=$!
+}
+stop_glitch_tool() {
+	if [ -n "$GLITCH_PID" ]; then
+		sudo kill -TERM "$GLITCH_PID" 2>/dev/null || true
+		wait "$GLITCH_PID" 2>/dev/null || true
+		GLITCH_PID=""
+	fi
+}
+
 cleanup_common() {
+	stop_glitch_tool
 	remove_netem
 	restore_glitch_exporter
 }

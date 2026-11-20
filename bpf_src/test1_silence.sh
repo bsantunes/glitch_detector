@@ -19,11 +19,9 @@ for i in $(seq 1 "$RUNS"); do
 	stop_glitch_exporter_if_needed
 	log="/tmp/test1_${CAPTURE}_${i}.log"
 
-	sudo "$GLITCH_BIN" -iface "$IFACE" -capture "$CAPTURE" >"$log" 2>&1 &
-	glitch_pid=$!
+	start_glitch_tool "$log"
 	sleep 60
-	sudo kill -TERM "$glitch_pid" 2>/dev/null || true
-	wait "$glitch_pid" 2>/dev/null || true
+	stop_glitch_tool
 	restore_glitch_exporter
 
 	starts=$(grep -c "Stall START" "$log" || true)
