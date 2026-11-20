@@ -205,7 +205,7 @@ for i in $(seq 1 "$RUNS"); do
 	echo "run $i: iperf3_retr=${iperf_retr:-unknown}"
 
 	echo "--- exporter log ($exporter_log) ---"
-	grep -E "drops this interval|influx async write error" "$exporter_log" || echo "(nothing logged — either clean, or the interval tick hasn't fired yet; the InfluxDB query below is authoritative)"
+	grep -E "drops this interval|influx async write error|influx health|ERROR" "$exporter_log" || echo "(nothing logged — either clean, or the interval tick hasn't fired yet; the InfluxDB query below is authoritative)"
 
 	check_no_leftover_rule
 	echo "(confirmed: no leftover 5201 rule on wservices)"
