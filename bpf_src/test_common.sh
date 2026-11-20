@@ -14,6 +14,7 @@ IFACE=wwan0
 CAPTURE=ebpf
 RUNS=1
 OUTAGE_SECONDS=1
+PARALLEL=1
 GLITCH_BIN="${GLITCH_TOOL_BIN:-./glitch-tool}"
 
 parse_common_args() {
@@ -33,6 +34,10 @@ parse_common_args() {
 			;;
 		-outage-seconds)
 			OUTAGE_SECONDS="$2"
+			shift 2
+			;;
+		-parallel)
+			PARALLEL="$2"
 			shift 2
 			;;
 		*)

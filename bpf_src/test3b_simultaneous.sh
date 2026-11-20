@@ -30,7 +30,10 @@
 # beyond that plus a safety margin is the real signal worth flagging,
 # not jitter).
 #
-# Usage: ./test3b_simultaneous.sh [-iface IFACE] [-runs N] [-outage-seconds N]
+# Usage: ./test3b_simultaneous.sh [-iface IFACE] [-runs N] [-outage-seconds N] [-parallel N]
+# -parallel N runs iperf3 with N parallel streams (-P N, default 1) —
+# a bigger aggregate burst for stress-testing AF_PACKET's drop
+# counters against a bigger backlog than a single stream produces.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=test_common.sh
@@ -102,7 +105,7 @@ for i in $(seq 1 "$RUNS"); do
 	AFPACKET_PID=$!
 	sleep 2
 
-	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t 10 >"$iperf_log" 2>&1 &
+	iperf3 -c "$IPERF_TARGET" --bind-dev "$IFACE" -t 10 -P "$PARALLEL" >"$iperf_log" 2>&1 &
 	iperf_pid=$!
 	sleep 3
 
