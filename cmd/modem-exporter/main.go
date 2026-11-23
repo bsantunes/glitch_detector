@@ -117,13 +117,15 @@ func main() {
 	// staleness.go's own doc comment.
 	stale := newStaleTracker(time.Now)
 
-	// sourceStaleByModem: whether each modem's own data source (ubus
-	// only, currently — see exportModem) looked stale as of its last
-	// poll. Read by the redetect ticker below to decide whether to fall
-	// back off the current method even to a nominally worse-ranked one —
-	// a working worse method beats a frozen better one. Single
-	// goroutine, no locking needed.
-	sourceStaleByModem := map[string]bool{}
+	// methodUnhealthyByModem: whether each modem's current method looked
+	// unhealthy as of its last poll - either a hard read failure (e.g.
+	// uqmi-ubus stopped outright, so ubus calls fail immediately), or,
+	// for ubus specifically, its own source timestamp stuck while still
+	// answering calls (see exportModem). Read by the redetect ticker
+	// below to decide whether to fall back off the current method even
+	// to a nominally worse-ranked one — a working worse method beats a
+	// broken or frozen better one. Single goroutine, no locking needed.
+	methodUnhealthyByModem := map[string]bool{}
 
 	// redetect: periodically re-runs the full detection cascade and
 	// switches method if either (a) a better-ranked method has become
@@ -156,10 +158,10 @@ func main() {
 			return
 		case <-ticker.C:
 			for _, m := range modems {
-				exportModem(ctx, writeAPI, *deviceID, m, stale, sourceStaleByModem, *interval)
+				exportModem(ctx, writeAPI, *deviceID, m, stale, methodUnhealthyByModem, *interval)
 			}
 		case <-redetectTicker.C:
-			modems = maybeSwitchModems(ctx, modems, sourceStaleByModem)
+			modems = maybeSwitchModems(ctx, modems, methodUnhealthyByModem)
 		case <-agentInfoTicker.C:
 			writeAgentInfo(ctx, writeAPI, *deviceID, "modem-exporter")
 		}
@@ -169,36 +171,41 @@ func main() {
 // maybeSwitchModems re-runs the detection cascade and swaps to its
 // result if either every currently-tracked modem is on a method ranked
 // worse than what the fresh cascade found (an upgrade), or any current
-// modem's own data source is known stale right now (a fallback, which
-// explicitly excludes the stale method from the fresh cascade — see
+// modem's method is unhealthy right now — a hard read failure (e.g.
+// uqmi-ubus stopped outright) or, for ubus specifically, its own source
+// timestamp stuck while still answering calls (a fallback, which
+// explicitly excludes the unhealthy method from the fresh cascade — see
 // modem.DetectValidatedExcluding's own doc comment for why DetectValidated
-// alone can't be trusted to skip it). Either way this is all-or-nothing
-// across every tracked modem, never a partial per-modem swap — a partial
-// swap would risk losing track of a modem the fresh cascade didn't
-// happen to re-find this particular time. Returns the original list
-// unchanged on any detection error, an empty result, or no actual
-// improvement.
-func maybeSwitchModems(ctx context.Context, current []modem.Modem, sourceStaleByModem map[string]bool) []modem.Modem {
+// alone can't be trusted to skip it: a hard read failure means
+// DetectValidated would reject the method anyway via its own all-N/A
+// check, but a frozen-yet-still-answering ubus would look exactly as
+// "valid" to that check as a real reading, so it needs the explicit
+// exclusion). Either way this is all-or-nothing across every tracked
+// modem, never a partial per-modem swap — a partial swap would risk
+// losing track of a modem the fresh cascade didn't happen to re-find
+// this particular time. Returns the original list unchanged on any
+// detection error, an empty result, or no actual improvement.
+func maybeSwitchModems(ctx context.Context, current []modem.Modem, methodUnhealthyByModem map[string]bool) []modem.Modem {
 	worstCurrent := 0
-	anyStale := false
-	var staleMethod modem.Method
+	anyUnhealthy := false
+	var unhealthyMethod modem.Method
 	for _, m := range current {
 		if r := methodRank(m.Method); r > worstCurrent {
 			worstCurrent = r
 		}
-		if sourceStaleByModem[m.ID] {
-			anyStale = true
-			staleMethod = m.Method
+		if methodUnhealthyByModem[m.ID] {
+			anyUnhealthy = true
+			unhealthyMethod = m.Method
 		}
 	}
-	if worstCurrent == 0 && !anyStale {
-		return current // already ModemManager for everything, and nothing is stale
+	if worstCurrent == 0 && !anyUnhealthy {
+		return current // already ModemManager for everything, and nothing is unhealthy
 	}
 
 	var fresh []modem.Modem
 	var err error
-	if anyStale {
-		fresh, err = modem.DetectValidatedExcluding(ctx, staleMethod)
+	if anyUnhealthy {
+		fresh, err = modem.DetectValidatedExcluding(ctx, unhealthyMethod)
 	} else {
 		fresh, err = modem.DetectValidated(ctx)
 	}
@@ -215,8 +222,8 @@ func maybeSwitchModems(ctx context.Context, current []modem.Modem, sourceStaleBy
 	switch {
 	case bestFresh < worstCurrent:
 		log.Printf("modem: re-detection found a better method (rank %d -> %d) — switching", worstCurrent, bestFresh)
-	case anyStale:
-		log.Printf("modem: current method (%s) data is stale — falling back to rank %d", staleMethod, bestFresh)
+	case anyUnhealthy:
+		log.Printf("modem: current method (%s) is unhealthy — falling back to rank %d", unhealthyMethod, bestFresh)
 	default:
 		return current
 	}
@@ -268,10 +275,17 @@ func writeAgentInfo(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID
 // is retried/buffered (acceptable for monitoring data, and avoids
 // unbounded buffering on a resource-constrained device if InfluxDB, or
 // the link to it, is down for a while).
-func exportModem(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID string, m modem.Modem, stale *staleTracker, sourceStaleByModem map[string]bool, interval time.Duration) {
+func exportModem(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID string, m modem.Modem, stale *staleTracker, methodUnhealthyByModem map[string]bool, interval time.Duration) {
 	signals, err := modem.GetSignals(ctx, m)
 	if err != nil {
 		log.Printf("[%s] signal read failed: %v", m.ID, err)
+		// A hard read failure makes this method unhealthy regardless of
+		// whether it even has a source timestamp to check - confirmed
+		// live this matters: stopping uqmi-ubus outright (as opposed to
+		// it quietly going stale while still answering calls) makes
+		// every ubus call fail immediately, which the source-timestamp
+		// check below never gets a chance to run and notice on its own.
+		methodUnhealthyByModem[m.ID] = true
 		return
 	}
 
@@ -280,15 +294,21 @@ func exportModem(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID st
 	// while its underlying daemon has stopped actually refreshing that
 	// data) — every other backend falls back to staleTracker's own
 	// change-detection instead, which needs no source timestamp at all.
+	unhealthy := false
 	hasSourceTimestamp := false
 	sourceStale := false
 	if m.Method == modem.MethodUbus {
-		if ts, ok, tErr := modem.UbusMetricsTimestamp(ctx, m); tErr == nil && ok {
+		ts, ok, tErr := modem.UbusMetricsTimestamp(ctx, m)
+		switch {
+		case tErr != nil:
+			unhealthy = true // ubus itself failing even though GetSignals just succeeded - treat as unhealthy too
+		case ok:
 			hasSourceTimestamp = true
 			sourceStale = time.Since(ts) >= 3*interval
+			unhealthy = sourceStale
 		}
 	}
-	sourceStaleByModem[m.ID] = hasSourceTimestamp && sourceStale
+	methodUnhealthyByModem[m.ID] = unhealthy
 
 	var staleFieldsThisPoll int
 	for i, sig := range signals {
