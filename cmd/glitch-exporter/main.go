@@ -66,10 +66,12 @@ import (
 	"time"
 
 	influxdb2 "github.com/influxdata/influxdb-client-go/v2"
+	"github.com/influxdata/influxdb-client-go/v2/api"
 	"github.com/influxdata/influxdb-client-go/v2/api/write"
 
 	"dawn-agent/glitch"
 	"dawn-agent/glitch/afpacket"
+	"dawn-agent/version"
 )
 
 // writeQueueSize bounds the queue between the event-consumer loop and
@@ -121,7 +123,12 @@ func run() error {
 	deviceID := flag.String("device-id", "", "tag identifying this device in InfluxDB (defaults to hostname)")
 	maxEventsPerSec := flag.Int("max-events-per-sec", 20, "max glitch_event points written per second (excess is still counted in glitch_summary)")
 	noWriteAlertAfter := flag.Duration("no-write-alert-after", 2*time.Minute, "log an error if no InfluxDB write has been confirmed successful for this long (see the health-check goroutine)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return nil
+	}
 
 	if *influxURL == "" {
 		log.Fatalf("-influx-url is required")
@@ -252,6 +259,9 @@ func run() error {
 
 	agg := NewAggregator(time.Now, *maxEventsPerSec)
 
+	log.Printf("glitch-exporter %s", version.Version)
+	writeAgentInfo(ctx, writeAPIBlocking, *deviceID, "glitch-exporter")
+
 	log.Printf("exporting glitch stats for %s via %s to %s (org=%s bucket=%s device=%s) every %s",
 		*iface, *capture, *influxURL, *influxOrg, *influxBucket, *deviceID, *interval)
 
@@ -259,6 +269,8 @@ func run() error {
 	defer summaryTicker.Stop()
 	abandonedTicker := time.NewTicker(abandonedCheckInterval)
 	defer abandonedTicker.Stop()
+	agentInfoTicker := time.NewTicker(time.Hour)
+	defer agentInfoTicker.Stop()
 
 	var lastDropped, lastKernelDropped, lastUserDropped, lastUntruncated, lastWriteQueueDropped, lastRetrans uint64
 	for {
@@ -277,6 +289,8 @@ func run() error {
 			for _, p := range agg.CheckAbandoned() {
 				enqueue(eventInfluxPoint(*deviceID, *iface, *capture, p))
 			}
+		case <-agentInfoTicker.C:
+			writeAgentInfo(ctx, writeAPIBlocking, *deviceID, "glitch-exporter")
 		case <-summaryTicker.C:
 			dropped := h.Dropped()
 			drops := DropCounts{Total: dropped - lastDropped}
@@ -300,6 +314,25 @@ func run() error {
 			lastRetrans = retrans
 			enqueue(summaryInfluxPoint(*deviceID, *iface, *capture, agg.Summary(int(retransDelta), drops)))
 		}
+	}
+}
+
+// writeAgentInfo pushes one "agent_info" point — tags device, component;
+// field version (string, from version.Version) — so "what version is
+// this board running" is answerable from InfluxDB directly, per device
+// and per binary. Uses the blocking write API directly (same one the
+// health-check goroutine uses), not the bounded writeQueue: once an
+// hour is cheap enough that a stuck write here blocking this call for a
+// while is an acceptable risk, unlike the main event-consumer loop this
+// program otherwise goes out of its way to never block (see writeQueue's
+// own comment) — logged and dropped on failure, not retried.
+func writeAgentInfo(ctx context.Context, writeAPIBlocking api.WriteAPIBlocking, deviceID, component string) {
+	point := influxdb2.NewPoint("agent_info",
+		map[string]string{"device": deviceID, "component": component},
+		map[string]interface{}{"version": version.Version},
+		time.Now())
+	if err := writeAPIBlocking.WritePoint(ctx, point); err != nil {
+		log.Printf("influx write failed (agent_info): %v", err)
 	}
 }
 

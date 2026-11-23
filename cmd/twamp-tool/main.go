@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"dawn-agent/twamp"
+	"dawn-agent/version"
 )
 
 func main() {
@@ -24,11 +25,17 @@ func main() {
 	count := flag.Int("count", 5, "packets per burst")
 	probeInterval := flag.Duration("probe-interval", 100*time.Millisecond, "spacing between packets within a burst")
 	timeout := flag.Duration("timeout", 2*time.Second, "extra time to wait for trailing replies after the last packet in a burst")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	fmt.Printf("twamp-tool %s\n", version.Version)
 	fmt.Printf("Probing %s every %s (%d packets/burst, %s apart, Ctrl+C to stop)...\n\n",
 		*reflector, *interval, *count, *probeInterval)
 

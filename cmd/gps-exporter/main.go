@@ -30,6 +30,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -43,6 +44,7 @@ import (
 
 	"dawn-agent/gps"
 	"dawn-agent/modem"
+	"dawn-agent/version"
 )
 
 func main() {
@@ -56,7 +58,12 @@ func main() {
 	influxOrg := flag.String("influx-org", "wavecom", "InfluxDB org")
 	influxBucket := flag.String("influx-bucket", "location", "InfluxDB bucket")
 	deviceID := flag.String("device-id", "", "tag identifying this device in InfluxDB (defaults to hostname)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	if *influxURL == "" {
 		log.Fatalf("-influx-url is required")
@@ -123,10 +130,15 @@ func main() {
 	defer client.Close()
 	writeAPI := client.WriteAPIBlocking(*influxOrg, *influxBucket)
 
+	log.Printf("gps-exporter %s", version.Version)
+	writeAgentInfo(ctx, writeAPI, *deviceID, "gps-exporter")
+
 	log.Printf("exporting GPS fixes to %s (org=%s bucket=%s device=%s) every %s",
 		*influxURL, *influxOrg, *influxBucket, *deviceID, *interval)
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
+	agentInfoTicker := time.NewTicker(time.Hour)
+	defer agentInfoTicker.Stop()
 
 	for {
 		select {
@@ -136,7 +148,24 @@ func main() {
 			for _, p := range pollers {
 				exportFix(ctx, writeAPI, *deviceID, p)
 			}
+		case <-agentInfoTicker.C:
+			writeAgentInfo(ctx, writeAPI, *deviceID, "gps-exporter")
 		}
+	}
+}
+
+// writeAgentInfo pushes one "agent_info" point — tags device, component;
+// field version (string, from version.Version) — so "what version is
+// this board running" is answerable from InfluxDB directly, per device
+// and per binary. Logged and dropped on failure, not retried, same
+// deliberate tradeoff as every other write in this file.
+func writeAgentInfo(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID, component string) {
+	point := influxdb2.NewPoint("agent_info",
+		map[string]string{"device": deviceID, "component": component},
+		map[string]interface{}{"version": version.Version},
+		time.Now())
+	if err := writeAPI.WritePoint(ctx, point); err != nil {
+		log.Printf("influx write failed (agent_info): %v", err)
 	}
 }
 

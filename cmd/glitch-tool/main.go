@@ -27,6 +27,7 @@ import (
 
 	"dawn-agent/glitch"
 	"dawn-agent/glitch/afpacket"
+	"dawn-agent/version"
 )
 
 func main() {
@@ -44,7 +45,12 @@ func main() {
 func run() error {
 	iface := flag.String("iface", "wwan0", "network interface to attach to")
 	capture := flag.String("capture", "ebpf", "capture backend: ebpf (default) or afpacket (for boards with no clsact/TC-BPF support)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return nil
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
@@ -70,6 +76,7 @@ func run() error {
 	}
 	defer h.Close()
 
+	fmt.Printf("glitch-tool %s\n", version.Version)
 	fmt.Printf("🚀 glitch-tool watching %s via %s (Ctrl+C to stop)\n", *iface, *capture)
 	tag := strings.ToUpper(*capture)
 	if tag == "" {

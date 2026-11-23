@@ -20,6 +20,7 @@ import (
 
 	"dawn-agent/gps"
 	"dawn-agent/modem"
+	"dawn-agent/version"
 )
 
 func main() {
@@ -28,7 +29,12 @@ func main() {
 	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/ttyUSB3, or usb:<vid>:<pid>:<ifnum> e.g. usb:2c7c:0801:03 to survive ttyUSB numbers shifting across a reboot); requires -method=at")
 	nmeaPort := flag.String("nmea-port", "", "read fixes from this NMEA port instead of AT+CGPSINFO/AT+QGPSLOC=2 (same forms as -port; typically the modem's interface 01) — AT still starts the engine and assistance data; requires -method=at")
 	agps := flag.Bool("agps", true, "send the XTRA assistance-data enable command on AT-over-serial backends before starting the engine; the setting itself is stored in the modem and persists across reboots, so -agps=false only skips sending the command, it does not turn off assistance data already enabled")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	if *nmeaPort != "" && *method != "at" {
 		log.Fatalf("-nmea-port requires -method=at (got method %q)", *method)
@@ -51,6 +57,7 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	fmt.Printf("gps-tool %s\n", version.Version)
 	fmt.Printf("Detecting GPS-capable modems (%s)...\n", gps.DescribeMethod(*method, *port))
 	modems, err := gps.DetectWithMethod(ctx, *method, *port)
 	if err != nil {

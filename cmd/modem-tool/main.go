@@ -16,15 +16,22 @@ import (
 	"time"
 
 	"dawn-agent/modem"
+	"dawn-agent/version"
 )
 
 func main() {
 	interval := flag.Duration("interval", 5*time.Second, "polling interval for signal readings")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	fmt.Printf("modem-tool %s\n", version.Version)
 	fmt.Println("Detecting modems (ModemManager -> QMI/MBIM -> AT)...")
 	modems, err := modem.Detect(ctx)
 	if err != nil {

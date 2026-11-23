@@ -36,6 +36,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"math"
 	"os"
@@ -48,6 +49,7 @@ import (
 	"github.com/influxdata/influxdb-client-go/v2/api/write"
 
 	"dawn-agent/modem"
+	"dawn-agent/version"
 )
 
 func main() {
@@ -57,7 +59,12 @@ func main() {
 	influxOrg := flag.String("influx-org", "wavecom", "InfluxDB org")
 	influxBucket := flag.String("influx-bucket", "radio", "InfluxDB bucket")
 	deviceID := flag.String("device-id", "", "tag identifying this device in InfluxDB (defaults to hostname)")
+	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println(version.Version)
+		return
+	}
 
 	if *influxURL == "" {
 		log.Fatalf("-influx-url is required")
@@ -83,6 +90,9 @@ func main() {
 	client := influxdb2.NewClient(*influxURL, token)
 	defer client.Close()
 	writeAPI := client.WriteAPIBlocking(*influxOrg, *influxBucket)
+
+	log.Printf("modem-exporter %s", version.Version)
+	writeAgentInfo(ctx, writeAPI, *deviceID, "modem-exporter")
 
 	log.Printf("Detecting modems (ModemManager -> QMI/MBIM -> uqmi -> AT)...")
 	modems, err := modem.DetectValidated(ctx)
@@ -132,6 +142,14 @@ func main() {
 	redetectTicker := time.NewTicker(redetectInterval)
 	defer redetectTicker.Stop()
 
+	// agent_info: written once at startup (above) and again every hour,
+	// so "what version is this board actually running" is answerable
+	// from InfluxDB alone, not from remembering which directory someone
+	// happened to build from — see CLAUDE.md's on-device dev-checkout
+	// note and version/version.go.
+	agentInfoTicker := time.NewTicker(time.Hour)
+	defer agentInfoTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -142,6 +160,8 @@ func main() {
 			}
 		case <-redetectTicker.C:
 			modems = maybeSwitchModems(ctx, modems, sourceStaleByModem)
+		case <-agentInfoTicker.C:
+			writeAgentInfo(ctx, writeAPI, *deviceID, "modem-exporter")
 		}
 	}
 }
@@ -222,6 +242,22 @@ func methodRank(m modem.Method) int {
 		return 4
 	default:
 		return 5
+	}
+}
+
+// writeAgentInfo pushes one "agent_info" point — tags device, component;
+// field version (string, from version.Version) — so "what version is
+// this board running" is answerable from InfluxDB directly, per device
+// and per binary, without needing to SSH in and run each one with
+// -version by hand. Logged and dropped on failure, not retried, same
+// deliberate tradeoff as every other write in this file.
+func writeAgentInfo(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID, component string) {
+	point := influxdb2.NewPoint("agent_info",
+		map[string]string{"device": deviceID, "component": component},
+		map[string]interface{}{"version": version.Version},
+		time.Now())
+	if err := writeAPI.WritePoint(ctx, point); err != nil {
+		log.Printf("influx write failed (agent_info): %v", err)
 	}
 }
 
