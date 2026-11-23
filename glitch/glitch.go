@@ -163,14 +163,14 @@ type bpfObjects struct {
 const eventsChanSize = 4096
 
 type Handle struct {
-	lockFile       *os.File
-	qdisc          *netlink.GenericQdisc
-	ownsQdisc      bool // only true if this Handle's own QdiscAdd created it (not a pre-existing EEXIST)
-	egressFilter   *netlink.BpfFilter
-	ingressFilter  *netlink.BpfFilter
-	objs           bpfObjects
-	rd             *ringbuf.Reader
-	clockOffset    int64 // atomic: wall_ns - mono_ns, refreshed periodically — see refreshClockOffset
+	lockFile      *os.File
+	qdisc         *netlink.GenericQdisc
+	ownsQdisc     bool // only true if this Handle's own QdiscAdd created it (not a pre-existing EEXIST)
+	egressFilter  *netlink.BpfFilter
+	ingressFilter *netlink.BpfFilter
+	objs          bpfObjects
+	rd            *ringbuf.Reader
+	clockOffset   int64 // atomic: wall_ns - mono_ns, refreshed periodically — see refreshClockOffset
 
 	events       chan Event
 	dropped      uint64 // atomic

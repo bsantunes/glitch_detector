@@ -447,18 +447,26 @@ func TestEngine_BurstWindow_SameSendDoesNotSplitEpisode(t *testing.T) {
 	}
 
 	// P3: first retry — a retransmission, well past burstWindow. Must
-	// not reopen (already open) or close (still genuinely stalled).
+	// not reopen (already open) or close (still genuinely stalled), and
+	// — counted directly, not emitted as an Event any more — produces no
+	// Event at all; RetransCount is what confirms it was seen.
 	tm = tm.Add(320 * time.Millisecond)
 	events = e.HandlePacket(egressPkt(tm, s, 100)) // resend from s
-	if len(events) != 1 || events[0].Type != glitch.KindRetrans {
-		t.Fatalf("P3 (first retry): expected one Retrans, got %+v", events)
+	if len(events) != 0 {
+		t.Fatalf("P3 (first retry): expected no Events, got %+v", events)
+	}
+	if got := e.RetransCount(); got != 1 {
+		t.Fatalf("P3 (first retry): RetransCount() = %d, want 1", got)
 	}
 
 	// P4: second retry — another retransmission.
 	tm = tm.Add(270 * time.Millisecond)
 	events = e.HandlePacket(egressPkt(tm, s+50, 50)) // resend from s+50
-	if len(events) != 1 || events[0].Type != glitch.KindRetrans {
-		t.Fatalf("P4 (second retry): expected one Retrans, got %+v", events)
+	if len(events) != 0 {
+		t.Fatalf("P4 (second retry): expected no Events, got %+v", events)
+	}
+	if got := e.RetransCount(); got != 2 {
+		t.Fatalf("P4 (second retry): RetransCount() = %d, want 2", got)
 	}
 
 	// P5: recovery — normal-paced, genuinely new data closes the
