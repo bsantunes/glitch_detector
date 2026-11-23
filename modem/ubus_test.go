@@ -3,6 +3,7 @@ package modem
 import (
 	"math"
 	"testing"
+	"time"
 )
 
 // The "real capture" tests below use exact output captured live from
@@ -181,5 +182,31 @@ func TestOperatorNameFromUbusMetrics(t *testing.T) {
 	raw2 := []byte(`{"lte1": {"labels": {"opername": "MEO"}}}`)
 	if got := operatorNameFromUbusMetrics(raw2, "lte1"); got != "MEO" {
 		t.Errorf("operatorNameFromUbusMetrics() = %q, want MEO", got)
+	}
+}
+
+func TestUbusMetricsTimestamp(t *testing.T) {
+	raw := []byte(`{"lte1": {"timestamp": 1795435791, "context": {}}}`)
+	got, ok, err := ubusMetricsTimestamp(raw, "lte1")
+	if err != nil {
+		t.Fatalf("ubusMetricsTimestamp() error = %v", err)
+	}
+	if !ok {
+		t.Fatalf("ubusMetricsTimestamp() ok = false, want true")
+	}
+	want := time.Unix(1795435791, 0)
+	if !got.Equal(want) {
+		t.Errorf("ubusMetricsTimestamp() = %v, want %v", got, want)
+	}
+
+	// No timestamp field at all (0, the zero value) must report ok=false,
+	// not a bogus 1970 epoch time.
+	raw2 := []byte(`{"lte0": {"context": {}}}`)
+	if _, ok, err := ubusMetricsTimestamp(raw2, "lte0"); err != nil || ok {
+		t.Errorf("ubusMetricsTimestamp() with no timestamp field: ok=%v err=%v, want ok=false err=nil", ok, err)
+	}
+
+	if _, _, err := ubusMetricsTimestamp(raw, "lte9"); err == nil {
+		t.Errorf("ubusMetricsTimestamp() with unknown device = nil error, want an error")
 	}
 }

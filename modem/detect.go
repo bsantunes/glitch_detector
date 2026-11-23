@@ -80,7 +80,29 @@ func Detect(ctx context.Context) ([]Modem, error) {
 // broadcast system information) reports real RSRP/RSRQ while
 // GetCellInfo stays empty — see this package's own doc comment.
 func DetectValidated(ctx context.Context) ([]Modem, error) {
-	try := func(detect func(context.Context) ([]Modem, error), name string) []Modem {
+	return detectValidated(ctx, "")
+}
+
+// DetectValidatedExcluding behaves exactly like DetectValidated but
+// never considers method, even if it would otherwise "find" a modem
+// with real-looking (non-NaN) signal data — for falling back off a
+// method whose data is known stale by some signal DetectValidated's own
+// all-N/A check can't see (e.g. ubus's own source timestamp not
+// advancing — see cmd/modem-exporter's staleness tracking), since a
+// stuck cache can look exactly like a fresh reading to that check
+// alone. Confirmed live this matters: without it, re-running
+// DetectValidated after falling back off a stale ubus could simply
+// re-select ubus right back, since its cached (stale) values are still
+// non-NaN.
+func DetectValidatedExcluding(ctx context.Context, method Method) ([]Modem, error) {
+	return detectValidated(ctx, method)
+}
+
+func detectValidated(ctx context.Context, exclude Method) ([]Modem, error) {
+	try := func(method Method, detect func(context.Context) ([]Modem, error), name string) []Modem {
+		if method == exclude {
+			return nil
+		}
 		modems, err := detect(ctx)
 		if err != nil {
 			log.Printf("modem: %s detection unavailable: %v", name, err)
@@ -99,19 +121,19 @@ func DetectValidated(ctx context.Context) ([]Modem, error) {
 		return nil
 	}
 
-	if modems := try(DetectModemManager, "ModemManager"); modems != nil {
+	if modems := try(MethodModemManager, DetectModemManager, "ModemManager"); modems != nil {
 		return modems, nil
 	}
-	if modems := try(DetectUbus, "ubus (WaveOS)"); modems != nil {
+	if modems := try(MethodUbus, DetectUbus, "ubus (WaveOS)"); modems != nil {
 		return modems, nil
 	}
-	if modems := try(DetectQMIMBIM, "QMI/MBIM"); modems != nil {
+	if modems := try(MethodQMI, DetectQMIMBIM, "QMI/MBIM"); modems != nil {
 		return modems, nil
 	}
-	if modems := try(DetectUQMI, "uqmi"); modems != nil {
+	if modems := try(MethodUQMI, DetectUQMI, "uqmi"); modems != nil {
 		return modems, nil
 	}
-	if modems := try(DetectAT, "AT"); modems != nil {
+	if modems := try(MethodAT, DetectAT, "AT"); modems != nil {
 		return modems, nil
 	}
 	return nil, nil

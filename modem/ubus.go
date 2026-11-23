@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // DetectUbus probes WaveOS's own "qmi" ubus object, backed by its
@@ -86,6 +87,45 @@ func getSignalsUbus(ctx context.Context, m Modem) ([]Signal, error) {
 		return nil, fmt.Errorf("ubus call qmi metrics: %w", err)
 	}
 	return signalsFromUbusMetrics(raw, m.ID)
+}
+
+// UbusMetricsTimestamp returns the Unix timestamp `ubus call qmi
+// metrics` itself reports for m (its own "timestamp" field - confirmed
+// live this is when uqmi-ubus's daemon last actually refreshed this
+// device's cached data, not when this call happened to run), and
+// whether one was present at all. Exposed separately from GetSignals
+// because only cmd/modem-exporter's own staleness tracking needs it -
+// every other backend (qmicli, uqmi, AT) has no equivalent source
+// timestamp to compare against, which is why that tracker falls back to
+// change-detection for them instead. A second "ubus call qmi metrics"
+// per poll when this is used - cheap local IPC, not a competing QMI
+// session, unlike the contention this backend exists to avoid in the
+// first place.
+func UbusMetricsTimestamp(ctx context.Context, m Modem) (time.Time, bool, error) {
+	raw, err := runUbus(ctx, "qmi", "metrics")
+	if err != nil {
+		return time.Time{}, false, fmt.Errorf("ubus call qmi metrics: %w", err)
+	}
+	return ubusMetricsTimestamp(raw, m.ID)
+}
+
+// ubusMetricsTimestamp parses `ubus call qmi metrics` output for one
+// device's own "timestamp" field. Pure/testable: no exec involved.
+func ubusMetricsTimestamp(raw []byte, deviceID string) (time.Time, bool, error) {
+	var all map[string]struct {
+		Timestamp int64 `json:"timestamp"`
+	}
+	if err := json.Unmarshal(raw, &all); err != nil {
+		return time.Time{}, false, fmt.Errorf("unexpected output: %w", err)
+	}
+	dev, ok := all[deviceID]
+	if !ok {
+		return time.Time{}, false, fmt.Errorf("device %q not present in response", deviceID)
+	}
+	if dev.Timestamp == 0 {
+		return time.Time{}, false, nil
+	}
+	return time.Unix(dev.Timestamp, 0), true, nil
 }
 
 // ubusRATKeys are the top-level keys uqmi-ubus's "metrics" context

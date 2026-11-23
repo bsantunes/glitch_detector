@@ -17,10 +17,13 @@
 //     tac. Fields: rsrp, rsrq, rssi, sinr (float, omitted when NaN) and
 //     — anchor rows only — cell_id (string; changes with mobility, so
 //     it's a field, not a tag).
-//   - measurement "modem_state", one point per modem per tick.
+//   - measurement "modem_state", one point per modem per tick (only
+//     when it has something to report at all).
 //     Tags: device, modem_id. Fields: operator_name,
 //     registration_state, packet_service_state (all strings, omitted
-//     when empty).
+//     when empty), stale_signal_fields (int, omitted when 0 - how many
+//     of this modem's rsrp/rsrq/rssi/sinr fields staleTracker withheld
+//     from radio_cell this tick, see staleness.go).
 //
 // Note: PCI isn't sent yet — no backend has a verified source for it
 // (ModemManager exposes no cell/PCI command at all; qmicli's
@@ -98,20 +101,33 @@ func main() {
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 
-	// stale: a signal reading repeated for 3 poll intervals straight is
-	// withheld rather than re-written as fresh — see staleness.go's own
-	// doc comment for why change-detection, not a source timestamp.
-	stale := newStaleTracker(3*(*interval), time.Now)
+	// stale: a signal field repeated for 30 minutes straight (or, for
+	// ubus specifically, whose own source timestamp hasn't advanced in
+	// 3x -interval) is withheld rather than re-written as fresh — see
+	// staleness.go's own doc comment.
+	stale := newStaleTracker(time.Now)
+
+	// sourceStaleByModem: whether each modem's own data source (ubus
+	// only, currently — see exportModem) looked stale as of its last
+	// poll. Read by the redetect ticker below to decide whether to fall
+	// back off the current method even to a nominally worse-ranked one —
+	// a working worse method beats a frozen better one. Single
+	// goroutine, no locking needed.
+	sourceStaleByModem := map[string]bool{}
 
 	// redetect: periodically re-runs the full detection cascade and
-	// upgrades to a better-ranked method if one has become available —
-	// confirmed live on dawn6g that a reboot can win the method cascade
-	// race onto a worse/contention-prone method (uqmi, or a QMI session
-	// contending with WaveOS's own uqmi-ubus daemon) simply because that
-	// daemon wasn't ready yet at the single startup-time Detect call,
-	// and nothing before this retried later once it was. Only upgrades,
-	// never downgrades — a method already working is left alone even if
-	// a higher-ranked one would also work now.
+	// switches method if either (a) a better-ranked method has become
+	// available (confirmed live on dawn6g that a reboot can win the
+	// method cascade race onto a worse/contention-prone method simply
+	// because uqmi-ubus wasn't ready yet at the single startup-time
+	// Detect call, and nothing before this retried later once it was),
+	// or (b) the current method's own data has gone stale (confirmed
+	// live: ubus's own source timestamp can freeze for hours while
+	// still answering ubus calls without error) — falls back even to a
+	// worse rank in that case, and switches back once the better method
+	// recovers, via the same upgrade check on a later tick. Every
+	// switch is logged with which of the two reasons triggered it.
+	// Never a partial per-modem swap — see maybeSwitchModems.
 	const redetectInterval = 5 * time.Minute
 	redetectTicker := time.NewTicker(redetectInterval)
 	defer redetectTicker.Stop()
@@ -122,33 +138,50 @@ func main() {
 			return
 		case <-ticker.C:
 			for _, m := range modems {
-				exportModem(ctx, writeAPI, *deviceID, m, stale)
+				exportModem(ctx, writeAPI, *deviceID, m, stale, sourceStaleByModem, *interval)
 			}
 		case <-redetectTicker.C:
-			modems = maybeUpgradeModems(ctx, modems)
+			modems = maybeSwitchModems(ctx, modems, sourceStaleByModem)
 		}
 	}
 }
 
-// maybeUpgradeModems re-runs the full detection cascade and swaps to its
-// result only if every currently-tracked modem is on a method ranked
-// worse than what the fresh cascade found — a partial swap (upgrading
-// one modem but not another) would risk losing track of a modem the new
-// cascade happened not to re-find this particular time, which an
-// all-or-nothing comparison avoids. Returns the original list unchanged
-// on any detection error, an empty result, or no actual improvement.
-func maybeUpgradeModems(ctx context.Context, current []modem.Modem) []modem.Modem {
+// maybeSwitchModems re-runs the detection cascade and swaps to its
+// result if either every currently-tracked modem is on a method ranked
+// worse than what the fresh cascade found (an upgrade), or any current
+// modem's own data source is known stale right now (a fallback, which
+// explicitly excludes the stale method from the fresh cascade — see
+// modem.DetectValidatedExcluding's own doc comment for why DetectValidated
+// alone can't be trusted to skip it). Either way this is all-or-nothing
+// across every tracked modem, never a partial per-modem swap — a partial
+// swap would risk losing track of a modem the fresh cascade didn't
+// happen to re-find this particular time. Returns the original list
+// unchanged on any detection error, an empty result, or no actual
+// improvement.
+func maybeSwitchModems(ctx context.Context, current []modem.Modem, sourceStaleByModem map[string]bool) []modem.Modem {
 	worstCurrent := 0
+	anyStale := false
+	var staleMethod modem.Method
 	for _, m := range current {
 		if r := methodRank(m.Method); r > worstCurrent {
 			worstCurrent = r
 		}
+		if sourceStaleByModem[m.ID] {
+			anyStale = true
+			staleMethod = m.Method
+		}
 	}
-	if worstCurrent == 0 {
-		return current // already on ModemManager for everything — nothing ranks better
+	if worstCurrent == 0 && !anyStale {
+		return current // already ModemManager for everything, and nothing is stale
 	}
 
-	fresh, err := modem.DetectValidated(ctx)
+	var fresh []modem.Modem
+	var err error
+	if anyStale {
+		fresh, err = modem.DetectValidatedExcluding(ctx, staleMethod)
+	} else {
+		fresh, err = modem.DetectValidated(ctx)
+	}
 	if err != nil || len(fresh) == 0 {
 		return current
 	}
@@ -158,10 +191,15 @@ func maybeUpgradeModems(ctx context.Context, current []modem.Modem) []modem.Mode
 			bestFresh = r
 		}
 	}
-	if bestFresh >= worstCurrent {
+
+	switch {
+	case bestFresh < worstCurrent:
+		log.Printf("modem: re-detection found a better method (rank %d -> %d) — switching", worstCurrent, bestFresh)
+	case anyStale:
+		log.Printf("modem: current method (%s) data is stale — falling back to rank %d", staleMethod, bestFresh)
+	default:
 		return current
 	}
-	log.Printf("modem: re-detection found a better method (rank %d -> %d) — switching", worstCurrent, bestFresh)
 	for _, m := range fresh {
 		log.Printf("modem detected: [%s] %s %s (via %s)", m.ID, m.Manufacturer, m.Model, m.Method)
 	}
@@ -194,18 +232,36 @@ func methodRank(m modem.Method) int {
 // is retried/buffered (acceptable for monitoring data, and avoids
 // unbounded buffering on a resource-constrained device if InfluxDB, or
 // the link to it, is down for a while).
-func exportModem(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID string, m modem.Modem, stale *staleTracker) {
+func exportModem(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID string, m modem.Modem, stale *staleTracker, sourceStaleByModem map[string]bool, interval time.Duration) {
 	signals, err := modem.GetSignals(ctx, m)
 	if err != nil {
 		log.Printf("[%s] signal read failed: %v", m.ID, err)
 		return
 	}
+
+	// ubus is the only backend with its own source timestamp to check
+	// (confirmed live: it can keep answering ubus calls without error
+	// while its underlying daemon has stopped actually refreshing that
+	// data) — every other backend falls back to staleTracker's own
+	// change-detection instead, which needs no source timestamp at all.
+	hasSourceTimestamp := false
+	sourceStale := false
+	if m.Method == modem.MethodUbus {
+		if ts, ok, tErr := modem.UbusMetricsTimestamp(ctx, m); tErr == nil && ok {
+			hasSourceTimestamp = true
+			sourceStale = time.Since(ts) >= 3*interval
+		}
+	}
+	sourceStaleByModem[m.ID] = hasSourceTimestamp && sourceStale
+
+	var staleFieldsThisPoll int
 	for i, sig := range signals {
-		out, _, msg := stale.Check(signalKey{modemID: m.ID, role: sig.Role}, sig)
+		out, withheld, msg := stale.Check(signalKey{modemID: m.ID, role: sig.Role}, sig, hasSourceTimestamp, sourceStale)
 		if msg != "" {
 			log.Printf("[%s] %s", m.ID, msg)
 		}
 		signals[i] = out
+		staleFieldsThisPoll += withheld
 	}
 
 	var cell modem.CellInfo
@@ -230,11 +286,9 @@ func exportModem(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID st
 		}
 	}
 
-	if haveCellInfo {
-		if point := modemStatePoint(deviceID, m, cell); point != nil {
-			if err := writeAPI.WritePoint(ctx, point); err != nil {
-				log.Printf("[%s] influx write failed (modem_state): %v", m.ID, err)
-			}
+	if point := modemStatePoint(deviceID, m, cell, haveCellInfo, staleFieldsThisPoll); point != nil {
+		if err := writeAPI.WritePoint(ctx, point); err != nil {
+			log.Printf("[%s] influx write failed (modem_state): %v", m.ID, err)
 		}
 	}
 }
@@ -299,17 +353,25 @@ func radioCellPoint(deviceID string, m modem.Modem, sig modem.Signal, cell modem
 }
 
 // modemStatePoint builds one "modem_state" point (operator/registration/
-// attach state), or nil if none of those fields have data right now.
-func modemStatePoint(deviceID string, m modem.Modem, cell modem.CellInfo) *write.Point {
+// attach state, plus staleFieldsCount — how many of this modem's signal
+// fields staleTracker withheld this poll, 0-4, additive and omitted when
+// zero so a normal poll looks exactly like it did before this field
+// existed), or nil if none of those have anything to report right now.
+func modemStatePoint(deviceID string, m modem.Modem, cell modem.CellInfo, haveCellInfo bool, staleFieldsCount int) *write.Point {
 	fields := map[string]interface{}{}
-	addString := func(key, v string) {
-		if v != "" {
-			fields[key] = v
+	if haveCellInfo {
+		addString := func(key, v string) {
+			if v != "" {
+				fields[key] = v
+			}
 		}
+		addString("operator_name", cell.OperatorName)
+		addString("registration_state", cell.RegistrationState)
+		addString("packet_service_state", cell.PacketServiceState)
 	}
-	addString("operator_name", cell.OperatorName)
-	addString("registration_state", cell.RegistrationState)
-	addString("packet_service_state", cell.PacketServiceState)
+	if staleFieldsCount > 0 {
+		fields["stale_signal_fields"] = staleFieldsCount
+	}
 
 	if len(fields) == 0 {
 		return nil
