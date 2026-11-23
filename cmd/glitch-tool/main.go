@@ -113,8 +113,6 @@ func run() error {
 			}
 			ts := ev.Time.UTC().Format(time.RFC3339Nano)
 			switch ev.Type {
-			case glitch.KindRetrans:
-				fmt.Fprintf(out, "%s 🔴 [%s] TCP Loss Detected | %s %s:%d -> %s:%d\n", ts, tag, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallStart:
 				fmt.Fprintf(out, "%s 🟡 [%s] Stall START: gap %.1fms (baseline %.1fms) | %s %s:%d -> %s:%d\n", ts, tag, float64(ev.Value)/1e6, ev.Baseline.Seconds()*1000, protoName(ev.Proto), ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort)
 			case glitch.KindStallEnd:
@@ -126,20 +124,27 @@ func run() error {
 	}
 }
 
-// droppedLine reports the combined Dropped() count always, plus — for
-// -capture afpacket only — the kernel/user/truncation breakdown that
-// distinguishes a real AF_PACKET ring-capacity problem (kernelDropped,
-// relevant to Phase 3 sizing on WaveOS) from this process's own
-// Events() channel just not being drained fast enough (userDropped, a
-// property of this consumer, not of capture itself) — see
-// afpacket.Capture.KernelDropped's own doc comment for why this
-// session's first test run couldn't tell the two apart.
+// droppedLine reports the cumulative retransmission count — read
+// directly from the capture backend's own counter (glitch.Source.
+// RetransCount), not from Events, since neither backend emits a
+// KindRetrans Event any more: retransmissions vastly outnumber stall
+// start/end/abandoned during a real burst, so counting them directly
+// instead of sending each one through the Events channel removes their
+// share of channel-depth pressure entirely (confirmed live as a real
+// bottleneck at dawn6g's own burst scale) — and the combined Dropped()
+// count always, plus — for -capture afpacket only — the kernel/user/
+// truncation breakdown that distinguishes a real AF_PACKET ring-capacity
+// problem (kernelDropped, relevant to Phase 3 sizing on WaveOS) from
+// this process's own Events() channel just not being drained fast
+// enough (userDropped, a property of this consumer, not of capture
+// itself) — see afpacket.Capture.KernelDropped's own doc comment for
+// why this session's first test run couldn't tell the two apart.
 func droppedLine(h glitch.Source, afCap *afpacket.Capture) string {
 	if afCap == nil {
-		return fmt.Sprintf("dropped=%d", h.Dropped())
+		return fmt.Sprintf("retrans=%d dropped=%d", h.RetransCount(), h.Dropped())
 	}
-	return fmt.Sprintf("dropped=%d (kernel=%d user=%d untruncated_over_limit=%d)",
-		h.Dropped(), afCap.KernelDropped(), afCap.UserDropped(), afCap.UntruncatedOverLimit())
+	return fmt.Sprintf("retrans=%d dropped=%d (kernel=%d user=%d untruncated_over_limit=%d)",
+		h.RetransCount(), h.Dropped(), afCap.KernelDropped(), afCap.UserDropped(), afCap.UntruncatedOverLimit())
 }
 
 func protoName(proto uint8) string {

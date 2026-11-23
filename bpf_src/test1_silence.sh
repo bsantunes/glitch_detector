@@ -25,7 +25,8 @@ for i in $(seq 1 "$RUNS"); do
 	restore_glitch_exporter
 
 	starts=$(grep -c "Stall START" "$log" || true)
-	retrans=$(grep -c "TCP Loss Detected" "$log" || true)
+	retrans=$(grep -oE "retrans=[0-9]+" "$log" | tail -1 | cut -d= -f2)
+	retrans=${retrans:-0}
 
 	echo "run $i: stall_starts=$starts retrans=$retrans"
 	if [ "$starts" -eq 0 ]; then

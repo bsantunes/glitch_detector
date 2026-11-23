@@ -96,10 +96,15 @@ for i in $(seq 1 "$RUNS"); do
 
 	# :5201 at end of line — the dst port position in glitch-tool's
 	# "SrcIP:SrcPort -> DstIP:DstPort" output, and iperf3's server
-	# port, so this scopes every count to the actual test flow.
+	# port, so this scopes stall counts to the actual test flow. retrans
+	# can't be scoped the same way any more - both capture backends count
+	# retransmissions directly instead of emitting a per-flow Event for
+	# each one (see glitch-detector-internals skill), so it's this run's
+	# total across every flow, not just the iperf3 one.
 	starts=$(grep "Stall START" "$log" | grep -c ":5201$" || true)
 	ends=$(grep "Stall END" "$log" | grep -c ":5201$" || true)
-	retrans=$(grep "TCP Loss Detected" "$log" | grep -c ":5201$" || true)
+	retrans=$(grep -oE "retrans=[0-9]+" "$log" | tail -1 | cut -d= -f2)
+	retrans=${retrans:-0}
 
 	echo "run $i: stall_starts=$starts stall_ends=$ends retrans=$retrans"
 	grep "Stall END" "$log" | grep ":5201$" || true

@@ -33,7 +33,7 @@ func TestSummaryAggregation(t *testing.T) {
 	// Zero interval: Summary must still return a valid (all-zero) point
 	// without any prior event - this is what lets glitch_summary act as
 	// a heartbeat, written every tick regardless of activity.
-	if s := agg.Summary(DropCounts{}); s != (summaryPoint{}) {
+	if s := agg.Summary(0, DropCounts{}); s != (summaryPoint{}) {
 		t.Fatalf("zero-interval Summary = %+v, want all zero", s)
 	}
 
@@ -49,7 +49,7 @@ func TestSummaryAggregation(t *testing.T) {
 
 	// One flow: START then END, 500ms duration, steps=3.
 	agg.HandleEvent(ev(glitch.KindStallStart, 0, 0))
-	if s := agg.Summary(DropCounts{}); s.StallOpen != 1 {
+	if s := agg.Summary(0, DropCounts{}); s.StallOpen != 1 {
 		t.Fatalf("after START, StallOpen = %d, want 1", s.StallOpen)
 	}
 	agg.HandleEvent(ev(glitch.KindStallEnd, uint64(500*time.Millisecond), 3))
@@ -67,19 +67,27 @@ func TestSummaryAggregation(t *testing.T) {
 	ev2.Steps = 5
 	agg.HandleEvent(ev2)
 
-	// A retransmission: counted, never produces its own point.
+	// Retransmissions are never seen via HandleEvent at all any more -
+	// both capture backends count them directly instead of emitting them
+	// as Events (see glitch.Source.RetransCount) - so a KindRetrans event
+	// reaching HandleEvent regardless falls through every case and
+	// returns nil, same as any other event type this aggregator doesn't
+	// recognize.
 	if pts := agg.HandleEvent(ev(glitch.KindRetrans, 1234, 0)); pts != nil {
-		t.Fatalf("retrans HandleEvent returned points %+v, want nil", pts)
+		t.Fatalf("an unrecognized/retrans event returned points %+v, want nil", pts)
 	}
 
-	s := agg.Summary(DropCounts{Total: 7}) // dropped_events delta passed in by the caller
-	want := summaryPoint{StallEpisodes: 2, StallMaxMs: 900, StallSumMs: 1400, StallOpen: 0, RetransCount: 1, DroppedEvents: 7}
+	// retransCount is threaded straight through from the caller (main.go
+	// computes it as a delta of Source.RetransCount()), not accumulated
+	// from events - 11 here is an arbitrary caller-supplied value.
+	s := agg.Summary(11, DropCounts{Total: 7}) // dropped_events delta passed in by the caller
+	want := summaryPoint{StallEpisodes: 2, StallMaxMs: 900, StallSumMs: 1400, StallOpen: 0, RetransCount: 11, DroppedEvents: 7}
 	if s != want {
 		t.Fatalf("Summary = %+v, want %+v", s, want)
 	}
 
 	// Summary resets the per-interval counters for the next one.
-	if s := agg.Summary(DropCounts{}); s != (summaryPoint{}) {
+	if s := agg.Summary(0, DropCounts{}); s != (summaryPoint{}) {
 		t.Fatalf("Summary after reset = %+v, want all-zero", s)
 	}
 }
@@ -111,7 +119,7 @@ func TestRateLimiting(t *testing.T) {
 	// All 10 are still tracked as open regardless of the limit - it only
 	// governs whether a point gets written, never whether the
 	// underlying state (and hence glitch_summary's own counts) updates.
-	if s := agg.Summary(DropCounts{}); s.StallOpen != 10 {
+	if s := agg.Summary(0, DropCounts{}); s.StallOpen != 10 {
 		t.Fatalf("StallOpen = %d, want 10 (rate limit must not drop tracking)", s.StallOpen)
 	}
 
@@ -139,7 +147,7 @@ func TestAbandonedEpisodeTimeout(t *testing.T) {
 	if pts := agg.CheckAbandoned(); len(pts) != 0 {
 		t.Fatalf("CheckAbandoned at +10s returned %d points, want 0", len(pts))
 	}
-	if s := agg.Summary(DropCounts{}); s.StallOpen != 1 {
+	if s := agg.Summary(0, DropCounts{}); s.StallOpen != 1 {
 		t.Fatalf("StallOpen at +10s = %d, want 1 (still open)", s.StallOpen)
 	}
 
@@ -170,7 +178,7 @@ func TestAbandonedEpisodeTimeout(t *testing.T) {
 
 	// It's gone from the open set now, and reporting it once is enough -
 	// a later check must not re-report the same episode.
-	if s := agg.Summary(DropCounts{}); s.StallOpen != 0 {
+	if s := agg.Summary(0, DropCounts{}); s.StallOpen != 0 {
 		t.Fatalf("StallOpen after abandonment = %d, want 0", s.StallOpen)
 	}
 	clock.advance(time.Minute)
@@ -181,7 +189,7 @@ func TestAbandonedEpisodeTimeout(t *testing.T) {
 	// Abandonment must never count toward glitch_summary's own
 	// stall_episodes/stall_max_ms/stall_sum_ms - those are STALL_ENDs
 	// only, by the schema's own definition.
-	if s := agg.Summary(DropCounts{}); s.StallEpisodes != 0 || s.StallMaxMs != 0 || s.StallSumMs != 0 {
+	if s := agg.Summary(0, DropCounts{}); s.StallEpisodes != 0 || s.StallMaxMs != 0 || s.StallSumMs != 0 {
 		t.Fatalf("abandonment leaked into Summary: %+v", s)
 	}
 }

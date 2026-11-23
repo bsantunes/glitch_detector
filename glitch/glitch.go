@@ -153,6 +153,15 @@ type bpfObjects struct {
 // one interface. Call Close when done to remove both filters and the
 // qdisc (whichever this Handle actually created — see ownsQdisc) and
 // release kernel resources.
+// eventsChanSize: raised from 256 after a real burst on dawn6g's own
+// link (single-stream, single 2s outage, iperf3_retr~1000-1100) showed
+// genuine UserDropped-equivalent channel drops even with retransmissions
+// no longer competing for a slot in this same channel (see readLoop's
+// own comment) — the channel itself, not just a consumer's per-event
+// processing cost, was the bottleneck at this device's real burst scale.
+// 4096 is margin, not a measured minimum.
+const eventsChanSize = 4096
+
 type Handle struct {
 	lockFile       *os.File
 	qdisc          *netlink.GenericQdisc
@@ -163,8 +172,9 @@ type Handle struct {
 	rd             *ringbuf.Reader
 	clockOffset    int64 // atomic: wall_ns - mono_ns, refreshed periodically — see refreshClockOffset
 
-	events  chan Event
-	dropped uint64 // atomic
+	events       chan Event
+	dropped      uint64 // atomic
+	retransCount uint64 // atomic — see RetransCount's own doc comment
 
 	mu   sync.Mutex
 	err  error // non-nil once readLoop sees a real (non-ErrClosed) reader error
@@ -332,7 +342,7 @@ func Open(iface string) (h *Handle, err error) {
 		objs:              objs,
 		rd:                rd,
 		clockOffset:       clockOffset,
-		events:            make(chan Event, 256),
+		events:            make(chan Event, eventsChanSize),
 		done:              make(chan struct{}),
 		stopOffsetRefresh: make(chan struct{}),
 		offsetRefreshDone: make(chan struct{}),
@@ -400,6 +410,17 @@ func (h *Handle) readLoop() {
 		if err := binary.Read(bytes.NewReader(rec.RawSample), binary.LittleEndian, &w); err != nil {
 			continue
 		}
+		typ := Kind(w.Type)
+		// Retransmissions are counted here, not forwarded as Events at
+		// all — see RetransCount's own doc comment for why: they vastly
+		// outnumber stall start/end/abandoned during a real burst, so
+		// keeping them off this channel entirely removes their share of
+		// channel-depth pressure, rather than just processing them
+		// faster once sent.
+		if typ == KindRetrans {
+			atomic.AddUint64(&h.retransCount, 1)
+			continue
+		}
 		ev := Event{
 			Time:     time.Unix(0, int64(w.Ts)+atomic.LoadInt64(&h.clockOffset)),
 			SrcIP:    int2ip(w.SrcIP),
@@ -408,7 +429,7 @@ func (h *Handle) readLoop() {
 			DstPort:  w.DstPort,
 			Value:    w.Value,
 			Baseline: time.Duration(w.BaselineNs),
-			Type:     Kind(w.Type),
+			Type:     typ,
 			Steps:    w.Steps,
 			Proto:    w.Proto,
 		}
@@ -442,6 +463,18 @@ func (h *Handle) Err() error {
 // caller wasn't draining Events() fast enough — see readLoop.
 func (h *Handle) Dropped() uint64 {
 	return atomic.LoadUint64(&h.dropped)
+}
+
+// RetransCount returns the cumulative count of TCP retransmissions seen
+// so far — counted directly in readLoop instead of being sent as
+// KindRetrans Events (which this package no longer emits at all; Event
+// decoding can still produce the type, but readLoop intercepts it before
+// it ever reaches a caller). Cumulative like Dropped/Evictions — callers
+// wanting a per-interval count (e.g. cmd/glitch-exporter's glitch_summary
+// tick) compute their own delta since the last read, the same way they
+// already do for Dropped().
+func (h *Handle) RetransCount() uint64 {
+	return atomic.LoadUint64(&h.retransCount)
 }
 
 // Close removes both BPF filters, and the qdisc too if this Handle is

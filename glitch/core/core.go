@@ -168,6 +168,7 @@ type Engine struct {
 	flows           map[flowKey]*flowState
 	udpMonitorPorts map[uint16]bool
 	evictions       uint64
+	retransCount    uint64
 }
 
 // NewEngine constructs an Engine. udpMonitorPorts mirrors
@@ -323,13 +324,13 @@ func (e *Engine) handleEgress(pm PacketMeta, srcKey, dstKey [4]byte) []glitch.Ev
 		diff := int32(pm.Seq - state.endSeq)
 		switch {
 		case diff < 0 && pm.PayloadLen > 0:
-			events = append(events, glitch.Event{
-				Time: pm.Time, SrcIP: pm.SrcIP, DstIP: pm.DstIP,
-				SrcPort: pm.SrcPort, DstPort: pm.DstPort,
-				Value: uint64(-diff),
-				Type:  glitch.KindRetrans,
-				Proto: pm.Proto,
-			})
+			// Counted directly, not emitted as an Event — see
+			// RetransCount's own doc comment for why: retransmissions
+			// vastly outnumber stall start/end/abandoned during a real
+			// burst, so keeping them off the Events channel entirely
+			// removes their share of channel-depth pressure, confirmed
+			// live as a real bottleneck at dawn6g's own burst scale.
+			e.retransCount++
 		case diff >= 0 && pm.PayloadLen > 0:
 			state.endSeq = pm.Seq + uint32(pm.PayloadLen)
 		}
@@ -390,6 +391,17 @@ func (e *Engine) Evictions() uint64 {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return e.evictions
+}
+
+// RetransCount returns the cumulative count of TCP retransmissions seen
+// so far — see handleEgress's own comment on why this is counted
+// directly instead of being emitted as a KindRetrans Event. Cumulative,
+// like Evictions — a caller wanting a per-interval count computes its
+// own delta since the last read.
+func (e *Engine) RetransCount() uint64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.retransCount
 }
 
 // evictLRU removes the single least-recently-seen flow — called only

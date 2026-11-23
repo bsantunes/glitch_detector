@@ -260,7 +260,7 @@ func run() error {
 	abandonedTicker := time.NewTicker(abandonedCheckInterval)
 	defer abandonedTicker.Stop()
 
-	var lastDropped, lastKernelDropped, lastUserDropped, lastUntruncated, lastWriteQueueDropped uint64
+	var lastDropped, lastKernelDropped, lastUserDropped, lastUntruncated, lastWriteQueueDropped, lastRetrans uint64
 	for {
 		select {
 		case <-ctx.Done():
@@ -295,7 +295,10 @@ func run() error {
 				log.Printf("drops this interval: total=%d kernel=%d user=%d untruncated_over_limit=%d write_queue=%d",
 					drops.Total, drops.Kernel, drops.User, drops.UntruncatedOverLimit, drops.WriteQueue)
 			}
-			enqueue(summaryInfluxPoint(*deviceID, *iface, *capture, agg.Summary(drops)))
+			retrans := h.RetransCount()
+			retransDelta := retrans - lastRetrans
+			lastRetrans = retrans
+			enqueue(summaryInfluxPoint(*deviceID, *iface, *capture, agg.Summary(int(retransDelta), drops)))
 		}
 	}
 }

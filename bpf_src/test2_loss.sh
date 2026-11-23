@@ -41,7 +41,8 @@ for i in $(seq 1 "$RUNS"); do
 	stop_glitch_tool
 	restore_glitch_exporter
 
-	retrans=$(grep -c "TCP Loss Detected" "$log" || true)
+	retrans=$(grep -oE "retrans=[0-9]+" "$log" | tail -1 | cut -d= -f2)
+	retrans=${retrans:-0}
 	stall_starts=$(grep -c "Stall START" "$log" || true)
 	# iperf3's sender summary line ends "<Retr count>  sender" — the
 	# second-to-last field on that line.

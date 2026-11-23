@@ -107,7 +107,6 @@ type Aggregator struct {
 	stallEpisodes int
 	stallMaxMs    float64
 	stallSumMs    float64
-	retransCount  int
 
 	// Plain per-wall-clock-second rate limiter, shared across every
 	// glitch_event point type (stall_start/stall_end/stall_abandoned) -
@@ -148,17 +147,17 @@ func (a *Aggregator) allow() bool {
 
 // HandleEvent processes one decoded glitch.Event, unconditionally
 // updating internal counters and open-episode tracking, and returns the
-// glitch_event point(s) to actually write - nil if this event never gets
-// its own point (a retransmission never does - see glitch_summary's
-// retrans_count instead) or if -max-events-per-sec was already hit this
-// second (the event is still counted either way; only the point itself
-// is dropped).
+// glitch_event point(s) to actually write - nil if -max-events-per-sec
+// was already hit this second (the event is still counted either way;
+// only the point itself is dropped). Retransmissions are never seen
+// here at all any more - both capture backends count them directly
+// (glitch.Handle.RetransCount / afpacket.Capture.RetransCount) instead
+// of emitting them as Events, specifically so they never compete for a
+// slot in the same channel a real burst's stall events share - see
+// glitch.Source.RetransCount's own doc comment. main.go reads that
+// counter directly and passes the per-interval delta into Summary.
 func (a *Aggregator) HandleEvent(ev glitch.Event) []eventPoint {
 	switch ev.Type {
-	case glitch.KindRetrans:
-		a.retransCount++
-		return nil
-
 	case glitch.KindStallStart:
 		baselineMs := ev.Baseline.Seconds() * 1000
 		a.open[keyFor(ev)] = openEpisode{start: ev.Time, baselineMs: baselineMs}
@@ -267,16 +266,18 @@ func (a *Aggregator) CheckAbandoned() []eventPoint {
 // counters, then resets them for the next interval - StallOpen (a live
 // snapshot of len(open)) is the one field that is not itself
 // accumulated/reset, since it describes "right now," not "during this
-// interval." drops is the caller's own responsibility to compute (see
-// DropCounts' own doc comment) and pass in, since none of it belongs to
-// this aggregator.
-func (a *Aggregator) Summary(drops DropCounts) summaryPoint {
+// interval." drops and retransCount are the caller's own responsibility
+// to compute and pass in (see DropCounts' own doc comment, and
+// glitch.Source.RetransCount's), since neither belongs to this
+// aggregator - retransCount in particular is never seen via HandleEvent
+// at all, since neither capture backend emits retransmissions as Events.
+func (a *Aggregator) Summary(retransCount int, drops DropCounts) summaryPoint {
 	s := summaryPoint{
 		StallEpisodes:              a.stallEpisodes,
 		StallMaxMs:                 a.stallMaxMs,
 		StallSumMs:                 a.stallSumMs,
 		StallOpen:                  len(a.open),
-		RetransCount:               a.retransCount,
+		RetransCount:               retransCount,
 		DroppedEvents:              drops.Total,
 		KernelDroppedEvents:        drops.Kernel,
 		UserDroppedEvents:          drops.User,
@@ -286,6 +287,5 @@ func (a *Aggregator) Summary(drops DropCounts) summaryPoint {
 	a.stallEpisodes = 0
 	a.stallMaxMs = 0
 	a.stallSumMs = 0
-	a.retransCount = 0
 	return s
 }

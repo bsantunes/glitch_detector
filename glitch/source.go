@@ -12,6 +12,14 @@ package glitch
 type Source interface {
 	Events() <-chan Event
 	Dropped() uint64
+	// RetransCount returns the cumulative count of TCP retransmissions
+	// seen so far — counted directly by whichever capture backend is in
+	// use (see glitch.Handle.RetransCount / afpacket.Capture.RetransCount)
+	// rather than emitted as Events, which both no longer produce
+	// KindRetrans for at all. A caller wanting a per-interval count
+	// computes its own delta since the last read, the same way every
+	// other cumulative counter here already works.
+	RetransCount() uint64
 	Err() error
 	Close() error
 }

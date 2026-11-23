@@ -88,6 +88,16 @@ const (
 	sweepInterval = 30 * time.Second
 )
 
+// eventsChanSize: raised from 256 after a real burst on dawn6g's own
+// link (single-stream, single 2s outage, iperf3_retr~1000-1100) showed
+// genuine channel-depth drops even with retransmissions no longer
+// competing for a slot here (core.Engine counts them directly instead —
+// see Engine.RetransCount) — the channel itself, not just a consumer's
+// per-event processing cost, was the bottleneck at this device's real
+// burst scale. 4096 is margin, not a measured minimum. Matches
+// glitch.Handle's own eventsChanSize for the same reason.
+const eventsChanSize = 4096
+
 // Capture reads raw packets off one interface via a TPACKET_V3
 // AF_PACKET ring and feeds them through a core.Engine, same public
 // shape as glitch.Handle (Events/Dropped/Close) so cmd/glitch-tool and
@@ -210,7 +220,7 @@ func Open(iface string, udpMonitorPorts []uint16) (c *Capture, err error) {
 		blockSize: int(req.Block_size),
 		blockNr:   int(req.Block_nr),
 		engine:    core.NewEngine(udpMonitorPorts),
-		events:    make(chan glitch.Event, 256),
+		events:    make(chan glitch.Event, eventsChanSize),
 		done:      make(chan struct{}),
 		stop:      make(chan struct{}),
 	}
@@ -523,6 +533,13 @@ func (c *Capture) PacketsSeen() uint64 {
 // unbounded memory growth.
 func (c *Capture) Evictions() uint64 {
 	return c.engine.Evictions()
+}
+
+// RetransCount returns the cumulative count of TCP retransmissions seen
+// so far — see core.Engine.RetransCount for why these are counted
+// directly instead of being emitted as Events.
+func (c *Capture) RetransCount() uint64 {
+	return c.engine.RetransCount()
 }
 
 // Close stops the capture loop and releases the socket/ring. Safe to

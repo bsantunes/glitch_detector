@@ -111,8 +111,15 @@ for i in $(seq 1 "$RUNS"); do
 	iperf_retr=$(awk '/sender/{print $(NF-1)}' "$iperf_log" | tail -1)
 	echo "run $i: iperf3 flow src_port=${src_port:-unknown} iperf3_retr=${iperf_retr:-unknown}"
 
-	ebpf_retrans=$(grep "TCP Loss Detected" "$ebpf_log" | grep -c ":5201\$" || true)
-	afpacket_retrans=$(grep "TCP Loss Detected" "$afpacket_log" | grep -c ":5201\$" || true)
+	# Both capture backends count retransmissions directly now
+	# (glitch.Source.RetransCount) instead of emitting a per-flow Event
+	# for each one, so these are each run's whole-process total across
+	# every flow, not scoped to just the iperf3 flow the way the old
+	# per-event ":5201$" grep was — see glitch-detector-internals skill.
+	ebpf_retrans=$(grep -oE "retrans=[0-9]+" "$ebpf_log" | tail -1 | cut -d= -f2)
+	afpacket_retrans=$(grep -oE "retrans=[0-9]+" "$afpacket_log" | tail -1 | cut -d= -f2)
+	ebpf_retrans=${ebpf_retrans:-0}
+	afpacket_retrans=${afpacket_retrans:-0}
 	echo "run $i: ebpf_retrans=$ebpf_retrans afpacket_retrans=$afpacket_retrans iperf3_retr=${iperf_retr:-unknown}"
 
 	echo "--- eBPF ($ebpf_log) ---"

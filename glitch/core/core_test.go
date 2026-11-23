@@ -132,13 +132,18 @@ func TestEngine_RetransDetection(t *testing.T) {
 	base := time.Now()
 	e.HandlePacket(egressPkt(base, 1000, 100)) // end_seq -> 1100
 
-	// Resend starting at 1000 (behind end_seq) with real payload.
+	// Resend starting at 1000 (behind end_seq) with real payload — counted
+	// directly (RetransCount), not emitted as an Event at all any more:
+	// see RetransCount's own doc comment for why (retransmissions vastly
+	// outnumber stall events during a real burst, so keeping them off the
+	// Events channel entirely removes their share of channel-depth
+	// pressure, rather than just processing them faster once sent).
 	events := e.HandlePacket(egressPkt(base.Add(time.Millisecond), 1000, 50))
-	if len(events) != 1 || events[0].Type != glitch.KindRetrans {
-		t.Fatalf("expected one Retrans event, got %+v", events)
+	if len(events) != 0 {
+		t.Fatalf("expected no Events for a retransmission, got %+v", events)
 	}
-	if events[0].Value != 100 {
-		t.Errorf("Value (seq delta) = %d, want 100", events[0].Value)
+	if got := e.RetransCount(); got != 1 {
+		t.Fatalf("RetransCount() = %d, want 1", got)
 	}
 }
 
@@ -152,6 +157,41 @@ func TestEngine_RetransDetection_PureACKNeverFlagged(t *testing.T) {
 	events := e.HandlePacket(egressPkt(base.Add(time.Millisecond), 1000, 0))
 	if len(events) != 0 {
 		t.Fatalf("expected no events for a payload-less repeat, got %+v", events)
+	}
+	if got := e.RetransCount(); got != 0 {
+		t.Fatalf("RetransCount() = %d, want 0 (nothing was actually retransmitted)", got)
+	}
+}
+
+// TestEngine_RetransBurst_NeverProducesEvents is the invariant that
+// makes zero user-side channel drops possible under a real burst,
+// confirmed live on dawn6g's own link (iperf3_retr~1000-1100 causing
+// real UserDropped-equivalent channel drops even after glitch-tool's
+// stdout was buffered): however many retransmissions arrive, however
+// fast, none of them are ever candidates for a channel send at all — a
+// capture layer forwarding HandlePacket's returned Events onto a
+// bounded channel (glitch/afpacket.Capture, glitch/glitch.go's eBPF
+// readLoop) can never experience a retransmission-caused drop, by
+// construction, regardless of that channel's size.
+func TestEngine_RetransBurst_NeverProducesEvents(t *testing.T) {
+	e := NewEngine(nil)
+	base := time.Now()
+	e.HandlePacket(egressPkt(base, 1000, 100)) // end_seq -> 1100
+
+	const burst = 5000
+	var produced int
+	for i := 0; i < burst; i++ {
+		// Same already-sent range resent repeatedly, all within 1 real
+		// second — "a burst of 5,000 retransmissions in 1s".
+		t := base.Add(time.Duration(i) * (time.Second / burst))
+		events := e.HandlePacket(egressPkt(t, 1000, 50))
+		produced += len(events)
+	}
+	if produced != 0 {
+		t.Fatalf("burst produced %d Events, want 0 — a capture layer forwarding these onto a bounded channel would see exactly this many chances to drop one", produced)
+	}
+	if got := e.RetransCount(); got != burst {
+		t.Fatalf("RetransCount() = %d, want %d", got, burst)
 	}
 }
 
