@@ -82,7 +82,7 @@ func main() {
 	writeAPI := client.WriteAPIBlocking(*influxOrg, *influxBucket)
 
 	log.Printf("Detecting modems (ModemManager -> QMI/MBIM -> uqmi -> AT)...")
-	modems, err := modem.Detect(ctx)
+	modems, err := modem.DetectValidated(ctx)
 	if err != nil {
 		log.Printf("modem detection error: %v", err)
 	}
@@ -98,15 +98,92 @@ func main() {
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 
+	// stale: a signal reading repeated for 3 poll intervals straight is
+	// withheld rather than re-written as fresh — see staleness.go's own
+	// doc comment for why change-detection, not a source timestamp.
+	stale := newStaleTracker(3*(*interval), time.Now)
+
+	// redetect: periodically re-runs the full detection cascade and
+	// upgrades to a better-ranked method if one has become available —
+	// confirmed live on dawn6g that a reboot can win the method cascade
+	// race onto a worse/contention-prone method (uqmi, or a QMI session
+	// contending with WaveOS's own uqmi-ubus daemon) simply because that
+	// daemon wasn't ready yet at the single startup-time Detect call,
+	// and nothing before this retried later once it was. Only upgrades,
+	// never downgrades — a method already working is left alone even if
+	// a higher-ranked one would also work now.
+	const redetectInterval = 5 * time.Minute
+	redetectTicker := time.NewTicker(redetectInterval)
+	defer redetectTicker.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			for _, m := range modems {
-				exportModem(ctx, writeAPI, *deviceID, m)
+				exportModem(ctx, writeAPI, *deviceID, m, stale)
 			}
+		case <-redetectTicker.C:
+			modems = maybeUpgradeModems(ctx, modems)
 		}
+	}
+}
+
+// maybeUpgradeModems re-runs the full detection cascade and swaps to its
+// result only if every currently-tracked modem is on a method ranked
+// worse than what the fresh cascade found — a partial swap (upgrading
+// one modem but not another) would risk losing track of a modem the new
+// cascade happened not to re-find this particular time, which an
+// all-or-nothing comparison avoids. Returns the original list unchanged
+// on any detection error, an empty result, or no actual improvement.
+func maybeUpgradeModems(ctx context.Context, current []modem.Modem) []modem.Modem {
+	worstCurrent := 0
+	for _, m := range current {
+		if r := methodRank(m.Method); r > worstCurrent {
+			worstCurrent = r
+		}
+	}
+	if worstCurrent == 0 {
+		return current // already on ModemManager for everything — nothing ranks better
+	}
+
+	fresh, err := modem.DetectValidated(ctx)
+	if err != nil || len(fresh) == 0 {
+		return current
+	}
+	bestFresh := 5
+	for _, m := range fresh {
+		if r := methodRank(m.Method); r < bestFresh {
+			bestFresh = r
+		}
+	}
+	if bestFresh >= worstCurrent {
+		return current
+	}
+	log.Printf("modem: re-detection found a better method (rank %d -> %d) — switching", worstCurrent, bestFresh)
+	for _, m := range fresh {
+		log.Printf("modem detected: [%s] %s %s (via %s)", m.ID, m.Manufacturer, m.Model, m.Method)
+	}
+	return fresh
+}
+
+// methodRank orders modem.Method by preference, matching the cascade
+// order modem.DetectValidated itself tries them in — lower is better.
+func methodRank(m modem.Method) int {
+	switch m {
+	case modem.MethodModemManager:
+		return 0
+	case modem.MethodUbus:
+		return 1
+	case modem.MethodQMI, modem.MethodMBIM:
+		return 2
+	case modem.MethodUQMI:
+		return 3
+	case modem.MethodAT:
+		return 4
+	default:
+		return 5
 	}
 }
 
@@ -117,11 +194,18 @@ func main() {
 // is retried/buffered (acceptable for monitoring data, and avoids
 // unbounded buffering on a resource-constrained device if InfluxDB, or
 // the link to it, is down for a while).
-func exportModem(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID string, m modem.Modem) {
+func exportModem(ctx context.Context, writeAPI api.WriteAPIBlocking, deviceID string, m modem.Modem, stale *staleTracker) {
 	signals, err := modem.GetSignals(ctx, m)
 	if err != nil {
 		log.Printf("[%s] signal read failed: %v", m.ID, err)
 		return
+	}
+	for i, sig := range signals {
+		out, _, msg := stale.Check(signalKey{modemID: m.ID, role: sig.Role}, sig)
+		if msg != "" {
+			log.Printf("[%s] %s", m.ID, msg)
+		}
+		signals[i] = out
 	}
 
 	var cell modem.CellInfo

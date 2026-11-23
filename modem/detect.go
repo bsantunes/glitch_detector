@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"math"
 )
 
 // Detect runs the hybrid detection cascade: ModemManager first (the
@@ -55,6 +56,74 @@ func Detect(ctx context.Context) ([]Modem, error) {
 	}
 
 	return nil, nil
+}
+
+// DetectValidated runs the same cascade as Detect, in the same order,
+// but additionally confirms each candidate actually yields live signal
+// data (at least one leg with a real, non-NaN RSRP or RSSI) before
+// accepting it — a method that "finds" a modem but can only report N/A
+// (e.g. a WaveOS ubus object that exists but hasn't registered with its
+// uqmi-ubus daemon yet, or a QMI session returning empty sections while
+// contending with that same daemon) is treated the same as not finding
+// anything, falling through to the next method instead of permanently
+// committing to a modem this cascade can never actually report real
+// values for. Confirmed live on dawn6g: Detect alone accepted ubus
+// moments before its daemon had anything to report, and separately
+// accepted a QMI session whose signal reads then stayed frozen for
+// 2.5 days — DetectValidated's job is to catch the first of those two
+// (the frozen-after-accept case needs cmd/modem-exporter's own
+// staleness tracking instead, since it isn't visible at detection time).
+//
+// GetCellInfo is deliberately not checked here — PLMN/registration text
+// is a weaker signal than a real radio measurement, and at least one
+// legitimate state (a modem with no SIM, still camped on a cell's
+// broadcast system information) reports real RSRP/RSRQ while
+// GetCellInfo stays empty — see this package's own doc comment.
+func DetectValidated(ctx context.Context) ([]Modem, error) {
+	try := func(detect func(context.Context) ([]Modem, error), name string) []Modem {
+		modems, err := detect(ctx)
+		if err != nil {
+			log.Printf("modem: %s detection unavailable: %v", name, err)
+			return nil
+		}
+		if len(modems) == 0 {
+			return nil
+		}
+		for _, m := range modems {
+			signals, serr := GetSignals(ctx, m)
+			if serr == nil && hasRealSignal(signals) {
+				return modems
+			}
+		}
+		log.Printf("modem: %s found %d modem(s) but none report real signal data (all N/A) — trying the next method", name, len(modems))
+		return nil
+	}
+
+	if modems := try(DetectModemManager, "ModemManager"); modems != nil {
+		return modems, nil
+	}
+	if modems := try(DetectUbus, "ubus (WaveOS)"); modems != nil {
+		return modems, nil
+	}
+	if modems := try(DetectQMIMBIM, "QMI/MBIM"); modems != nil {
+		return modems, nil
+	}
+	if modems := try(DetectUQMI, "uqmi"); modems != nil {
+		return modems, nil
+	}
+	if modems := try(DetectAT, "AT"); modems != nil {
+		return modems, nil
+	}
+	return nil, nil
+}
+
+func hasRealSignal(signals []Signal) bool {
+	for _, s := range signals {
+		if !math.IsNaN(s.RSRP) || !math.IsNaN(s.RSSI) {
+			return true
+		}
+	}
+	return false
 }
 
 // GetSignals returns one Signal per currently active radio leg for m —
