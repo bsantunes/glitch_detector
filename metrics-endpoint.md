@@ -31,12 +31,15 @@ telemetry writer, the Grafana dashboards, or the `dawn6g-metrics` server stack.
 
 ```
 radio_cell,device=<id>,modem_id=<n>,method=<ModemManager|QMI|AT>,rat=<lte|nr>,role=<anchor|scg>[,plmn=<mccmnc>,tac=<tac>] rsrp=<f>,rsrq=<f>,rssi=<f>,sinr=<f>,cell_id="<str>"[,pci=<i>]
-modem_state,device=<id>,modem_id=<n> operator_name="<s>",registration_state="<s>",packet_service_state="<s>"
+modem_state,device=<id>,modem_id=<n> operator_name="<s>",registration_state="<s>",packet_service_state="<s>"[,stale_signal_fields=<i>]
+agent_info,device=<id>,component=<modem-exporter|twamp-exporter|gps-exporter|glitch-exporter> version="<str>"
 ```
 
 - Tags = bounded-cardinality grouping keys; fields = measurements. `cell_id` stays a field.
 - One point per carrier: under EN-DC the LTE anchor and NR SCG are separate points (never mixed).
 - `plmn`/`tac` only on `role=anchor` rows.
+- `modem_state.stale_signal_fields` (int, omitted when 0): how many of that modem's `radio_cell` rsrp/rsrq/rssi/sinr fields were withheld this tick because they'd held an identical value too long (30 minutes change-detection, or — for the `ubus` method specifically — its own source timestamp not advancing in 3x the poll interval) — see the `modem-detection` skill. A nonzero run of these over time means `radio_cell`'s numeric fields for that modem are stale, not necessarily missing.
+- `agent_info`, one point at startup and again every hour, from every exporter (not `modem_state`/`radio_cell`-specific) — answers "what version is this device actually running" per component, straight from InfluxDB, without needing to SSH in and run each binary with `-version`. Each exporter writes it via its own existing client, so it lands in that exporter's own bucket, not one shared location — `modem-exporter`'s in `radio`, `twamp-exporter`'s and `glitch-exporter`'s in `network`, `gps-exporter`'s in `location`. A dashboard covering all four components needs to query across all three buckets (or `union()` in Flux), not just one.
 - Go client `github.com/influxdata/influxdb-client-go/v2`, one `WriteAPI` per bucket, batch 500,
   flush 1000 ms, max retries 10, retry buffer 100000 points (RAM only), precision ms.
 
