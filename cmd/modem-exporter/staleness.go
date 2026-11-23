@@ -50,10 +50,10 @@ type signalState struct {
 // when they last actually changed — not just when they were last
 // fetched, which a frozen source updates just as readily as a live one.
 type staleTracker struct {
-	maxAge   time.Duration
+	maxAge    time.Duration
 	warnEvery time.Duration
-	now      func() time.Time
-	states   map[signalKey]*signalState
+	now       func() time.Time
+	states    map[signalKey]*signalState
 }
 
 func newStaleTracker(maxAge time.Duration, now func() time.Time) *staleTracker {
