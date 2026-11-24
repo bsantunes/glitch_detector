@@ -202,8 +202,9 @@ func (r *NMEAReader) open(ctx context.Context) (*os.File, error) {
 		err error
 	}
 	ch := make(chan result, 1)
+	open := openNMEAPort // read here, not in the goroutine that may outlive Close
 	go func() {
-		f, err := openNMEAPort(r.dev)
+		f, err := open(r.dev)
 		ch <- result{f, err}
 	}()
 	select {
