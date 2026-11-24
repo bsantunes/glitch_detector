@@ -3,7 +3,6 @@ package modem
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -140,26 +139,12 @@ func parseIDMMPortIgnore(udevadmOutput string) bool {
 	return false
 }
 
-// sendAT configures the serial port with `stty` (raw mode, no echo —
-// no explicit baud; see below) and writes a single AT command,
-// returning whatever the modem replies within the given timeout.
+// sendAT opens the serial port in raw/no-echo mode (OpenRawSerial — no
+// external stty; see its doc comment for why) and writes a single AT
+// command, returning whatever the modem replies within the given
+// timeout.
 func sendAT(dev, cmd string, timeout time.Duration) (string, error) {
-	// stty commonly exits non-zero here if a baud rate is given — these
-	// are virtual USB-serial ports (CDC-ACM-style), and confirmed live on
-	// both aaeon and dawn6g that the kernel driver rejects setting an
-	// explicit speed on them specifically ("unable to perform all
-	// requested operations") while accepting raw/-echo on their own just
-	// fine, so the speed argument is dropped rather than tolerated.
-	// Logged with stty's own stderr (not just the generic exit-status
-	// error) in case a real misconfiguration ever surfaces here instead.
-	sttyCmd := exec.Command("stty", "-F", dev, "raw", "-echo")
-	var sttyErr strings.Builder
-	sttyCmd.Stderr = &sttyErr
-	if err := sttyCmd.Run(); err != nil {
-		log.Printf("modem: stty %s: %v: %s (continuing anyway)", dev, err, strings.TrimSpace(sttyErr.String()))
-	}
-
-	f, err := os.OpenFile(dev, os.O_RDWR, 0)
+	f, err := OpenRawSerial(dev, os.O_RDWR)
 	if err != nil {
 		return "", err
 	}

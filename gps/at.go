@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"os/exec"
 	"regexp"
 	"strconv"
 	"strings"
@@ -288,7 +287,7 @@ func getFixAT(m modem.Modem, vendor atGPSVendor) (Fix, error) {
 // can be a misread: NMEA on a separate port showed a continuous real
 // fix while our own reader classified every other poll as "no fix",
 // traced to stale bytes from a previous exchange and the modem's own
-// command echo (stty failing to set raw/-echo) corrupting the buffer.
+// command echo (the port not actually in raw/-echo mode) corrupting the buffer.
 // Logging the raw response here is what makes a future misread like
 // that visible instead of silently looking like "no antenna yet".
 func logNoFixResponse(port, cmd, resp string, fix Fix, err error) {
@@ -456,22 +455,9 @@ func drainPort(f *os.File) {
 // exported across packages for this one shared helper — same
 // reasoning as gps/mmcli.go's parseMmcliKeyValue.
 func atTransact(dev, cmd string, timeout time.Duration, isComplete func(string) bool) (string, error) {
-	// stty commonly exits non-zero here if a baud rate is given — these
-	// are virtual USB-serial ports (CDC-ACM-style), and confirmed live on
-	// both aaeon and dawn6g that the kernel driver rejects setting an
-	// explicit speed on them specifically ("unable to perform all
-	// requested operations") while accepting raw/-echo on their own just
-	// fine, so the speed argument is dropped rather than tolerated.
-	// Logged with stty's own stderr (not just the generic exit-status
-	// error) in case a real misconfiguration ever surfaces here instead.
-	sttyCmd := exec.Command("stty", "-F", dev, "raw", "-echo")
-	var sttyErr strings.Builder
-	sttyCmd.Stderr = &sttyErr
-	if err := sttyCmd.Run(); err != nil {
-		log.Printf("gps: stty %s: %v: %s (continuing anyway)", dev, err, strings.TrimSpace(sttyErr.String()))
-	}
-
-	f, err := os.OpenFile(dev, os.O_RDWR, 0)
+	// Port setup (raw, no echo, flushed) without an external stty — see
+	// modem.OpenRawSerial for why stty could hang here.
+	f, err := modem.OpenRawSerial(dev, os.O_RDWR)
 	if err != nil {
 		return "", err
 	}

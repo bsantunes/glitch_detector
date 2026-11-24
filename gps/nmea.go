@@ -5,11 +5,12 @@ import (
 	"log"
 	"math"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"dawn-agent/modem"
 )
 
 // parseNMEARMC parses an NMEA "RMC" sentence (any talker ID) into a
@@ -147,17 +148,9 @@ func (r *NMEAReader) run(ctx context.Context) {
 const nmeaReadDeadline = 500 * time.Millisecond
 
 func (r *NMEAReader) readOnce(ctx context.Context) error {
-	// stty's baud argument fails on these virtual USB-serial ports —
-	// see gps/at.go's atTransact for the same finding on the AT ports
-	// of the same modems; dropped here for the identical reason.
-	sttyCmd := exec.Command("stty", "-F", r.dev, "raw", "-echo")
-	var sttyErr strings.Builder
-	sttyCmd.Stderr = &sttyErr
-	if err := sttyCmd.Run(); err != nil {
-		log.Printf("gps: stty %s: %v: %s (continuing anyway)", r.dev, err, strings.TrimSpace(sttyErr.String()))
-	}
-
-	f, err := os.OpenFile(r.dev, os.O_RDONLY, 0)
+	// Port setup (raw, no echo, flushed) without an external stty — see
+	// modem.OpenRawSerial for why stty hung here on aaeon's SIM8202G.
+	f, err := modem.OpenRawSerial(r.dev, os.O_RDONLY)
 	if err != nil {
 		return err
 	}
