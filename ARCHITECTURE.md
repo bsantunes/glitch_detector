@@ -186,7 +186,14 @@ modem.Detect(ctx)
   │     to the other backends only if `mmcli -L` itself fails or finds
   │     nothing, not if signal-setup fails).
   │
-  ├─ 2. QMI / MBIM (modem/qmi.go) — used when ModemManager isn't managing
+  ├─ 2. ubus (modem/ubus.go) — WaveOS only: reads the uqmi-ubus daemon's
+  │     `qmi` object (`ubus call qmi metrics`). That daemon already owns
+  │     one serialized QMI/AT session per modem, so reading its results
+  │     avoids opening a competing qmicli/uqmi client (which exhausted
+  │     the modem's QMI client-ID pool when run alongside it). Preferred
+  │     over raw QMI for exactly that reason.
+  │
+  ├─ 3. QMI / MBIM (modem/qmi.go) — used when ModemManager isn't managing
   │     the modem (not installed, or the modem isn't supported). Probes
   │     /dev/cdc-wdm* with qmicli first (`--dms-get-manufacturer` /
   │     `--dms-get-model` — must be separate calls, qmicli rejects
@@ -195,12 +202,32 @@ modem.Detect(ctx)
   │     structured `--nas-get-signal-strength`; MBIM only exposes a coarse
   │     RSSI via `--query-signal-state`.
   │
-  └─ 3. Raw AT over serial (modem/at.go) — last resort. Scans
+  ├─ 4. uqmi (modem/uqmi.go) — OpenWrt's lightweight QMI client, for
+  │     systems (like WaveOS) that have uqmi but not qmicli/mbimcli.
+  │
+  └─ 5. Raw AT over serial (modem/at.go) — last resort. Scans
         /dev/ttyUSB*/ttyACM*, identifies via `ATI`, reads signal via the
         standard 3GPP `AT+CESQ` command (works across vendors; richer
         vendor-specific commands like Quectel's AT+QCSQ are a possible
         future addition once needed).
 ```
+
+`modem-exporter` calls `modem.DetectValidated`, which runs the same cascade
+in the same order but only accepts a backend whose signal read returns real
+(non-N/A) values — `ubus` can exist moments before its daemon has anything
+to report.
+
+**Periodic re-detection (`modem-exporter`, since `v2.3.1`).** Detection is
+no longer a one-shot at startup: every 5 minutes `modem-exporter` re-runs
+the validated cascade and switches method if (a) a better-ranked method has
+become available — e.g. after a reboot, when `uqmi-ubus` wasn't ready yet
+and detection settled on raw QMI — or (b) the current method has gone bad:
+its data is stale (per-field 30-minute change detection, and `ubus`'s own
+source timestamp not advancing) or `GetSignals` fails outright. In case (b)
+it falls back even to a worse-ranked method (`DetectValidatedExcluding`
+skips the stale one so it isn't re-selected), and moves back once the
+better method recovers. Every switch is logged with its reason; all modems
+switch together, never a partial swap. `modem-tool` still detects once.
 
 `modem.GetSignal(ctx, m)` then dispatches back to whichever backend found
 the modem. Every backend returns the same technology-agnostic `Signal{
