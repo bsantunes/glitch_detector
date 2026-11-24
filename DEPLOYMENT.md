@@ -16,10 +16,14 @@ not repeated here.
   running side by side (see CLAUDE.md's Project Overview) and its own eBPF
   decode logic no longer matches the current `tc_glitch.o` at all.
 - **WaveOS / OpenWrt** (like `6global`, `dawn6g`) → **no eBPF** (confirmed
-  missing `clsact`/TC-BPF kernel support — see CLAUDE.md's Known Issues).
-  Install only `modem-tool`, `modem-exporter`, `twamp-tool`, `twamp-exporter`.
-  Don't bother with `dawn-agent`, `glitch-tool`, or `glitch-exporter` here —
-  the whole eBPF path fails to load its qdisc on this kernel.
+  missing `clsact`/TC-BPF kernel support — see CLAUDE.md's Project Overview).
+  Install `modem-exporter`, `twamp-exporter`, **`glitch-exporter` with
+  `-capture afpacket`** (the AF_PACKET backend needs no eBPF), and
+  **`gps-exporter`** (AT-over-serial), plus `modem-tool`/`twamp-tool` if
+  you want local diagnostics. This is exactly what runs on `dawn6g`. Don't
+  install `dawn-agent`, and never run `glitch-tool`/`glitch-exporter` with
+  the default `-capture ebpf` here — the eBPF path fails to load its qdisc
+  on this kernel.
 
 Pick a short, stable **device ID** now (e.g. the hostname — `aaeon`,
 `6global`, `dawn6g`) — it's used as both the InfluxDB token's name and the
@@ -131,7 +135,15 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o modem-tool      ./cmd/modem-to
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o modem-exporter  ./cmd/modem-exporter
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o twamp-tool      ./cmd/twamp-tool
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o twamp-exporter  ./cmd/twamp-exporter
+make embed   # glitch/ embeds tc_glitch.o at compile time, even for -capture afpacket
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o glitch-exporter ./cmd/glitch-exporter
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o gps-exporter    ./cmd/gps-exporter
 ```
+
+Build from a tagged checkout (`git checkout vX.Y.Z`) and add
+`-ldflags "-X dawn-agent/version.Version=$(git describe --tags --always --dirty)"`
+to each line (the `Makefile` does this for native builds) so `-version` and
+the `agent_info` point report what's actually running.
 
 `CGO_ENABLED=0` matters: a normal `go build` is dynamically linked against
 the build host's glibc, which won't necessarily match WaveOS's. The static
@@ -140,32 +152,55 @@ build sidesteps that.
 Copy the binaries and the matching `openwrt/*.init` scripts to the device:
 
 ```bash
-scp -P <port> modem-tool modem-exporter twamp-tool twamp-exporter root@<waveos-ip>:/opt/dawn/
+scp -P <port> modem-tool modem-exporter twamp-tool twamp-exporter glitch-exporter gps-exporter root@<waveos-ip>:/opt/dawn/
 scp -P <port> openwrt/modem-tool.init      root@<waveos-ip>:/etc/init.d/modem-tool
 scp -P <port> openwrt/modem-exporter.init  root@<waveos-ip>:/etc/init.d/modem-exporter
 scp -P <port> openwrt/twamp-tool.init      root@<waveos-ip>:/etc/init.d/twamp-tool
 scp -P <port> openwrt/twamp-exporter.init  root@<waveos-ip>:/etc/init.d/twamp-exporter
+scp -P <port> openwrt/glitch-exporter.init root@<waveos-ip>:/etc/init.d/glitch-exporter
+scp -P <port> openwrt/gps-exporter.init    root@<waveos-ip>:/etc/init.d/gps-exporter
 ```
 
-On the device, **before enabling anything**, edit the two exporter init
+What the two extra exporters run (matching `dawn6g`):
+
+- **`glitch-exporter`**: `-capture afpacket -iface lte1` (set `IFACE` in the
+  init script to the interface actually carrying traffic — `lte1`/`mwan1` on
+  `dawn6g`; `lte0`/`mwan0` is disabled there). The AF_PACKET backend takes an
+  exclusivity lock at **`/var/run/glitch-afpacket-<iface>.lock`** — `/var/run`,
+  not `/run`, because WaveOS has no `/run` at all (glitch-exporter crash-looped
+  on `dawn6g` with `open lock file: ... no such file or directory` until the
+  path was changed). Only one AF_PACKET capture per interface can hold it: a
+  `glitch-tool -capture afpacket` on the same interface will refuse to start
+  while the exporter runs (stop the exporter first for a manual test).
+- **`gps-exporter`**: `-method at -port usb:2c7c:0801:03` — the Quectel
+  RM520N-GL's secondary AT port (interface 03), pinned by USB
+  vendor/product/interface because `ttyUSB` numbers aren't stable across
+  reboots on a two-modem board. **No `-nmea-port` on WaveOS**: the Quectel's
+  NMEA streaming is unresolved (see the `gps-integration` skill); AT fixes
+  arrive fine there. (`dawn6g`'s installed copy pins `/dev/ttyUSB10`, the same
+  interface today; new installs should use the `usb:` form.)
+
+On the device, **before enabling anything**, edit all four exporter init
 scripts to set the real `DEVICE_ID` (they ship with a placeholder — see each
-file's `DEVICE_ID=...` line near the top) and create the shared token file,
-reused by both exporters:
+file's `DEVICE_ID=...` line near the top; `glitch-exporter` also has `IFACE`)
+and create the shared token file, reused by all four exporters:
 
 ```bash
 ssh -p <port> root@<waveos-ip>
 vi /etc/init.d/modem-exporter   # set DEVICE_ID=<device-id>
 vi /etc/init.d/twamp-exporter   # set DEVICE_ID=<device-id> (same value)
+vi /etc/init.d/glitch-exporter  # set DEVICE_ID=<device-id>, IFACE=<traffic iface>
+vi /etc/init.d/gps-exporter     # set DEVICE_ID=<device-id>; check GPS_PORT
 
 cat > /opt/dawn/modem-exporter.env <<'EOF'
 INFLUX_TOKEN=<paste the token from step 1>
 EOF
 chmod 600 /opt/dawn/modem-exporter.env
 
-chmod +x /opt/dawn/modem-tool /opt/dawn/modem-exporter /opt/dawn/twamp-tool /opt/dawn/twamp-exporter
-chmod +x /etc/init.d/modem-tool /etc/init.d/modem-exporter /etc/init.d/twamp-tool /etc/init.d/twamp-exporter
+chmod +x /opt/dawn/modem-tool /opt/dawn/modem-exporter /opt/dawn/twamp-tool /opt/dawn/twamp-exporter /opt/dawn/glitch-exporter /opt/dawn/gps-exporter
+chmod +x /etc/init.d/modem-tool /etc/init.d/modem-exporter /etc/init.d/twamp-tool /etc/init.d/twamp-exporter /etc/init.d/glitch-exporter /etc/init.d/gps-exporter
 
-for svc in modem-tool modem-exporter twamp-tool twamp-exporter; do
+for svc in modem-tool modem-exporter twamp-tool twamp-exporter glitch-exporter gps-exporter; do
   /etc/init.d/$svc enable
   /etc/init.d/$svc start
 done
@@ -174,7 +209,7 @@ done
 Check logs:
 
 ```bash
-logread | grep -Ei "modem-exporter|twamp-exporter|modem-tool|twamp-tool" | tail -30
+logread | grep -Ei "modem-exporter|twamp-exporter|glitch-exporter|gps-exporter|modem-tool|twamp-tool" | tail -30
 ```
 
 ## 4. Verify data is actually landing in InfluxDB
@@ -195,13 +230,21 @@ from(bucket:"network") |> range(start:-5m)
   |> filter(fn:(r)=>r._measurement=="twamp")
   |> last()'
 
-# glitch-exporter — Debian/eBPF gateways only (see step 0). glitch_summary
-# writes a point every interval regardless of activity, so this should
-# never come back empty on a device that has it installed and running.
+# glitch-exporter — any board (eBPF on Debian, -capture afpacket on WaveOS).
+# glitch_summary writes a point every interval regardless of activity, so
+# this should never come back empty on a device that has it running.
 docker compose exec -T influxdb influx query '
 from(bucket:"network") |> range(start:-5m)
   |> filter(fn:(r)=>r.device=="<device-id>")
   |> filter(fn:(r)=>r._measurement=="glitch_summary")
+  |> last()'
+
+# gps-exporter — only writes gps_fix while the receiver has a valid fix, so
+# an empty result can just mean no fix yet (indoor antenna). Check its log
+# before suspecting the exporter; NMEA-sourced points carry source="nmea".
+docker compose exec -T influxdb influx query '
+from(bucket:"location") |> range(start:-1h)
+  |> filter(fn:(r)=>r.device=="<device-id>" and r._measurement=="gps_fix")
   |> last()'
 ```
 
@@ -236,9 +279,12 @@ list` while debugging a separate "no data" issue, not assumed.
 - **Use `add-device.sh`, never create the token by hand** — see step 1.
 - **WaveOS exporters share one token file** (`/opt/dawn/modem-exporter.env`)
   — don't create a separate one for `twamp-exporter`; it reads the same file.
-- **Set `DEVICE_ID` in *both* WaveOS init scripts** (`modem-exporter` and
-  `twamp-exporter`) — they default to a placeholder value that will
-  silently mislabel your data under the wrong device tag if left unedited.
+- **Set `DEVICE_ID` in *every* WaveOS exporter init script** (`modem-exporter`,
+  `twamp-exporter`, `glitch-exporter`, `gps-exporter`) — they ship with a
+  placeholder value that will silently mislabel your data under the wrong
+  device tag if left unedited.
+- **WaveOS has no `/run`** — anything writing runtime/lock files must use
+  `/var/run` (see `glitch-exporter`'s AF_PACKET lock above).
 - **No SIM ≠ no data.** A SIM-less modem can still report real
   RSRP/RSRQ/RSSI/SINR/PLMN/TAC/CellID by camping on a broadcasting cell's
   physical-layer system information — don't assume a missing SIM means the

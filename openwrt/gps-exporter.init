@@ -25,6 +25,21 @@
 # below is the Quectel RM520N-GL's secondary AT port (interface 03) —
 # dawn6g/6global's fixed hardware is modem 0 = SIMCom (1e0e:9001),
 # modem 1 = Quectel (2c7c:0801); see CLAUDE.md's Project Overview.
+# (dawn6g's installed copy still pins -port /dev/ttyUSB10, which is
+# the same 2c7c:0801 interface 03 today; this template uses the
+# reboot-stable usb: form.)
+#
+# Fix source: AT only. On the WaveOS Quectel the NMEA reader is parked
+# (NMEA streaming on dawn6g is unresolved), so -nmea-port is NOT set
+# here. -nmea-port is what aaeon's SIMCom SIM8202G uses (its AT position
+# commands never report a fix). Before any -nmea-port use on a Quectel:
+# it needs gps-exporter v2.3.2 or later (AT fallback while the NMEA
+# stream is stale; v2.3.1's reader can also hang on port setup), and
+# the NMEA streaming issue resolved — see the gps-integration skill.
+#
+# WaveOS itself appends a ubus "platform.events" notify block (marked
+# #<pe.1.1>) to every installed init script's start_service; it isn't
+# part of this template and needn't be copied.
 
 START=98
 STOP=1
@@ -34,18 +49,12 @@ PROG=/opt/dawn/gps-exporter
 ENV_FILE=/opt/dawn/modem-exporter.env
 
 # Per-device identity — adjust per board.
-DEVICE_ID=6global
+DEVICE_ID=dawn6g
 INFLUX_URL=https://wservices.wavesys.pt:8086
 INFLUX_ORG=wavecom
 INFLUX_BUCKET=location
 GPS_METHOD=at
 GPS_PORT=usb:2c7c:0801:03
-# NMEA port (interface 01) — preferred over AT+QGPSLOC=2/AT+CGPSINFO
-# for reading fixes once the engine's running, confirmed live to be
-# more reliable (AT+QGPSLOC=2 intermittently reports "no fix" even
-# with a continuous lock) — see CLAUDE.md's gps/ package section.
-# AT (above) still owns engine start/stop and XTRA regardless.
-GPS_NMEA_PORT=usb:2c7c:0801:01
 
 start_service() {
 	INFLUX_TOKEN=""
@@ -55,7 +64,6 @@ start_service() {
 	procd_set_param command "$PROG" \
 		-method "$GPS_METHOD" \
 		-port "$GPS_PORT" \
-		-nmea-port "$GPS_NMEA_PORT" \
 		-interval 30s \
 		-influx-url "$INFLUX_URL" \
 		-influx-org "$INFLUX_ORG" \

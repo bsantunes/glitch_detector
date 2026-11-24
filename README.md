@@ -195,14 +195,33 @@ threshold table above. Run it the same way, just with its own binary:
 
 ```bash
 make glitch-tool
-sudo ./glitch-tool -iface wwan0
+sudo ./glitch-tool -iface wwan0                     # eBPF (default; Debian boards)
+sudo ./glitch-tool -iface lte1 -capture afpacket    # AF_PACKET (WaveOS — no clsact/TC-BPF)
 ```
 
-| Icon | Event Type | Meaning |
+Example output (illustrative values; the line formats are exact):
+
+```text
+glitch-tool v2.3.2
+🚀 glitch-tool watching wwan0 via ebpf (Ctrl+C to stop)
+📊 retrans=0 dropped=0
+2026-11-24T22:10:03.512094Z 🟡 [EBPF] Stall START: gap 412.3ms (baseline 38.1ms) | TCP 10.64.12.7:51544 -> 203.0.113.5:5201
+📊 retrans=37 dropped=0
+2026-11-24T22:10:04.731220Z ✅ [EBPF] Stall END: duration 1631.0ms, steps=3 (baseline 38.1ms) | TCP 10.64.12.7:51544 -> 203.0.113.5:5201
+📊 retrans=212 dropped=0
+^C
+📊 retrans=215 dropped=0 (final)
+```
+
+With `-capture afpacket` the 📊 line also breaks drops down:
+`📊 retrans=215 dropped=0 (kernel=0 user=0 untruncated_over_limit=0)`.
+
+| Icon | Line | Meaning |
 | --- | --- | --- |
-| 🔴 | **Retransmission** | A TCP sequence number went backwards with real payload attached — the kernel resent data it already sent once. Independent of the stall logic below; fires regardless of pacing. |
+| 📊 | **Running totals** | Printed every 5 s (and once more as `(final)` on exit): the cumulative TCP retransmission count since start, plus events dropped before they could be printed. **Retransmissions are not printed one per line any more** — the capture backend counts them directly (`glitch.Source.RetransCount`) instead of sending each one as an event, which at burst scale (~1,000+) was itself a source of dropped events. A retransmission is a TCP sequence number going backwards with real payload attached; it's counted independently of the stall logic below. To count retransmissions over a test, take the difference between two 📊 lines. |
 | 🟡 | **Stall START** | The first gap in this flow's egress pacing that exceeded its adaptive baseline. Emitted immediately (not buffered until the episode ends), so a consumer reacting in a closed loop (e.g. QoS re-routing) doesn't have to wait for recovery to find out something is wrong. |
 | ✅ | **Stall END** | The episode closed: a normal-paced packet arrived again. Carries the **total duration** (from the last good packet before the episode to the one that closed it) and the **step count** (how many qualifying gaps were folded into the episode — e.g. a TCP RTO backoff retrying 4 times shows up as one episode with `steps=4`, not four separate events). |
+| 💀 | **Stall ABANDONED** | An open episode never got its END (e.g. the connection died mid-outage, or the flow was evicted from the flow table); reported with the duration measured so far. |
 
 **Stalls are reported as episodes, not one event per lagging packet.** Every
 qualifying gap after the first silently extends the open episode (tracked
@@ -401,8 +420,8 @@ sudo ./glitch-tool -iface wwan0 &
 sudo tc qdisc add dev wwan0 root netem loss 10%
 iperf3 -c <some-iperf3-server> --bind-dev wwan0 -t 10
 sudo tc qdisc del dev wwan0 root netem
-# Watch glitch-tool output a 🔴 line per real retransmission — compare
-# the count against iperf3's own reported "Retr" column.
+# Compare the growth of glitch-tool's 📊 retrans= total across the run
+# against iperf3's own reported "Retr" column.
 ```
 
 **4. `glitch-tool`: force a stall episode**
