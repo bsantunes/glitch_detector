@@ -59,3 +59,15 @@ Implementation notes worth knowing:
 - **UDP stall ports are fixed at compile time and empty by default** (see `UDP_MONITOR_PORTS` above) — no UDP flow is stall-checked at all unless `bpf_src/tc_glitch.bpf.c` is edited and rebuilt.
 
 See the `telemetry-schema` skill's `glitch-exporter` entry for `glitch_summary`/`glitch_event`'s InfluxDB schema, and `metrics-endpoint.md` for the authoritative field-by-field reference.
+
+## `dawn-agent`'s frozen pipeline (moved from CLAUDE.md)
+
+Full two-endpoint component diagram (gateway + server), including the current `glitch/`/`glitch-tool`/`glitch-exporter` pipeline: see `ARCHITECTURE.md`. The rest of this section describes `dawn-agent`'s own, **superseded and frozen** pipeline specifically — see the `glitch-detector-internals` skill for the current architecture (two BPF programs, stall episodes, ACK-gating), which `dawn-agent`'s own loading code does not use or benefit from.
+
+1. **Kernel space — `bpf_src/tc_glitch.bpf.c`** (Debian gateways only, shared with `glitch/` — there is only one BPF source file): TC egress program (`egress_monitor`). `dawn-agent`'s own Go decode logic still assumes the pre-refactor 24-byte `glitch_event` layout (no ports, a plain `last_ts`/`max_seq` struct, a single fixed 100ms threshold) — it was never updated alongside the `glitch/` package's Phase 1-3 work, so it no longer matches what the shared, currently-compiled `tc_glitch.o` actually emits (48-byte struct, episodes, ACK-gated stalls). Don't trust `dawn-agent`'s stall/retrans output as anything other than historical reference.
+
+2. **User space — `main.go`**: loads `tc_glitch.o` via cilium/ebpf, adds a `clsact` qdisc and attaches the program as a filter via vishvananda/netlink using a `HANDLE_MINEGRESS = 0xFFF2` constant that **is actually `TC_H_MIN_INGRESS`, not egress** — see the `glitch-detector-internals` skill's "Historical bug" note. `dawn-agent` itself was never fixed (it's frozen/superseded), so this misattachment is still present in its own code today, on top of the struct-layout mismatch above. Runs two loops:
+   - **Passive**: reads `GlitchEvent`s from the ring buffer and prints them (🔴 loss / ⚠️ stall) — unreliably, given both issues above.
+   - **Active** (`runActiveMonitoring`, every 5s): calls `modem.Detect`/`modem.GetSignal`/`modem.GetCellInfo` for radio status, and `twamp.Measure` (native Go sender, `twamp/` package — no longer shells out to `twampy`/Python) for RTT/jitter/loss. This half is unaffected by the eBPF issues above and still works.
+
+**Struct layout coupling**: Go's `GlitchEvent` (main.go) must match the C `glitch_event` (tc_glitch.bpf.c) field-for-field — events are decoded with `binary.Read` little-endian. (`glitch/glitch.go`'s own `wireEvent` is the up-to-date equivalent for the current struct layout.)
