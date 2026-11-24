@@ -456,8 +456,11 @@ func drainPort(f *os.File) {
 // reasoning as gps/mmcli.go's parseMmcliKeyValue.
 func atTransact(dev, cmd string, timeout time.Duration, isComplete func(string) bool) (string, error) {
 	// Port setup (raw, no echo, flushed) without an external stty — see
-	// modem.OpenRawSerial for why stty could hang here.
-	f, err := modem.OpenRawSerial(dev, os.O_RDWR)
+	// modem.OpenRawSerial for why stty could hang here. Bounded by the
+	// same timeout as the whole exchange, so a setup call stuck in the
+	// kernel can't hang the poll loop (and with it SIGTERM handling);
+	// a late-arriving file is closed by the setup goroutine itself.
+	f, err := openSerialBounded(dev, os.O_RDWR, timeout)
 	if err != nil {
 		return "", err
 	}
@@ -501,6 +504,31 @@ func atTransact(dev, cmd string, timeout time.Duration, isComplete func(string) 
 		return r.s, nil
 	case <-time.After(timeout):
 		return "", fmt.Errorf("timeout waiting for response from %s", dev)
+	}
+}
+
+// openSerialBounded is modem.OpenRawSerial with a deadline — see
+// atTransact.
+func openSerialBounded(dev string, flag int, timeout time.Duration) (*os.File, error) {
+	type result struct {
+		f   *os.File
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		f, err := modem.OpenRawSerial(dev, flag)
+		ch <- result{f, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.f, res.err
+	case <-time.After(timeout):
+		go func() {
+			if res := <-ch; res.f != nil {
+				res.f.Close()
+			}
+		}()
+		return nil, fmt.Errorf("timeout setting up serial port %s", dev)
 	}
 }
 

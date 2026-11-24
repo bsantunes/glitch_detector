@@ -106,7 +106,23 @@ type NMEAReader struct {
 	mu       sync.Mutex
 	fix      Fix
 	lastSeen time.Time
+	started  time.Time
 }
+
+// openNMEAPort is the port-setup function the reader uses — a package
+// variable only so tests can substitute one that blocks forever (see
+// TestNMEAReader_CloseWithStuckSetup).
+var openNMEAPort = func(dev string) (*os.File, error) {
+	return modem.OpenRawSerial(dev, os.O_RDONLY)
+}
+
+// nmeaCloseTimeout bounds how long Close waits for the background
+// reader to stop. Port setup is a kernel call that can't be cancelled
+// from Go (v2.3.1's stty subprocess hung in set_termios for good, and
+// the reader's Close then hung with it, so SIGTERM never stopped
+// gps-tool/gps-exporter); past this bound Close gives up on the
+// goroutine instead, and process exit reclaims it.
+var nmeaCloseTimeout = 2 * time.Second
 
 // OpenNMEAReader starts reading dev in the background immediately;
 // errors opening the port surface through the logged reopen loop, not
@@ -114,7 +130,7 @@ type NMEAReader struct {
 // (modem still booting) is expected to become available shortly.
 func OpenNMEAReader(ctx context.Context, dev string) *NMEAReader {
 	ctx, cancel := context.WithCancel(ctx)
-	r := &NMEAReader{dev: dev, cancel: cancel, done: make(chan struct{})}
+	r := &NMEAReader{dev: dev, cancel: cancel, done: make(chan struct{}), started: time.Now()}
 	go r.run(ctx)
 	return r
 }
@@ -148,10 +164,8 @@ func (r *NMEAReader) run(ctx context.Context) {
 const nmeaReadDeadline = 500 * time.Millisecond
 
 func (r *NMEAReader) readOnce(ctx context.Context) error {
-	// Port setup (raw, no echo, flushed) without an external stty — see
-	// modem.OpenRawSerial for why stty hung here on aaeon's SIM8202G.
-	f, err := modem.OpenRawSerial(r.dev, os.O_RDONLY)
-	if err != nil {
+	f, err := r.open(ctx)
+	if err != nil || f == nil {
 		return err
 	}
 	defer f.Close()
@@ -174,6 +188,34 @@ func (r *NMEAReader) readOnce(ctx context.Context) error {
 			}
 			return err
 		}
+	}
+}
+
+// open runs port setup (raw, no echo, flushed — modem.OpenRawSerial,
+// no external stty) in its own goroutine so a setup call stuck in the
+// kernel can't keep the reader from noticing shutdown: on ctx.Done()
+// it returns (nil, nil) immediately and the setup goroutine closes
+// whatever it eventually gets.
+func (r *NMEAReader) open(ctx context.Context) (*os.File, error) {
+	type result struct {
+		f   *os.File
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		f, err := openNMEAPort(r.dev)
+		ch <- result{f, err}
+	}()
+	select {
+	case res := <-ch:
+		return res.f, res.err
+	case <-ctx.Done():
+		go func() {
+			if res := <-ch; res.f != nil {
+				res.f.Close()
+			}
+		}()
+		return nil, nil
 	}
 }
 
@@ -245,8 +287,26 @@ func (r *NMEAReader) Fix() Fix {
 	return r.fix
 }
 
+// streamAge reports how long it has been since the last parsed RMC/GGA
+// sentence (or since the reader started, if none has arrived yet).
+func (r *NMEAReader) streamAge() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	last := r.lastSeen
+	if last.IsZero() {
+		last = r.started
+	}
+	return time.Since(last)
+}
+
+// Close stops the background reader, waiting at most nmeaCloseTimeout
+// (see there) so shutdown can never hang on a misbehaving port.
 func (r *NMEAReader) Close() error {
 	r.cancel()
-	<-r.done
+	select {
+	case <-r.done:
+	case <-time.After(nmeaCloseTimeout):
+		log.Printf("gps: [%s] NMEA reader did not stop within %s (port setup stuck in the kernel?) — abandoning it", r.dev, nmeaCloseTimeout)
+	}
 	return nil
 }
