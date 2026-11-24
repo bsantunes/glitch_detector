@@ -51,7 +51,7 @@ func main() {
 	interval := flag.Duration("interval", 30*time.Second, "how often to poll for a GPS fix and push to InfluxDB")
 	method := flag.String("method", "auto", "detection method: auto (default), mm (ModemManager only), at (AT-over-serial only)")
 	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/dawn-gps, or usb:<vid>:<pid>:<ifnum> e.g. usb:2c7c:0801:03 to survive ttyUSB numbers shifting across a reboot); requires -method=at")
-	nmeaPort := flag.String("nmea-port", "", "read fixes from this NMEA port instead of AT+CGPSINFO/AT+QGPSLOC=2 (same forms as -port; typically the modem's interface 01) — AT still starts the engine and assistance data; requires -method=at")
+	nmeaPort := flag.String("nmea-port", "", "read fixes from this NMEA port instead of AT+CGPSINFO/AT+QGPSLOC=2 (same forms as -port; typically the modem's interface 01) — AT still starts the engine and assistance data, and is polled instead while the NMEA stream is stale (no sentence for 5s); requires -method=at")
 	agps := flag.Bool("agps", true, "send the XTRA assistance-data enable command on AT-over-serial backends before starting the engine; the setting itself is stored in the modem and persists across reboots, so -agps=false only skips sending the command, it does not turn off assistance data already enabled")
 	influxURL := flag.String("influx-url", "", "InfluxDB base URL, e.g. https://wservices.wavesys.pt:8086 (required)")
 	influxToken := flag.String("influx-token", "", "InfluxDB API token (falls back to INFLUX_TOKEN env var)")

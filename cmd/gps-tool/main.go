@@ -27,7 +27,7 @@ func main() {
 	interval := flag.Duration("interval", 10*time.Second, "polling interval for GPS fixes")
 	method := flag.String("method", "auto", "detection method: auto (default), mm (ModemManager only), at (AT-over-serial only)")
 	port := flag.String("port", "", "pin AT-over-serial to this exact device (e.g. /dev/ttyUSB3, or usb:<vid>:<pid>:<ifnum> e.g. usb:2c7c:0801:03 to survive ttyUSB numbers shifting across a reboot); requires -method=at")
-	nmeaPort := flag.String("nmea-port", "", "read fixes from this NMEA port instead of AT+CGPSINFO/AT+QGPSLOC=2 (same forms as -port; typically the modem's interface 01) — AT still starts the engine and assistance data; requires -method=at")
+	nmeaPort := flag.String("nmea-port", "", "read fixes from this NMEA port instead of AT+CGPSINFO/AT+QGPSLOC=2 (same forms as -port; typically the modem's interface 01) — AT still starts the engine and assistance data, and is polled instead while the NMEA stream is stale (no sentence for 5s); requires -method=at")
 	agps := flag.Bool("agps", true, "send the XTRA assistance-data enable command on AT-over-serial backends before starting the engine; the setting itself is stored in the modem and persists across reboots, so -agps=false only skips sending the command, it does not turn off assistance data already enabled")
 	showVersion := flag.Bool("version", false, "print version and exit")
 	flag.Parse()

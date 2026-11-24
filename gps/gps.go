@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"time"
 
 	"dawn-agent/modem"
 )
@@ -156,7 +157,18 @@ type Poller struct {
 	session  *QMISession // nil for ModemManager/AT
 	atVendor atGPSVendor // atGPSVendorUnknown for ModemManager/QMI
 	nmea     *NMEAReader // non-nil only for an AT-backed poller given -nmea-port
+
+	// atFallback reads a fix over AT; used instead of the NMEA reader
+	// while its stream is stale (see Fix). A field only so tests can
+	// substitute it.
+	atFallback func() (Fix, error)
+	onAT       bool // currently falling back to AT (for logging switches)
 }
+
+// nmeaStaleAfter is how long the NMEA stream may go without a parsed
+// RMC/GGA sentence before Fix falls back to AT polling. Both modems
+// emit sentences every second while the stream is alive.
+var nmeaStaleAfter = 5 * time.Second
 
 // NewPoller sets up GPS polling for m. For ModemManager, this enables
 // the gps-raw location source (best-effort, retried — see
@@ -179,7 +191,9 @@ type Poller struct {
 // nmeaPort, if non-empty, opens a background NMEAReader on the
 // modem's dedicated NMEA port (already resolved to a real device path
 // by the caller — see modem.ResolvePort — same as -port itself) and
-// makes Fix prefer it over the AT request/response path. Only valid
+// makes Fix prefer it over the AT request/response path while its
+// stream is alive, falling back to AT while it is stale (see
+// fixNMEAOrAT). Only valid
 // together with method AT (m.Method == modem.MethodAT); NewPoller
 // doesn't enforce that itself — see DetectWithMethod/cmd/ layer for
 // the -nmea-port/-method validation — it simply has no effect for any
@@ -200,6 +214,7 @@ func NewPoller(ctx context.Context, m modem.Modem, agps bool, nmeaPort string) (
 			return nil, err
 		}
 		p := &Poller{m: m, atVendor: vendor}
+		p.atFallback = func() (Fix, error) { return getFixAT(p.m, p.atVendor) }
 		if nmeaPort != "" {
 			p.nmea = OpenNMEAReader(ctx, nmeaPort)
 		}
@@ -213,12 +228,13 @@ func NewPoller(ctx context.Context, m modem.Modem, agps bool, nmeaPort string) (
 
 // Fix returns the current GPS fix for this poller's modem. The NMEA
 // reader, when configured (see NewPoller's nmeaPort), is preferred
-// over everything else; otherwise this makes a fresh mmcli/AT call,
+// over everything else while its stream is alive (AT fallback while
+// stale — see fixNMEAOrAT); otherwise this makes a fresh mmcli/AT call,
 // or for QMI, an instant read of the background session's cache (see
 // QMISession.Fix).
 func (p *Poller) Fix(ctx context.Context) (Fix, error) {
 	if p.nmea != nil {
-		return p.nmea.Fix(), nil
+		return p.fixNMEAOrAT()
 	}
 	if p.session != nil {
 		return p.session.Fix()
@@ -227,6 +243,29 @@ func (p *Poller) Fix(ctx context.Context) (Fix, error) {
 		return getFixAT(p.m, p.atVendor)
 	}
 	return getFixModemManager(ctx, p.m)
+}
+
+// fixNMEAOrAT returns the NMEA reader's fix while its stream is alive,
+// and falls back to AT polling while it is stale (no parsed sentence
+// for nmeaStaleAfter: port gone, reader stuck, NMEA output disabled).
+// Each switch is logged once. Required before -nmea-port is used on a
+// modem whose AT position commands do work (dawn6g's Quectel); on
+// aaeon's SIM8202G, AT never reports a fix, so the fallback only ever
+// yields "no fix" there.
+func (p *Poller) fixNMEAOrAT() (Fix, error) {
+	age := p.nmea.streamAge()
+	if age <= nmeaStaleAfter {
+		if p.onAT {
+			log.Printf("gps: [%s] NMEA stream alive again — switching back from AT to NMEA", p.m.Port)
+			p.onAT = false
+		}
+		return p.nmea.Fix(), nil
+	}
+	if !p.onAT {
+		log.Printf("gps: [%s] NMEA stream stale (no sentence for %s) — falling back to AT polling", p.m.Port, age.Round(time.Second))
+		p.onAT = true
+	}
+	return p.atFallback()
 }
 
 // Close releases any resources this poller holds (the QMI backend's
