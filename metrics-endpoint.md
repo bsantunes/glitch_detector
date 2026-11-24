@@ -149,7 +149,7 @@ with meaningless zeros.
 | `altitude` | float | meters | — |
 | `speed_knots` | float | knots | Additive, NMEA-reader-only (see below) — NaN-omitted. |
 | `course_deg` | float | degrees | Additive, NMEA-reader-only — NaN-omitted. |
-| `hdop` | float | — | Additive, NMEA-reader-only — NaN-omitted. |
+| `hdop` | float | — | Additive, NMEA-reader-only — NaN-omitted. **Caveat:** a GGA HDOP of `500` (the receiver's "unknown") is currently written as a real value (seen on `aaeon`'s first NMEA point, 2026-11-24); from `v2.3.3` it will be omitted instead. Until then, ignore `hdop >= 500` in queries/panels. |
 | `satellites` | int | count | Additive, NMEA-reader-only. |
 
 Tags: `device`, `modem_id`, `method` (`"ModemManager"` or `"AT"` — raw QMI

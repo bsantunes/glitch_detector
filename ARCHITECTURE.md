@@ -94,7 +94,7 @@ telemetry stack).
 ## Current pipeline (`glitch/` package — supersedes the diagram above)
 
 ```
-┌────────────── GATEWAY, glitch-tool / glitch-exporter (glitch/ package) ──────────────┐
+┌──────── GATEWAY, glitch-tool / glitch-exporter (glitch/, glitch/core, glitch/afpacket) ────────┐
 │                                                                                       │
 │  ═══ KERNEL SPACE — bpf_src/tc_glitch.bpf.c (same source file as the diagram above,  │
 │       dawn-agent's own decode logic just never caught up to its later changes) ═══   │
@@ -129,18 +129,34 @@ telemetry stack).
 │  │   └─ RETRANS event ──────────────────────────┼──▶ events (BPF_MAP_TYPE_RINGBUF, 16KiB)│
 │  └───────────────────────────────────────────────────────────────────────────────────┘   │
 │                                                           │                                │
-│  ═══ USER SPACE — glitch/glitch.go ═══                   ▼                                │
-│  Open(iface): loads both programs, attaches both hooks, reads the ring buffer,           │
-│  decodes wireEvent (48 bytes, little-endian) → Event{Time, SrcIP, DstIP, SrcPort,        │
-│  DstPort, Value, Baseline, Type, Steps, Proto}. Events()/Dropped()/Close().               │
+│  ═══ USER SPACE — two interchangeable capture backends behind glitch.Source ═══         │
+│  (Events() / RetransCount() / Dropped() / Err() / Close(); picked with -capture)          │
+│                                                                                           │
+│  -capture ebpf (default; Debian/aaeon)        -capture afpacket (WaveOS/dawn6g — no       │
+│  glitch/glitch.go, Handle                      clsact/TC-BPF in that kernel)              │
+│  Open(iface): loads both programs above,       glitch/afpacket, Capture                   │
+│  attaches both hooks, reads the ring buffer,   Open(iface): TPACKET_V3 ring + classic     │
+│  decodes wireEvent (48 bytes, little-endian).  BPF filter (TCP + opted-in UDP ports),     │
+│  RETRANS records are only counted              no eBPF at all. Every packet goes to       │
+│  (retransCount) — not forwarded as Events.     glitch/core.Engine: the same algorithm    │
+│  Lock: /var/run/glitch-<iface>.lock            as tc_glitch.bpf.c, ported to Go          │
+│                                                (stalls, ACK gate, retrans counted        │
+│                                                directly; bounded flow table: idle expiry, │
+│                                                10k cap, stall_abandoned on eviction).     │
+│                                                Lock: /var/run/glitch-afpacket-<iface>.lock│
+│                                                (/var/run — WaveOS has no /run)            │
 │       │                                        │                                          │
-│       ▼                                        ▼                                          │
+│       └──────────── Event{Time, SrcIP, DstIP, SrcPort, DstPort, Value, Baseline,          │
+│                     Type (stall start/end/abandoned), Steps, Proto} ───┐                  │
+│                                                                        ▼                  │
 │  cmd/glitch-tool                      cmd/glitch-exporter                                 │
-│  prints 🔴/🟡/✅ to stdout             aggregates (see Aggregator, cmd/glitch-exporter/     │
-│  forever, no InfluxDB                 aggregate.go) → glitch_summary (heartbeat,          │
-│                                        every -interval) + glitch_event (rate-limited,     │
-│                                        stall_start/stall_end/stall_abandoned) → InfluxDB  │
-│                                        "network" bucket via async WriteAPI                │
+│  prints 🟡 START / ✅ END / 💀        aggregates (see Aggregator, cmd/glitch-exporter/     │
+│  ABANDONED per episode, plus a 📊     aggregate.go) → glitch_summary (heartbeat, every    │
+│  running total every 5 s:             -interval, incl. retrans_count from RetransCount()  │
+│  retrans=<cumulative> dropped=<n>     and the kernel/user/write-queue drop counters) +    │
+│  (+ kernel/user/untruncated_over_     glitch_event (rate-limited, stall_start/stall_end/  │
+│  limit for afpacket). No per-retrans  stall_abandoned) → InfluxDB "network" bucket via a  │
+│  lines. No InfluxDB.                  bounded write queue                                 │
 └─────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -230,14 +246,34 @@ gps.Detect(ctx)
   │
   └─ 3. AT-over-serial (gps/at.go) — the backend actually deployed.
         SIMCom (AT+CGPS=1,1 / AT+CGPSINFO) or Quectel (AT+QGPS=1 /
-        AT+QGPSLOC=2), chosen via detectATGPSVendor. Confirmed live,
-        sustained, zero errors on 6global/dawn6g (no fix — no GPS
-        antenna on either board) and confirmed to obtain a real fix on
-        aaeon's SIMCom modem via manual testing (41.549747, -8.413069)
-        — but only once SIMCom's XTRA assistance data was also enabled
-        (AT+CGPSXE=1); the engine alone tracked satellites but never
-        resolved a position. modem.PortInUse skips any serial port
-        another process already has open.
+        AT+QGPSLOC=2), chosen via detectATGPSVendor. AT always starts
+        the GNSS engine and XTRA assistance data (AT+CGPSXE=1 on
+        SIMCom). modem.PortInUse skips any serial port another process
+        already has open. Ports are set up with modem.OpenRawSerial
+        (direct termios: raw, no echo, TCSANOW, then flush — no
+        external stty since v2.3.2).
+
+Fix source, per poll (gps.Poller.Fix), once the AT poller exists:
+
+  -nmea-port set? ── no ──▶ AT position query every poll
+        │                   (AT+CGPSINFO / AT+QGPSLOC=2)
+       yes
+        ▼
+  NMEAReader (gps/nmea.go): background reader on the modem's NMEA
+  port (interface 01), keeps the latest RMC (validity, lat/lon,
+  speed, course) + GGA (satellites, HDOP, altitude).
+        │
+  stream alive? (an RMC/GGA sentence within the last 5 s)
+        ├─ yes ─▶ NMEA fix (source="nmea"; RMC "A"/"V" decides Valid)
+        └─ no ──▶ AT fallback for this poll (each switch logged once,
+                   back to NMEA as soon as sentences resume) — v2.3.2+
+
+Which board uses which:
+  aaeon  — SIMCom SIM8202G: -nmea-port usb:1e0e:9001:01. Its AT
+           position commands (AT+CGPSINFO, AT+CGNSSINFO) report no
+           fix even while the NMEA port has one.
+  dawn6g — Quectel RM520N-GL: AT only (-port usb:2c7c:0801:03); its
+           AT fixes arrive, and its NMEA streaming is unresolved.
 ```
 
 `gps.Detect` does **not** reuse `modem.Detect()`'s own cascade result or
@@ -254,8 +290,8 @@ issue despite earlier documentation having theorized that it was.
 shape: detect, then poll on an interval (`gps-tool` prints forever, no
 InfluxDB; `gps-exporter` pushes `gps_fix` points to InfluxDB's `location`
 bucket, only when a fix is valid — see `metrics-endpoint.md`). `gps-exporter`
-is deployed and running on `6global`/`dawn6g`; `gps-tool` isn't installed
-anywhere as a running service.
+runs on `dawn6g` (AT) and `aaeon` (NMEA, `v2.3.2`); `6global` is switched
+off. `gps-tool` isn't installed anywhere as a running service.
 
 ## How the two measurement paths complement each other
 

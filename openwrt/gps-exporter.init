@@ -49,7 +49,12 @@ PROG=/opt/dawn/gps-exporter
 ENV_FILE=/opt/dawn/modem-exporter.env
 
 # Per-device identity — adjust per board.
-DEVICE_ID=dawn6g
+# Device ID: none is passed by default, so the exporter tags its data
+# with this board's hostname (`uname -n`) — make sure that matches the
+# ID provisioned with add-device.sh. To set it explicitly instead,
+# uncomment and edit:
+# DEVICE_ID=dawn6g
+DEVICE_ID=
 INFLUX_URL=https://wservices.wavesys.pt:8086
 INFLUX_ORG=wavecom
 INFLUX_BUCKET=location
@@ -67,8 +72,8 @@ start_service() {
 		-interval 30s \
 		-influx-url "$INFLUX_URL" \
 		-influx-org "$INFLUX_ORG" \
-		-influx-bucket "$INFLUX_BUCKET" \
-		-device-id "$DEVICE_ID"
+		-influx-bucket "$INFLUX_BUCKET"
+	[ -n "$DEVICE_ID" ] && procd_append_param command -device-id "$DEVICE_ID"
 	procd_set_param env INFLUX_TOKEN="$INFLUX_TOKEN"
 	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}
 	procd_set_param stdout 1

@@ -7,7 +7,7 @@ A high-performance, eBPF-powered 5G gateway agent. It provides active/passive ne
 ## 🌟 Features
 - **Passive Monitoring:** eBPF-based detection of TCP retransmissions and stall episodes, judged against each flow's own adaptive pacing baseline (a fixed 100ms floor for flows with no established pace yet) rather than a single fixed threshold — see [glitch-tool's output](#4-glitch-tool-output) below.
 - **Active Auditing:** Multi-profile TWAMP (RFC 5357) to measure 5QI slice performance.
-- **Hardware Integration:** Real-time RSRP/RSRQ/RSSI/SINR extraction with automatic modem detection — tries ModemManager, then QMI/MBIM, then raw AT, so it isn't locked to one modem vendor.
+- **Hardware Integration:** Real-time RSRP/RSRQ/RSSI/SINR extraction with automatic modem detection — tries ModemManager, then `ubus` (WaveOS's `uqmi-ubus` daemon), then QMI/MBIM, then `uqmi`, then raw AT, so it isn't locked to one modem vendor.
 - **QoS Enforcement:** Dynamic traffic shaping (HTB) to protect critical flows (DSCP EF) during congestion.
 - **Telemetry:** Asynchronous data push to InfluxDB 2.x with Grafana visualization.
 - **Roaming Aware:** Intelligent behavior switching between Private NPN and Public carriers.
@@ -17,9 +17,11 @@ A high-performance, eBPF-powered 5G gateway agent. It provides active/passive ne
 ### 1. Prerequisites (x86 Linux gateway)
 ```bash
 sudo apt update
-sudo apt install clang llvm libbpf-dev golang modemmanager python3-pip -y
-pip3 install twampy --break-system-packages
+sudo apt install clang llvm libbpf-dev golang modemmanager -y
 ```
+
+(No Python needed: the TWAMP sender is native Go — the `twamp/` package —
+not the old `twampy` dependency.)
 
 **A high-precision network diagnostic tool for 5G Gateways and Embedded Linux.**
 
@@ -253,11 +255,22 @@ then.
 
 ### 5. Modem Detection
 
-On startup, `dawn-agent` auto-detects whatever modem is present instead of
-assuming a fixed ModemManager index. It tries, in order, **ModemManager**
-(`mmcli`), then **QMI/MBIM** (`qmicli`/`mbimcli`), then raw **AT** commands
-over serial — stopping at the first backend that finds a modem. You'll see
-what it found logged at startup:
+On startup, `modem-exporter`/`modem-tool` (and the superseded `dawn-agent`)
+auto-detect whatever modem is present instead of assuming a fixed
+ModemManager index. The cascade (`modem.Detect`) tries, in order:
+
+1. **ModemManager** (`mmcli`) — Debian boards like `aaeon`.
+2. **`ubus`** — WaveOS's own `uqmi-ubus` daemon (`ubus call qmi metrics`);
+   preferred on WaveOS because it avoids opening a competing QMI client.
+3. **QMI/MBIM** (`qmicli`/`mbimcli`).
+4. **`uqmi`** — OpenWrt's lightweight QMI client, for systems that have it
+   but not `qmicli`/`mbimcli`.
+5. Raw **AT** commands over serial.
+
+It stops at the first backend that finds a modem. `modem-exporter` also
+re-runs detection periodically and falls back to the next method if the
+current one stops answering or goes stale (see `CLAUDE.md` and the
+`modem-detection` skill). `dawn-agent`'s startup log looked like this:
 
 ```
 📶 Modem detected: [0] QUALCOMM INCORPORATED 0 (via ModemManager)

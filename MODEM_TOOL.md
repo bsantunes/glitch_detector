@@ -9,10 +9,13 @@ it can be built and run on its own, on a different device than the gateway.
 ## Prerequisites
 
 - **OS: Linux.** It shells out to Linux-specific tools (`mmcli`, `qmicli`,
-  `mbimcli`, `stty`) and paths (`/dev/ttyUSB*`, `/dev/cdc-wdm*`), so it won't
-  work on macOS/Windows.
+  `mbimcli`, `uqmi`, `ubus`) and uses Linux-specific paths (`/dev/ttyUSB*`,
+  `/dev/cdc-wdm*`) and serial ioctls, so it won't work on macOS/Windows.
 - **Go toolchain, 1.21+ recommended.** The `modem/` and `cmd/modem-tool` code
-  itself has **zero third-party dependencies** — standard library only.
+  has **one third-party dependency**: `golang.org/x/sys/unix`, for direct
+  serial-port setup (`modem.OpenRawSerial`, raw mode via termios ioctls —
+  replaced the external `stty` in `v2.3.2`). Its version is pinned in the
+  repo's `go.mod`.
 - **Root/sudo to actually run it.** `mmcli --signal-setup` (ModemManager path)
   and direct QMI/MBIM/AT device access both require it.
 - Optional, only needed for detection to actually find something (install
@@ -24,27 +27,35 @@ it can be built and run on its own, on a different device than the gateway.
     isn't managing. (On OpenWrt-based systems, `qmicli` may already be bundled
     with the `libqmi` package itself rather than a separate `-utils` package —
     check with `which qmicli` rather than the package manager alone.)
+  - **`ubus`** — on WaveOS, the `uqmi-ubus` daemon's `qmi` object
+    (`ubus call qmi metrics`). Tried right after ModemManager and preferred
+    on WaveOS, since it reads the daemon's own data instead of opening a
+    competing QMI client. Nothing to install: it's part of WaveOS.
   - **`uqmi`** — OpenWrt's own lightweight QMI client; used as a further
     fallback on systems (like WaveOS) that have it but not `qmicli`/`mbimcli`.
-  - `stty` — part of coreutils, present on essentially every Linux system
-    already; used for the raw-AT-over-serial fallback.
+  - Raw AT over serial needs nothing extra (no `stty` since `v2.3.2`).
+
+  The cascade order is ModemManager → `ubus` → QMI/MBIM → `uqmi` → AT.
 
 ## Files needed
 
 Just two directories from this repo — nothing else:
 
 ```
+go.mod, go.sum   (pins golang.org/x/sys)
+version/         (cmd/modem-tool imports dawn-agent/version)
 modem/
   types.go
   detect.go
   mmcli.go
+  ubus.go
   qmi.go
   uqmi.go
   at.go
-  mmcli_test.go   (optional — only needed to run `go test`)
-  qmi_test.go     (optional)
-  uqmi_test.go    (optional)
-  at_test.go      (optional)
+  usbport.go
+  serial_linux.go
+  serial_other.go
+  *_test.go       (optional — only needed to run `go test`)
 cmd/modem-tool/
   main.go
 ```
@@ -58,14 +69,12 @@ make modem-tool
 sudo ./modem-tool
 ```
 
-**Caveat:** `make modem-tool` depends on the same `deps` Makefile target as
-the full `dawn-agent` build, so it will also fetch `cilium/ebpf`,
-`vishvananda/netlink` and the InfluxDB client — none of which `modem-tool`
-actually uses. That's harmless but pulls in extra network dependencies and,
-on an older Go toolchain, may force a Go version bump (`cilium/ebpf`
-currently requires Go 1.25+). If the target device is offline, has an older
-Go toolchain you don't want to touch, or you just don't want the extra
-weight, use Option B instead.
+`go.mod`/`go.sum` are committed, so this builds against pinned versions;
+`go build` only downloads modules `modem-tool` actually imports
+(`golang.org/x/sys`). The `go` directive in `go.mod` (1.25.0) may make an
+older toolchain fetch a newer one. If the device is offline or you don't
+want that, use Option B, or cross-compile elsewhere (see the WaveOS section
+below).
 
 ## Option B — copy just the modem-tool files (minimal, no unrelated dependencies)
 
@@ -74,23 +83,24 @@ weight, use Option B instead.
    and `cmd/modem-tool/` under the destination folder):
 
    ```bash
-   rsync -avR modem cmd/modem-tool user@device:~/modem-tool/
+   rsync -avR go.mod go.sum version modem cmd/modem-tool user@device:~/modem-tool/
    ```
 
    (Swap in `scp -r` + manual directory creation, or a USB drive, if `rsync`
-   isn't available — the only requirement is that `modem/` and
-   `cmd/modem-tool/` end up as siblings on the target.)
+   isn't available — the only requirement is that these end up side by side
+   on the target, at the same relative paths.)
 
 2. On the target device:
 
    ```bash
    cd ~/modem-tool
-   go mod init dawn-agent          # module name MUST be "dawn-agent" —
-                                    # cmd/modem-tool/main.go imports "dawn-agent/modem"
    go build -o modem-tool ./cmd/modem-tool
    ```
 
-   No `go get` is needed — there are no third-party imports to resolve.
+   The copied `go.mod` already names the module `dawn-agent` (the import
+   path `cmd/modem-tool` uses), so no `go mod init` is needed. The first
+   build downloads `golang.org/x/sys` at the version `go.mod` pins; on an
+   offline device, cross-compile elsewhere instead.
 
 3. Run it:
 
@@ -220,9 +230,9 @@ shows N/A/unknown rather than garbage.
 - **`mbimcli` errors with "device is closed"** — normal if the modem is
   QMI-only (as the SIM8202G-M2 is); MBIM will never work on such a modem,
   and that's expected, not a bug.
-- **`stty: ... unable to perform all requested operations`** printed to
-  stderr during AT detection — harmless; the code logs it and continues,
-  since the serial port typically still works fine afterward.
+- **`stty: ... unable to perform all requested operations`** — only from
+  builds before `v2.3.2`, which shelled out to `stty`; harmless there.
+  `v2.3.2`+ sets the port up directly and never prints it.
 
 ## Optional: run the unit tests too
 
@@ -232,6 +242,7 @@ If you copied the `*_test.go` files as well:
 go test ./modem/... -v
 ```
 
-These are pure parser tests (no external tools or hardware required) —
+These are mostly pure parser tests (no external tools or hardware required) —
 several are built directly from real `mmcli`/`qmicli` output captured during
-development.
+development — plus one Linux-only serial-setup test that uses a pty pair
+(`serial_linux_test.go`; still no modem needed).

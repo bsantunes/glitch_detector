@@ -180,17 +180,22 @@ What the two extra exporters run (matching `dawn6g`):
   arrive fine there. (`dawn6g`'s installed copy pins `/dev/ttyUSB10`, the same
   interface today; new installs should use the `usb:` form.)
 
-On the device, **before enabling anything**, edit all four exporter init
-scripts to set the real `DEVICE_ID` (they ship with a placeholder — see each
-file's `DEVICE_ID=...` line near the top; `glitch-exporter` also has `IFACE`)
-and create the shared token file, reused by all four exporters:
+On the device, **before enabling anything**, check the device ID and create
+the shared token file, reused by all four exporters. The exporter init
+scripts pass **no `-device-id` by default**, so each exporter tags its data
+with the board's hostname (`uname -n`). If the hostname already is the
+device ID you provisioned in step 1 (true on `dawn6g` and `aaeon`), there's
+nothing to edit; otherwise set `DEVICE_ID=` (commented example near the top
+of each script) in all four. `glitch-exporter` also has `IFACE`, and
+`gps-exporter` has `GPS_PORT`:
 
 ```bash
 ssh -p <port> root@<waveos-ip>
-vi /etc/init.d/modem-exporter   # set DEVICE_ID=<device-id>
-vi /etc/init.d/twamp-exporter   # set DEVICE_ID=<device-id> (same value)
-vi /etc/init.d/glitch-exporter  # set DEVICE_ID=<device-id>, IFACE=<traffic iface>
-vi /etc/init.d/gps-exporter     # set DEVICE_ID=<device-id>; check GPS_PORT
+uname -n                        # must equal <device-id>, or set DEVICE_ID= below
+vi /etc/init.d/glitch-exporter  # IFACE=<traffic iface> (and DEVICE_ID= if needed)
+vi /etc/init.d/gps-exporter     # check GPS_PORT (and DEVICE_ID= if needed)
+# only if the hostname isn't the device ID:
+# vi /etc/init.d/modem-exporter /etc/init.d/twamp-exporter   # DEVICE_ID=<device-id>
 
 cat > /opt/dawn/modem-exporter.env <<'EOF'
 INFLUX_TOKEN=<paste the token from step 1>
@@ -279,10 +284,14 @@ list` while debugging a separate "no data" issue, not assumed.
 - **Use `add-device.sh`, never create the token by hand** — see step 1.
 - **WaveOS exporters share one token file** (`/opt/dawn/modem-exporter.env`)
   — don't create a separate one for `twamp-exporter`; it reads the same file.
-- **Set `DEVICE_ID` in *every* WaveOS exporter init script** (`modem-exporter`,
-  `twamp-exporter`, `glitch-exporter`, `gps-exporter`) — they ship with a
-  placeholder value that will silently mislabel your data under the wrong
-  device tag if left unedited.
+- **Device ID defaults to the hostname.** All four WaveOS exporter init
+  scripts (`modem-exporter`, `twamp-exporter`, `glitch-exporter`,
+  `gps-exporter`) ship with `DEVICE_ID` empty and then pass no `-device-id`,
+  so each exporter uses `uname -n` — consistent across all four, and no
+  leftover placeholder (they used to default to `6global`, which silently
+  mislabelled data if left unedited). If a board's hostname isn't its
+  provisioned device ID, set `DEVICE_ID=` in all four scripts, or rename the
+  host.
 - **WaveOS has no `/run`** — anything writing runtime/lock files must use
   `/var/run` (see `glitch-exporter`'s AF_PACKET lock above).
 - **No SIM ≠ no data.** A SIM-less modem can still report real
