@@ -140,10 +140,21 @@ GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o glitch-exporter ./cmd/glitch-e
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o gps-exporter    ./cmd/gps-exporter
 ```
 
-Build from a tagged checkout (`git checkout vX.Y.Z`) and add
-`-ldflags "-X dawn-agent/version.Version=$(git describe --tags --always --dirty)"`
-to each line (the `Makefile` does this for native builds) so `-version` and
-the `agent_info` point report what's actually running.
+**Release builds: tag first, then build from a clean clone of the tag** (on
+`aaeon`, the build machine, in `~/build/<tag>`; never in `~/glitch_detector`,
+which only ever gets `git pull`). The `Makefile` stamps `git describe`, so a
+build from the tag reports exactly `vX.Y.Z` in `-version` and `agent_info`:
+
+```bash
+git clone --branch vX.Y.Z --depth 1 https://github.com/bsantunes/glitch_detector.git ~/build/vX.Y.Z
+cd ~/build/vX.Y.Z && make embed
+export GOOS=linux GOARCH=amd64 CGO_ENABLED=0 GOFLAGS=-mod=readonly
+make modem-exporter twamp-exporter gps-exporter glitch-exporter
+for b in *-exporter; do echo "$b $(./$b -version)"; done   # all must print vX.Y.Z
+```
+
+For the plain `go build` lines above, add
+`-ldflags "-X dawn-agent/version.Version=$(git describe --tags --always --dirty)"`.
 
 `CGO_ENABLED=0` matters: a normal `go build` is dynamically linked against
 the build host's glibc, which won't necessarily match WaveOS's. The static
@@ -161,7 +172,23 @@ scp -P <port> openwrt/glitch-exporter.init root@<waveos-ip>:/etc/init.d/glitch-e
 scp -P <port> openwrt/gps-exporter.init    root@<waveos-ip>:/etc/init.d/gps-exporter
 ```
 
-What the two extra exporters run (matching `dawn6g`):
+Only the four exporters run as services. Don't enable `modem-tool`/`twamp-tool`
+alongside them (6global had both running from an old install: a second
+modem poller and a second TWAMP sender).
+
+What the exporters run beyond the defaults (matching `dawn6g`/`6global`):
+
+- **`twamp-exporter`** (`v2.3.4`+): `REFLECTOR=51.91.57.3:862` and
+  `BIND_DEV=lte1` (`-bind-dev`, SO_BINDTODEVICE). On these boards ordinary
+  internet traffic uses `lte1` (metric 40), but everything to wservices goes
+  over the wired `br-wan`: WireGuard's `route_allowed_ips` adds a host route for
+  its endpoint `51.91.57.3` via `br-wan`, so InfluxDB writes go there directly
+  and `10.30.30.1` (through `wg0`) does too. Probing `10.30.30.1` therefore
+  measures the wired link, not cellular. Points carry `iface=lte1` when bound.
+  Check after install: a 50-packet `twamp-tool -bind-dev lte1 -reflector
+  51.91.57.3:862 -count 50 -probe-interval 10ms` burst must add ~50 to
+  `/sys/class/net/lte1/statistics/tx_packets` and ~0 to `br-wan`'s. The
+  reflector's 862/udp is allowed by an explicit ufw rule on wservices.
 
 - **`glitch-exporter`**: `-capture afpacket -iface lte1` (set `IFACE` in the
   init script to the interface actually carrying traffic — `lte1`/`mwan1` on
@@ -177,8 +204,9 @@ What the two extra exporters run (matching `dawn6g`):
   vendor/product/interface because `ttyUSB` numbers aren't stable across
   reboots on a two-modem board. **No `-nmea-port` on WaveOS**: the Quectel's
   NMEA streaming is unresolved (see the `gps-integration` skill); AT fixes
-  arrive fine there. (`dawn6g`'s installed copy pins `/dev/ttyUSB10`, the same
-  interface today; new installs should use the `usb:` form.)
+  arrive fine there. Confirm the GNSS antenna is on the Quectel first (old
+  fixes from `modem_id=/dev/ttyUSB10`, or `AT+QGPSLOC=2` on that port); if it
+  were on the SIMCom you'd use `-nmea-port usb:1e0e:9001:01` instead.
 
 On the device, **before enabling anything**, check the device ID and create
 the shared token file, reused by all four exporters. The exporter init
@@ -229,6 +257,7 @@ from(bucket:"radio") |> range(start:-5m)
   |> filter(fn:(r)=>r._measurement=="radio_cell" or r._measurement=="modem_state")
   |> last()'
 
+# twamp — on WaveOS, check iface=lte1 and reflector=51.91.57.3:862
 docker compose exec -T influxdb influx query '
 from(bucket:"network") |> range(start:-5m)
   |> filter(fn:(r)=>r.device=="<device-id>")
@@ -294,6 +323,30 @@ list` while debugging a separate "no data" issue, not assumed.
   host.
 - **WaveOS has no `/run`** — anything writing runtime/lock files must use
   `/var/run` (see `glitch-exporter`'s AF_PACKET lock above).
+- **SIM PIN.** If `logread` shows `netifd: mwanN: PIN not specified but
+  required` and the interface keeps restarting, the SIM is PIN-locked and no
+  PIN is configured. Read the retries first (`uqmi -s -d /dev/cdc-wdmN
+  --uim-get-sim-state`; stop if `pin1_verify_tries` < 2), verify once
+  (`uqmi -s -d /dev/cdc-wdmN --uim-verify-pin1 <pin>`), then disable the lock
+  (`qmicli -d /dev/cdc-wdmN --uim-set-pin-protection="PIN1,disable,<pin>"`;
+  WaveOS's `uqmi --set-pin1-protection` returns "Not supported"). `netifd`
+  then connects by itself. Done this way on 6global (2026-11-25); no PIN is
+  stored in the config.
+- **TWAMP to `10.30.30.1` measures the wired link on WaveOS** — use
+  `-bind-dev lte1` with `51.91.57.3:862` (see the exporter notes above).
+- **Test 3b on WaveOS** runs against the production `glitch-exporter` (no
+  `sudo`/`python3`/`glitch-tool` there): `iperf3 --bind-dev lte1` to
+  wservices plus the restricted-key `outage N`, scored from `glitch_summary`.
+  The script's port-8086 block does nothing on these boards (InfluxDB writes go
+  over `br-wan`, not the tested interface); the iperf outage itself is valid.
+  Needs a static `iperf3` in `/usr/bin` (copied from `dawn6g`) and the board's
+  own `id_ed25519_wservices_outage` key added to `idwave`'s
+  `~/.ssh/authorized_keys` on wservices with the same restrictions as the
+  other boards' lines:
+
+  ```
+  command="/home/idwave/bin/test3b-dispatch.sh",no-agent-forwarding,no-port-forwarding,no-X11-forwarding,no-pty ssh-ed25519 <pubkey> <board>-test3b-outage
+  ```
 - **No SIM ≠ no data.** A SIM-less modem can still report real
   RSRP/RSRQ/RSSI/SINR/PLMN/TAC/CellID by camping on a broadcasting cell's
   physical-layer system information — don't assume a missing SIM means the

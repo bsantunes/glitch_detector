@@ -5,7 +5,9 @@ description: The native Go TWAMP-Light sender in twamp/ and the wservices.wavesy
 
 # `twamp/` package
 
-Native Go sender for "TWAMP Light" (RFC 5357-style, unauthenticated, no TWAMP-Control handshake — direct UDP TWAMP-Test packets). `Measure(ctx, reflectorAddr, count, probeInterval, timeout) (Result, error)` sends a burst of packets and computes `Result{Sent, Received, AvgRTT, Jitter, LossPct}`.
+Native Go sender for "TWAMP Light" (RFC 5357-style, unauthenticated, no TWAMP-Control handshake — direct UDP TWAMP-Test packets). `Measure(ctx, reflectorAddr, bindDev, count, probeInterval, timeout) (Result, error)` sends a burst of packets and computes `Result{Sent, Received, AvgRTT, Jitter, LossPct}`. `bindDev` (`-bind-dev` on `twamp-exporter`/`twamp-tool`, since `v2.3.4`) pins the socket to an interface with SO_BINDTODEVICE (`twamp/bind_linux.go`); a missing interface fails the dial rather than falling back to normal routing. `twamp-exporter` adds an `iface` tag only when it's set.
+
+**On the WaveOS boards, use `-bind-dev lte1 -reflector 51.91.57.3:862`.** Traffic to wservices goes over the wired `br-wan` there (WireGuard's endpoint host route), so probing `10.30.30.1` through `wg0` measures the wired link, not cellular — all `twamp` data before 2026-11-25 21:20:29 UTC (`6global`) / 23:27:09 UTC (`dawn6g`) did exactly that (see CLAUDE.md). The reflector listens on `0.0.0.0:862`, and 862/udp has an explicit ufw rule on wservices, so the public address works the same.
 
 **Packet sizes deliberately diverge from RFC 5357's stated minimums** (`senderPacketLen = 14`, `reflectedHeaderLen = 38`, not the RFC's 41/41) — found via live `strace -f -e trace=network` on `twampy` itself, which showed the real deployed reflector (`10.30.30.1:862`) expects/sends packets smaller than the RFC minimums. This is intentional: it matches the actual wire behavior of this project's reflector, not the spec. If TWAMP is ever pointed at a different reflector and gets 100% loss, check packet sizes via `strace` again before assuming the sizes are wrong.
 
