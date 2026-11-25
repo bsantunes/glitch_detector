@@ -115,6 +115,23 @@ func TestNMEAReader_HandleLine_GGANeverTouchesValid(t *testing.T) {
 	}
 }
 
+func TestNMEAReader_HandleLine_GGAHDOP500ClearsHDOP(t *testing.T) {
+	// A later GGA with the receiver's "unknown" HDOP (500.0) must clear
+	// an earlier real HDOP, not leave it in place or write 500.
+	r := &NMEAReader{}
+	r.handleLine("$GPRMC,141950.00,A,4132.883130,N,00824.989479,W,,,191126,,,A*63")
+	r.handleLine("$GPGGA,141950,4132.883130,N,00824.989479,W,1,09,1.1,201.8,M,50.0,M,,*47")
+	r.handleLine("$GNGGA,141951,4132.883130,N,00824.989479,W,1,03,500.0,201.8,M,50.0,M,,*47")
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if !math.IsNaN(r.fix.HDOP) {
+		t.Errorf("HDOP = %v, want NaN after a GGA with HDOP 500", r.fix.HDOP)
+	}
+	if r.fix.Satellites != 3 || !r.fix.Valid {
+		t.Errorf("sats=%d valid=%v, want 3/true (only HDOP is unknown)", r.fix.Satellites, r.fix.Valid)
+	}
+}
+
 func TestNMEAReader_ConsumeLines_HandlesPartialLineAcrossReads(t *testing.T) {
 	r := &NMEAReader{}
 	var pending strings.Builder

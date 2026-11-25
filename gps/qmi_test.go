@@ -58,6 +58,30 @@ func TestParseNMEAGGA_NoFix_SatellitesAndHDOPUnknown(t *testing.T) {
 	}
 }
 
+func TestParseNMEAGGA_HDOP500IsUnknown(t *testing.T) {
+	// The receiver's "unknown" HDOP (500.0) must come out as NaN, so
+	// gps-exporter omits the hdop field instead of writing 500. Covers
+	// both a fix and a no-fix sentence; satellites stay as reported.
+	for _, line := range []string{
+		"$GNGGA,232032.00,4132.88186,N,00824.98502,W,1,03,500.0,201.8,M,50.2,M,,*48",
+		"$GNGGA,232032.00,,,,,0,00,500.0,,,,,,*4F",
+		"$GNGGA,232032.00,4132.88186,N,00824.98502,W,1,03,500,201.8,M,50.2,M,,*48",
+	} {
+		fix, ok := parseNMEAGGA(line)
+		if !ok {
+			t.Fatalf("parseNMEAGGA(%q): expected ok=true", line)
+		}
+		if !math.IsNaN(fix.HDOP) {
+			t.Errorf("parseNMEAGGA(%q): HDOP = %v, want NaN (500 = unknown)", line, fix.HDOP)
+		}
+	}
+	// A high but real HDOP (30.7 was seen on aaeon indoors) stays a value.
+	fix, _ := parseNMEAGGA("$GNGGA,232032.00,4132.88186,N,00824.98502,W,1,03,30.7,201.8,M,50.2,M,,*48")
+	if fix.HDOP != 30.7 {
+		t.Errorf("HDOP = %v, want 30.7", fix.HDOP)
+	}
+}
+
 func TestParseNMEAGGA_NotAGGASentence(t *testing.T) {
 	for _, line := range []string{
 		"$GPVTG,,T,,M,,N,,K,N*2C",

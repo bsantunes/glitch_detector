@@ -202,6 +202,13 @@ func (s *QMISession) Close() {
 // Format: $--GGA,time,lat,N|S,lon,E|W,quality,numSats,hdop,altitude,M,...
 // quality 0 means no fix — observed live (no antenna connected):
 // $GPGGA,,,,,,0,,,,,,,,*66
+// ggaHDOPUnknown is the HDOP some receivers put in GGA when they don't
+// know it yet, instead of leaving the field blank. Seen live on aaeon's
+// SIM8202G (2026-11-24): "500.0" alongside a valid RMC fix, which went
+// into InfluxDB as a real hdop. HDOP that high is never a real reading,
+// so it's treated as missing (NaN), like a blank field.
+const ggaHDOPUnknown = 500.0
+
 func parseNMEAGGA(line string) (Fix, bool) {
 	line = strings.TrimSpace(line)
 	if idx := strings.IndexByte(line, '*'); idx >= 0 {
@@ -221,7 +228,7 @@ func parseNMEAGGA(line string) (Fix, bool) {
 	// on every live capture seen so far, leaving the zero value/NaN).
 	numSats, _ := strconv.Atoi(fields[7])
 	hdop, err := strconv.ParseFloat(fields[8], 64)
-	if err != nil {
+	if err != nil || hdop >= ggaHDOPUnknown {
 		hdop = math.NaN()
 	}
 
