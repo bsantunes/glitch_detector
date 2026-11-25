@@ -70,19 +70,30 @@ type Result struct {
 // TWAMP-Test reflector listening directly on that UDP port — there's
 // no TWAMP-Control session setup here, matching how this project's
 // reflector is actually run (`twampy reflector`, a fixed UDP port).
-func Measure(ctx context.Context, reflectorAddr string, count int, probeInterval, timeout time.Duration) (Result, error) {
+//
+// bindDev, if non-empty, pins the probe socket to that network
+// interface (SO_BINDTODEVICE, like `iperf3 --bind-dev`), so probes
+// leave through it whatever the routing table prefers. On the WaveOS
+// boards the route to wservices goes over the wired link (WireGuard's
+// route_allowed_ips), so -bind-dev lte1 plus wservices' public address
+// is what makes TWAMP measure the cellular path. Empty = normal routing.
+func Measure(ctx context.Context, reflectorAddr, bindDev string, count int, probeInterval, timeout time.Duration) (Result, error) {
 	if count <= 0 {
 		return Result{}, fmt.Errorf("count must be positive, got %d", count)
 	}
 
-	raddr, err := net.ResolveUDPAddr("udp", reflectorAddr)
-	if err != nil {
-		return Result{}, fmt.Errorf("resolve %s: %w", reflectorAddr, err)
+	d := net.Dialer{}
+	if bindDev != "" {
+		d.Control = bindToDeviceControl(bindDev)
 	}
-	conn, err := net.DialUDP("udp", nil, raddr)
+	c, err := d.DialContext(ctx, "udp", reflectorAddr)
 	if err != nil {
+		if bindDev != "" {
+			return Result{}, fmt.Errorf("dial %s (bind-dev %s): %w", reflectorAddr, bindDev, err)
+		}
 		return Result{}, fmt.Errorf("dial %s: %w", reflectorAddr, err)
 	}
+	conn := c.(*net.UDPConn)
 	defer conn.Close()
 
 	// Force any blocked Read to return promptly if the caller cancels.

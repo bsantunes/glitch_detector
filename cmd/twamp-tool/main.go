@@ -21,6 +21,7 @@ import (
 
 func main() {
 	reflector := flag.String("reflector", "10.30.30.1:862", "TWAMP-Test reflector address (UDP host:port) — must already be listening directly, no TWAMP-Control handshake")
+	bindDev := flag.String("bind-dev", "", "send probes only through this interface (SO_BINDTODEVICE, like iperf3 --bind-dev), e.g. lte1; empty = normal routing")
 	interval := flag.Duration("interval", 5*time.Second, "how often to run a probe burst")
 	count := flag.Int("count", 5, "packets per burst")
 	probeInterval := flag.Duration("probe-interval", 100*time.Millisecond, "spacing between packets within a burst")
@@ -47,7 +48,7 @@ func main() {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			result, err := twamp.Measure(ctx, *reflector, *count, *probeInterval, *timeout)
+			result, err := twamp.Measure(ctx, *reflector, *bindDev, *count, *probeInterval, *timeout)
 			if err != nil {
 				log.Printf("probe failed: %v", err)
 				continue

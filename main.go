@@ -190,7 +190,7 @@ func runActiveMonitoring(ctx context.Context, reflector string, modems []modem.M
 			return
 		case <-ticker.C:
 			// Sensor 1: TWAMP Metrics
-			twampResult, err := twamp.Measure(ctx, reflector, 5, 100*time.Millisecond, 2*time.Second)
+			twampResult, err := twamp.Measure(ctx, reflector, "", 5, 100*time.Millisecond, 2*time.Second)
 			if err != nil {
 				log.Printf("twamp: measure against %s failed: %v", reflector, err)
 				twampResult = twamp.Result{LossPct: 100}

@@ -1,8 +1,13 @@
 package twamp
 
 import (
+	"context"
 	"encoding/binary"
+	"errors"
 	"math"
+	"net"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -137,5 +142,79 @@ func TestSummarize(t *testing.T) {
 				t.Errorf("summarize(%d, %v) = %+v, want %+v", tc.sent, tc.rtts, got, tc.want)
 			}
 		})
+	}
+}
+
+// startFakeReflector runs a minimal TWAMP-Light reflector on 127.0.0.1:
+// for each sender packet it echoes the sender's sequence and timestamp
+// (T1) back in a reflected packet, with T2/T3 = now. Returns its address.
+func startFakeReflector(t *testing.T) string {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, addr, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if n < senderPacketLen {
+				continue
+			}
+			now := time.Now()
+			out := make([]byte, reflectedHeaderLen)
+			binary.BigEndian.PutUint64(out[4:12], ntpTimestamp(now))
+			binary.BigEndian.PutUint16(out[12:14], 0x0001)
+			binary.BigEndian.PutUint64(out[16:24], ntpTimestamp(now))
+			copy(out[24:28], buf[0:4])  // sender sequence
+			copy(out[28:36], buf[4:12]) // sender timestamp (T1)
+			pc.WriteTo(out, addr)
+		}
+	}()
+	return pc.LocalAddr().String()
+}
+
+func TestMeasure_LoopbackReflector(t *testing.T) {
+	addr := startFakeReflector(t)
+	res, err := Measure(context.Background(), addr, "", 3, 10*time.Millisecond, 500*time.Millisecond)
+	if err != nil {
+		t.Fatalf("Measure: %v", err)
+	}
+	if res.Sent != 3 || res.Received != 3 || res.LossPct != 0 {
+		t.Errorf("result = %+v, want 3/3 received, 0%% loss", res)
+	}
+}
+
+func TestMeasure_BindDevLoopback(t *testing.T) {
+	// Pinned to "lo", probes to a 127.0.0.1 reflector must still get
+	// through: the bind-dev path must not break a working route.
+	addr := startFakeReflector(t)
+	res, err := Measure(context.Background(), addr, "lo", 3, 10*time.Millisecond, 500*time.Millisecond)
+	if err != nil {
+		if errors.Is(err, syscall.EPERM) {
+			t.Skipf("SO_BINDTODEVICE needs CAP_NET_RAW on this kernel: %v", err)
+		}
+		t.Fatalf("Measure with bind-dev lo: %v", err)
+	}
+	if res.Received != 3 {
+		t.Errorf("result = %+v, want 3/3 received", res)
+	}
+}
+
+func TestMeasure_BindDevUnknownInterface(t *testing.T) {
+	// A missing interface must fail the dial with a clear error, not
+	// silently fall back to normal routing (which would measure the
+	// wrong path without anyone noticing).
+	addr := startFakeReflector(t)
+	_, err := Measure(context.Background(), addr, "nosuchdev0", 1, 10*time.Millisecond, 100*time.Millisecond)
+	if err == nil {
+		t.Fatalf("Measure with bind-dev nosuchdev0 = nil error, want a failure")
+	}
+	if !strings.Contains(err.Error(), "nosuchdev0") {
+		t.Errorf("error %q should name the interface", err)
 	}
 }

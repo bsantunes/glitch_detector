@@ -23,7 +23,14 @@ ENV_FILE=/opt/dawn/modem-exporter.env
 # uncomment and edit:
 # DEVICE_ID=dawn6g
 DEVICE_ID=
-REFLECTOR=10.30.30.1:862
+# TWAMP must measure the cellular path. On these boards the route to
+# wservices (and so the WireGuard tunnel to 10.30.30.1) goes over the
+# wired link, so probe wservices' public address pinned to the modem's
+# data interface instead (-bind-dev = SO_BINDTODEVICE). BIND_DEV is the
+# interface of the modem that carries traffic (lte1 = Quectel on
+# dawn6g/6global); leave it empty for normal routing.
+REFLECTOR=51.91.57.3:862
+BIND_DEV=lte1
 INFLUX_URL=https://wservices.wavesys.pt:8086
 INFLUX_ORG=wavecom
 INFLUX_BUCKET=network
@@ -39,6 +46,7 @@ start_service() {
 		-influx-url "$INFLUX_URL" \
 		-influx-org "$INFLUX_ORG" \
 		-influx-bucket "$INFLUX_BUCKET"
+	[ -n "$BIND_DEV" ] && procd_append_param command -bind-dev "$BIND_DEV"
 	[ -n "$DEVICE_ID" ] && procd_append_param command -device-id "$DEVICE_ID"
 	procd_set_param env INFLUX_TOKEN="$INFLUX_TOKEN"
 	procd_set_param respawn ${respawn_threshold:-3600} ${respawn_timeout:-5} ${respawn_retry:-5}

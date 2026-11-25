@@ -11,8 +11,9 @@
 // a schema for it):
 //
 //   - measurement "twamp", one point per probe burst.
-//     Tags: device, reflector. Fields: rtt_ms, jitter_ms, loss_pct
-//     (all float), sent, received (ints).
+//     Tags: device, reflector, plus iface when -bind-dev is set (the
+//     interface the probes were pinned to). Fields: rtt_ms, jitter_ms,
+//     loss_pct (all float), sent, received (ints).
 package main
 
 import (
@@ -33,7 +34,8 @@ import (
 )
 
 func main() {
-	reflector := flag.String("reflector", "10.30.30.1:862", "TWAMP-Test reflector address (UDP host:port)")
+	reflector := flag.String("reflector", "10.30.30.1:862", "TWAMP-Test reflector address (UDP host:port); use wservices' public 51.91.57.3:862 with -bind-dev")
+	bindDev := flag.String("bind-dev", "", "send probes only through this interface (SO_BINDTODEVICE, like iperf3 --bind-dev), e.g. lte1; empty = normal routing")
 	interval := flag.Duration("interval", 30*time.Second, "how often to probe and push to InfluxDB")
 	count := flag.Int("count", 5, "packets per burst")
 	probeInterval := flag.Duration("probe-interval", 100*time.Millisecond, "spacing between packets within a burst")
@@ -78,8 +80,12 @@ func main() {
 	log.Printf("twamp-exporter %s", version.Version)
 	writeAgentInfo(ctx, writeAPI, *deviceID, "twamp-exporter")
 
-	log.Printf("exporting TWAMP metrics for %s to %s (org=%s bucket=%s device=%s) every %s",
-		*reflector, *influxURL, *influxOrg, *influxBucket, *deviceID, *interval)
+	via := "normal routing"
+	if *bindDev != "" {
+		via = "bind-dev " + *bindDev
+	}
+	log.Printf("exporting TWAMP metrics for %s (%s) to %s (org=%s bucket=%s device=%s) every %s",
+		*reflector, via, *influxURL, *influxOrg, *influxBucket, *deviceID, *interval)
 
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
@@ -93,14 +99,13 @@ func main() {
 		case <-agentInfoTicker.C:
 			writeAgentInfo(ctx, writeAPI, *deviceID, "twamp-exporter")
 		case <-ticker.C:
-			result, err := twamp.Measure(ctx, *reflector, *count, *probeInterval, *timeout)
+			result, err := twamp.Measure(ctx, *reflector, *bindDev, *count, *probeInterval, *timeout)
 			if err != nil {
 				log.Printf("probe against %s failed: %v", *reflector, err)
 				continue
 			}
 
-			point := influxdb2.NewPoint("twamp",
-				map[string]string{"device": *deviceID, "reflector": *reflector},
+			point := influxdb2.NewPoint("twamp", twampTags(*deviceID, *reflector, *bindDev),
 				map[string]interface{}{
 					"rtt_ms":    result.AvgRTT,
 					"jitter_ms": result.Jitter,
@@ -117,6 +122,17 @@ func main() {
 			}
 		}
 	}
+}
+
+// twampTags builds a twamp point's tags. iface is only added when the
+// probes were pinned to an interface (-bind-dev), so points from an
+// unbound exporter keep exactly the tag set they always had.
+func twampTags(deviceID, reflector, bindDev string) map[string]string {
+	tags := map[string]string{"device": deviceID, "reflector": reflector}
+	if bindDev != "" {
+		tags["iface"] = bindDev
+	}
+	return tags
 }
 
 // writeAgentInfo pushes one "agent_info" point — tags device, component;
