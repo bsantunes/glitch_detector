@@ -131,15 +131,16 @@ section — these are inherent to the design, not bugs):
 - On `aaeon`, `glitch-exporter`'s own InfluxDB write traffic goes out over
   the same `wwan0` interface it monitors, so it's counted in its own stats.
 
-No Grafana panel for this yet — same open "TODO 2"-style gap as the
-`radio`/`twamp` dashboards below, not yet captured as repo-tracked JSON.
+Panels: `glitch_summary`/`glitch_event` are on both provisioned dashboards
+(`dawn6g-metrics/grafana/dashboards/`, see "Grafana dashboards" below).
 
 ## `location` bucket: `gps_fix`
 
 Written by `cmd/gps-exporter` (the `gps/` package's InfluxDB exporter — see
 `CLAUDE.md`'s `gps/` package section for the detection/backend logic this
-schema reports on). Deployed and running on `6global`/`dawn6g`/`aaeon`, all
-via the AT-over-serial backend.
+schema reports on). Running on `dawn6g`/`6global` via the AT-over-serial
+backend (`aaeon` wrote NMEA-sourced points until it became build-only on
+2026-11-25).
 
 **`gps_fix`** — one point per poll interval (default 30s), **only written
 when the fix is actually valid** — unlike `radio_cell`/`twamp`, there is no
@@ -154,7 +155,7 @@ with meaningless zeros.
 | `altitude` | float | meters | — |
 | `speed_knots` | float | knots | Additive, NMEA-reader-only (see below) — NaN-omitted. |
 | `course_deg` | float | degrees | Additive, NMEA-reader-only — NaN-omitted. |
-| `hdop` | float | — | Additive, NMEA-reader-only — NaN-omitted. **Caveat:** a GGA HDOP of `500` (the receiver's "unknown") is currently written as a real value (seen on `aaeon`'s first NMEA point, 2026-11-24); from `v2.3.3` it will be omitted instead. Until then, ignore `hdop >= 500` in queries/panels. |
+| `hdop` | float | — | Additive, NMEA-reader-only — NaN-omitted. A GGA HDOP of `500` (the receiver's "unknown") is omitted since `v2.3.3`; **data caveat:** `aaeon`'s first NMEA point (2026-11-24, `v2.3.2`) has `hdop=500` — ignore `hdop >= 500` in queries over older data. |
 | `satellites` | int | count | Additive, NMEA-reader-only. |
 
 Tags: `device`, `modem_id`, `method` (`"ModemManager"` or `"AT"` — raw QMI
@@ -198,11 +199,25 @@ No Grafana panel for this yet either.
 - **TODO 1:** migrate the Go agent writer to the target schema above
   (`device_id`→`device`, `technology` field→`rat` tag, add `role`, `plmn`/`tac`→tags,
   status strings→`modem_state`). Old `modem_telemetry` data just ages out.
-- **TODO 2:** provisioned Grafana dashboard JSON in `grafana/provisioning/dashboards/`
-  (device variable from `schema.tagValues(bucket:"radio", tag:"device")`, refresh on time range change;
-  RSRP/RSRQ/SINR time series with `aggregateWindow(every: v.windowPeriod, fn: mean)`, display name
-  `${__field.labels.device} ${__field.labels.rat}/${__field.labels.role}`; Stat panel with `last()`;
-  State timeline for `modem_state`; later: annotations from `events`).
+- **TODO 2 — done (2026-11-26):** dashboards are provisioned from repo JSON — see "Grafana
+  dashboards" below. Still open from the original idea: annotations from `events`.
+
+## Grafana dashboards (provisioned)
+
+- `dawn6g-metrics/grafana/dashboards/*.json`, bind-mounted read-only at `/etc/grafana/dashboards`
+  and loaded by `grafana/provisioning/dashboards/dawn6g.yaml` into the **DAWN6G** folder
+  (re-read every 30 s; `allowUiUpdates: false`, `disableDeletion: true`). All queries use the
+  `influxdb-flux` datasource UID.
+- **`gateway-health.json`** (`uid: dawn6g-gateway-health`): `glitch_summary` drop counters
+  (should be 0), `modem_state.stale_signal_fields` (should be 0; absent when 0), `agent_info`
+  versions per device/component against the **`expected_version`** textbox variable (status `OK` /
+  `MISMATCH` / `NOT REPORTING` after 65 min without a point), and the `radio_cell` detection method
+  over time. **`expected_version` is bumped to the new tag at each release.**
+- **`radio-network.json`** (`uid: 990a32ca-18bf-4bcd-8f97-0d137fcc5c29-v2`): radio KPIs per
+  leg, TWAMP RTT/jitter/loss **filtered to `exists r.iface`** (cellular path only — older wired-path
+  points are deliberately hidden), glitch stalls/retransmissions/events, latest modem state and
+  serving cell, and a GPS map joined with anchor RSRP/SINR.
+- `device` variable (both): devices with a `radio_cell` `rsrp` point in the last 2 days.
 
 ## Verifying writes on the server
 

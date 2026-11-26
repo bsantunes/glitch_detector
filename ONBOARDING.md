@@ -29,7 +29,11 @@
   - **Test 2** (`test2_loss.sh`): retransmission detection on a live iperf3 flow under 2% netem loss (counts are compared against iperf3's own Retr). Needs `tc`, so not on WaveOS.
   - **Test 3** (`test3_outage.sh`): a netem-induced outage gives exactly one stall longer than the outage. Valid for `-capture ebpf` only.
   - **Test 3b** (`test3b_*.sh`): a real server-side outage on `wservices` (restricted SSH key), valid for both capture paths; `test3b_simultaneous.sh` compares eBPF and AF_PACKET, `test3b_exporter_load.sh` loads the exporter itself. On WaveOS (no `sudo`/`python3`) it's run against the production `glitch-exporter` and scored from `glitch_summary` (`DEPLOYMENT.md` gotchas).
-- **Grafana** runs on `wservices` (behind Apache). Its dashboard (radio metrics plus a TWAMP panel) was built in Grafana's UI and isn't in the repo yet. Health signals to watch: `glitch_summary`'s `kernel_dropped_events`/`user_dropped_events`/`write_queue_dropped_events`, `modem_state.stale_signal_fields`, and `agent_info` (which version each exporter runs).
+- **Grafana** runs on `wservices` (behind Apache). Its two dashboards, in the **DAWN6G** folder, are provisioned from the repo (`dawn6g-metrics/grafana/dashboards/`):
+  - **DAWN6G gateway health** (`gateway-health.json`): glitch drop counters and `stale_signal_fields` (both should be 0), each exporter's version per board against `expected_version` (`OK` / `MISMATCH` / `NOT REPORTING`), and the modem detection method over time.
+  - **Radio & Network Data v2** (`radio-network.json`): radio KPIs, cellular-path TWAMP, glitch stalls and events, modem state, GPS map.
+  - They can't be saved from the UI (`allowUiUpdates: false`): to change one, export the JSON, commit it and copy it to wservices; Grafana reloads it within 30 s (`DEPLOYMENT.md` step 5).
+  - **At each release, bump `expected_version` in `gateway-health.json` to the new tag**, or the versions table shows every exporter as `MISMATCH`.
 - **`metrics-endpoint.md` is the authoritative InfluxDB schema.** Ignore the `.docx` tutorial and `dawn6g-metrics/README.md`.
 - **Dependencies are pinned.** Don't let a build change `go.mod`/`go.sum`; update deliberately with `go get <module>@<version>`.
 - **Ask Claude to show a change before committing** when you want to review it first ("first show me the diff").

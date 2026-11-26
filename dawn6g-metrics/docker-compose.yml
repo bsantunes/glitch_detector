@@ -60,6 +60,7 @@ services:
     volumes:
       - grafana-data:/var/lib/grafana
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro   # provisioned dashboards (provisioning/dashboards/dawn6g.yaml)
     networks: [metrics]
 
 networks:

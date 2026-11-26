@@ -289,24 +289,59 @@ service logs first (step 3A/3B) before suspecting the server side; the token
 itself being wrong/revoked is the single most common cause of total silence
 (look for `unauthorized`/`403` in the exporter's log output).
 
-## 5. Grafana — no manual "add device" step needed
+## 5. Grafana — dashboards are provisioned; no "add device" step
 
-The dashboard's `device` variable is query-driven
-(`tagValues(bucket: "...", tag: "device")`), so **a new device appears in the
-dropdown automatically** the first time it writes at least one point to the
-relevant bucket — nothing to configure in Grafana itself. Just:
+**Dashboards come from the repo, not Grafana's UI.** Both live in
+`dawn6g-metrics/grafana/dashboards/` — `gateway-health.json` (drops,
+stale signal fields, exporter versions vs. `expected_version`, detection
+method) and `radio-network.json` (radio KPIs, cellular-path TWAMP, glitch
+stalls/events, modem state, GPS map). `grafana/provisioning/dashboards/dawn6g.yaml`
+loads every `*.json` in that folder (bind-mounted read-only at
+`/etc/grafana/dashboards` by `docker-compose.yml`) into the **DAWN6G**
+folder, and re-reads it every 30 s. Both use the `influxdb-flux` datasource UID
+from `grafana/provisioning/datasources/influxdb.yaml`.
 
-1. Wait for step 4 to show data (or refresh the dashboard — the `device`
-   variable re-queries on dashboard load/time-range change).
-2. Open the device dropdown and select the new device (or "All", if the
-   variable has that option enabled) — it'll be listed alongside
-   `aaeon`/`6global`/`dawn6g`.
+`allowUiUpdates: false`: the JSON in the repo is the source of truth, so a
+provisioned dashboard **can't be saved from the UI** (Grafana says "Cannot save
+provisioned dashboard"). A UI save would otherwise live only in Grafana's DB,
+be overwritten by the next change to the file, and drift from the repo.
+`disableDeletion: true` keeps them from being deleted in the UI.
+
+**To change a dashboard:**
+
+1. Edit it in the UI (changes stay in your browser session), then
+   **Share → Export → Save to file** with "Export for sharing externally"
+   **off** (keeps the `influxdb-flux` datasource UID instead of `${DS_...}`
+   placeholders). Or edit the JSON directly.
+2. Keep `"uid"` unchanged (it's the dashboard's identity; a new uid creates a
+   second dashboard) and `"id": null`. Replace the file in
+   `dawn6g-metrics/grafana/dashboards/`, check it parses
+   (`python3 -m json.tool <file> >/dev/null`), commit and push.
+3. Copy it to wservices; Grafana picks it up within 30 s, no restart:
+
+   ```bash
+   scp dawn6g-metrics/grafana/dashboards/<name>.json wservices:dawn6g-metrics/grafana/dashboards/
+   ```
+
+**At each release:** set `expected_version` in `gateway-health.json`
+(`templating.list[]` entry `expected_version`: its `query`, `current.text` and
+`current.value`) to the new tag, commit it with the release, and copy it to
+wservices once the boards run that tag. The versions table then shows `OK`,
+`MISMATCH` (wrong version) or `NOT REPORTING` (no `agent_info` for 65 min) per
+device and exporter. Changing the textbox in the UI only lasts for that
+browser session.
+
+**New devices need nothing in Grafana.** The `device` variable lists devices
+with a `radio_cell` `rsrp` point in the last 2 days, so a new board shows up
+in the dropdown once its `modem-exporter` writes (step 4). `radio-network`'s
+GPS map has one query per board (`dawn6g`, `6global`): add a query there for a
+third board.
 
 No datasource change is needed either: the `influxdb-flux` datasource's
-`grafana-read` token already has read access to all three buckets
-(`radio`/`network`/`events`), so a brand-new device's data in any of them is
-immediately queryable — this was confirmed directly against `influx auth
-list` while debugging a separate "no data" issue, not assumed.
+`grafana-read` token already has read access to all the buckets, so a
+brand-new device's data is immediately queryable — this was confirmed
+directly against `influx auth list` while debugging a separate "no data"
+issue, not assumed.
 
 ## 6. Gotchas checklist
 

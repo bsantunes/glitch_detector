@@ -1,0 +1,25 @@
+# Dashboard provisioning: Grafana loads every *.json in
+# /etc/grafana/dashboards (bind-mounted read-only from ./grafana/dashboards,
+# see docker-compose.yml) into the "DAWN6G" folder, and re-reads the folder
+# every updateIntervalSeconds, so a changed JSON shows up without a restart.
+#
+# allowUiUpdates: false — the JSON files in the repo are the source of
+# truth. Grafana refuses to save a provisioned dashboard from the UI
+# ("Cannot save provisioned dashboard"); change it in the UI, export the JSON
+# (Share > Export, "Export for sharing externally" off), commit it, copy it to
+# wservices. With true, UI saves would go into Grafana's DB only, be silently
+# overwritten by the next change to the file, and drift from the repo — the
+# exact gap this provisioning closes. Ad-hoc experiments: "Save as" a copy
+# outside the DAWN6G folder.
+apiVersion: 1
+providers:
+  - name: dawn6g
+    orgId: 1
+    folder: DAWN6G
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    updateIntervalSeconds: 30
+    options:
+      path: /etc/grafana/dashboards
+      foldersFromFilesStructure: false

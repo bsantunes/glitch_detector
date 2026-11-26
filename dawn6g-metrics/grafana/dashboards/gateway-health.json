@@ -1,0 +1,699 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {
+          "type": "grafana",
+          "uid": "-- Grafana --"
+        },
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      },
+      {
+        "datasource": {
+          "type": "influxdb",
+          "uid": "influxdb-flux"
+        },
+        "enable": true,
+        "hide": false,
+        "iconColor": "purple",
+        "mappings": {
+          "text": {
+            "source": "field",
+            "value": "text"
+          },
+          "time": {
+            "source": "field",
+            "value": "_time"
+          }
+        },
+        "name": "Exporter restarts (approx.)",
+        "target": {
+          "query": "from(bucket: \"network\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"agent_info\" and r.component == \"glitch-exporter\" and r._field == \"version\" and r.device =~ /^${device:regex}$/)\n  |> group(columns: [\"device\"])\n  |> sort(columns: [\"_time\"])\n  |> elapsed(unit: 1m)\n  |> filter(fn: (r) => r.elapsed < 58)\n  |> map(fn: (r) => ({_time: r._time, text: r.device + \": exporter (re)start, \" + r._value}))",
+          "refId": "Anno"
+        }
+      }
+    ]
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "id": 1,
+      "panels": [],
+      "title": "Glitch detector: drops (should be 0)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influxdb-flux"
+      },
+      "description": "Sum of each glitch_summary drop counter over the time range. Any non-zero value means events or points were lost. dropped_events is eBPF-only; kernel/user/untruncated are AF_PACKET-only; write_queue applies to both.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "displayName": "${__field.labels.device} · ${__field.labels._field}",
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 17,
+        "w": 9,
+        "x": 0,
+        "y": 1
+      },
+      "id": 2,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb-flux"
+          },
+          "query": "from(bucket: \"network\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"glitch_summary\" and r.device =~ /^${device:regex}$/)\n  |> filter(fn: (r) => r._field == \"kernel_dropped_events\" or r._field == \"user_dropped_events\" or r._field == \"write_queue_dropped_events\" or r._field == \"untruncated_over_limit_events\" or r._field == \"dropped_events\")\n  |> map(fn: (r) => ({r with _value: float(v: r._value)}))\n  |> group(columns: [\"device\", \"_field\"])\n  |> sum()",
+          "refId": "A"
+        }
+      ],
+      "title": "Drops in selected range",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influxdb-flux"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "displayName": "${__field.labels.device} · ${__field.labels._field}",
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 17,
+        "w": 15,
+        "x": 9,
+        "y": 1
+      },
+      "id": 3,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb-flux"
+          },
+          "query": "from(bucket: \"network\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"glitch_summary\" and r.device =~ /^${device:regex}$/)\n  |> filter(fn: (r) => r._field == \"kernel_dropped_events\" or r._field == \"user_dropped_events\" or r._field == \"write_queue_dropped_events\" or r._field == \"untruncated_over_limit_events\" or r._field == \"dropped_events\")\n  |> map(fn: (r) => ({r with _value: float(v: r._value)}))\n  |> group(columns: [\"device\", \"_field\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)",
+          "refId": "A"
+        }
+      ],
+      "title": "Drops over time",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 18
+      },
+      "id": 4,
+      "panels": [],
+      "title": "Modem data freshness (should be 0)",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influxdb-flux"
+      },
+      "description": "Sum of modem_state.stale_signal_fields: signal fields withheld because the source was stale (ubus timestamp not advancing, or a value unchanged for 30 min). The field is omitted when 0, so 'no data' here means healthy.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "thresholds"
+          },
+          "decimals": 0,
+          "displayName": "${__field.labels.device} · ${__field.labels.modem_id}",
+          "mappings": [],
+          "noValue": "0",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 1
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 9,
+        "x": 0,
+        "y": 19
+      },
+      "id": 5,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "horizontal",
+        "percentChangeColorMode": "standard",
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "showPercentChange": false,
+        "textMode": "value_and_name",
+        "wideLayout": true
+      },
+      "pluginVersion": "12.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb-flux"
+          },
+          "query": "from(bucket: \"radio\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"modem_state\" and r.device =~ /^${device:regex}$/ and r._field == \"stale_signal_fields\")\n  |> map(fn: (r) => ({r with _value: float(v: r._value)}))\n  |> group(columns: [\"device\", \"modem_id\"])\n  |> sum()",
+          "refId": "A"
+        }
+      ],
+      "title": "Withheld stale signal fields in range",
+      "type": "stat"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influxdb-flux"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "bars",
+            "fillOpacity": 80,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "auto",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "decimals": 0,
+          "displayName": "${__field.labels.device} · ${__field.labels.modem_id}",
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 6,
+        "w": 15,
+        "x": 9,
+        "y": 19
+      },
+      "id": 6,
+      "options": {
+        "legend": {
+          "calcs": [],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "12.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb-flux"
+          },
+          "query": "from(bucket: \"radio\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"modem_state\" and r.device =~ /^${device:regex}$/ and r._field == \"stale_signal_fields\")\n  |> map(fn: (r) => ({r with _value: float(v: r._value)}))\n  |> group(columns: [\"device\", \"modem_id\"])\n  |> aggregateWindow(every: v.windowPeriod, fn: sum, createEmpty: false)",
+          "refId": "A"
+        }
+      ],
+      "title": "Stale signal fields over time",
+      "type": "timeseries"
+    },
+    {
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "id": 7,
+      "panels": [],
+      "title": "Versions and detection method",
+      "type": "row"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influxdb-flux"
+      },
+      "description": "Latest agent_info per device and component over the last 7 days (independent of the time picker). Exporters write it at startup and hourly, so age above 65 min means NOT REPORTING. A component missing from the table has not reported in 7 days. Expected version is set by the dashboard variable.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "cellOptions": {
+              "type": "auto"
+            },
+            "inspect": false
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "status"
+            },
+            "properties": [
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-background"
+                }
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "options": {
+                      "MISMATCH": {
+                        "color": "orange",
+                        "index": 1
+                      },
+                      "NOT REPORTING": {
+                        "color": "red",
+                        "index": 2
+                      },
+                      "OK": {
+                        "color": "green",
+                        "index": 0
+                      }
+                    },
+                    "type": "value"
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "age_min"
+            },
+            "properties": [
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "unit",
+                "value": "m"
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 26
+      },
+      "id": 8,
+      "options": {
+        "cellHeight": "sm",
+        "footer": {
+          "countRows": false,
+          "fields": "",
+          "reducer": [
+            "sum"
+          ],
+          "show": false
+        },
+        "showHeader": true
+      },
+      "pluginVersion": "12.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb-flux"
+          },
+          "hide": true,
+          "query": "latest = (b) => from(bucket: b)\n  |> range(start: -7d)\n  |> filter(fn: (r) => r._measurement == \"agent_info\" and r._field == \"version\" and r.device =~ /^${device:regex}$/)\n  |> last()\n\nunion(tables: [latest(b: \"radio\"), latest(b: \"network\"), latest(b: \"location\")])\n  |> group()\n  |> map(fn: (r) => ({r with age_min: float(v: int(v: now()) - int(v: r._time)) / 60000000000.0}))\n  |> map(fn: (r) => ({\n       device: r.device,\n       component: r.component,\n       version: r._value,\n       last_report: r._time,\n       age_min: r.age_min,\n       status: if r.age_min > 65.0 then \"NOT REPORTING\"\n               else if r._value == \"${expected_version}\" then \"OK\"\n               else \"MISMATCH\"\n     }))\n  |> sort(columns: [\"device\", \"component\"])",
+          "refId": "A"
+        }
+      ],
+      "title": "Exporter versions (agent_info, latest per component)",
+      "type": "table"
+    },
+    {
+      "datasource": {
+        "type": "influxdb",
+        "uid": "influxdb-flux"
+      },
+      "description": "Method tag of radio_cell over time. Expected on WaveOS: ubus. A switch to QMI without an exporter restart (dashed annotations) suggests the vendor uqmi-ubus data went stale. One row per device; if a device ever reports two modems, their methods share the row.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "fixedColor": "grey",
+            "mode": "fixed"
+          },
+          "custom": {
+            "axisPlacement": "auto",
+            "fillOpacity": 70,
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineWidth": 0,
+            "spanNulls": false
+          },
+          "displayName": "${__field.labels.series}",
+          "mappings": [
+            {
+              "options": {
+                "AT": {
+                  "color": "purple",
+                  "index": 4
+                },
+                "ModemManager": {
+                  "color": "blue",
+                  "index": 3
+                },
+                "QMI": {
+                  "color": "orange",
+                  "index": 1
+                },
+                "ubus": {
+                  "color": "green",
+                  "index": 0
+                },
+                "uqmi": {
+                  "color": "red",
+                  "index": 2
+                }
+              },
+              "type": "value"
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green"
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 24,
+        "x": 0,
+        "y": 34
+      },
+      "id": 9,
+      "options": {
+        "alignValue": "left",
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "mergeValues": true,
+        "rowHeight": 0.8,
+        "showValue": "auto",
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "single",
+          "sort": "none"
+        }
+      },
+      "pluginVersion": "12.0.0",
+      "targets": [
+        {
+          "datasource": {
+            "type": "influxdb",
+            "uid": "influxdb-flux"
+          },
+          "query": "from(bucket: \"radio\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"radio_cell\" and r.device =~ /^${device:regex}$/ and r.role == \"anchor\" and r._field == \"rsrp\")\n  |> aggregateWindow(every: v.windowPeriod, fn: last, createEmpty: false)\n  |> map(fn: (r) => ({_time: r._time, _value: r.method, series: r.device}))\n  |> group(columns: [\"series\"])\n  |> sort(columns: [\"_time\"])",
+          "refId": "A"
+        }
+      ],
+      "title": "radio_cell detection method (anchor leg)",
+      "type": "state-timeline"
+    }
+  ],
+  "preload": false,
+  "refresh": "1m",
+  "schemaVersion": 41,
+  "tags": [
+    "dawn6g",
+    "health"
+  ],
+  "templating": {
+    "list": [
+      {
+        "current": {
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "datasource": {
+          "type": "influxdb",
+          "uid": "influxdb-flux"
+        },
+        "definition": "from(bucket: \"radio\")\n  |> range(start: -2d)\n  |> filter(fn: (r) => r._measurement == \"radio_cell\" and r._field == \"rsrp\")\n  |> keep(columns: [\"device\"])\n  |> group()\n  |> distinct(column: \"device\")",
+        "includeAll": true,
+        "label": "Device",
+        "multi": true,
+        "name": "device",
+        "options": [],
+        "query": "from(bucket: \"radio\")\n  |> range(start: -2d)\n  |> filter(fn: (r) => r._measurement == \"radio_cell\" and r._field == \"rsrp\")\n  |> keep(columns: [\"device\"])\n  |> group()\n  |> distinct(column: \"device\")",
+        "refresh": 1,
+        "sort": 1,
+        "type": "query"
+      },
+      {
+        "current": {
+          "text": "v2.3.4",
+          "value": "v2.3.4"
+        },
+        "label": "Expected version",
+        "name": "expected_version",
+        "options": [
+          {
+            "selected": true,
+            "text": "v2.3.4",
+            "value": "v2.3.4"
+          }
+        ],
+        "query": "v2.3.4",
+        "type": "textbox"
+      }
+    ]
+  },
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "utc",
+  "title": "DAWN6G gateway health",
+  "uid": "dawn6g-gateway-health",
+  "version": 6
+}
