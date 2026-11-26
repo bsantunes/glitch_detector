@@ -30,7 +30,7 @@
   - **Test 3** (`test3_outage.sh`): a netem-induced outage gives exactly one stall longer than the outage. Valid for `-capture ebpf` only.
   - **Test 3b** (`test3b_*.sh`): a real server-side outage on `wservices` (restricted SSH key), valid for both capture paths; `test3b_simultaneous.sh` compares eBPF and AF_PACKET, `test3b_exporter_load.sh` loads the exporter itself. On WaveOS (no `sudo`/`python3`) it's run against the production `glitch-exporter` and scored from `glitch_summary` (`DEPLOYMENT.md` gotchas).
 - **Grafana** runs on `wservices` (behind Apache). Its two dashboards, in the **DAWN6G** folder, are provisioned from the repo (`dawn6g-metrics/grafana/dashboards/`):
-  - **DAWN6G gateway health** (`gateway-health.json`): glitch drop counters and `stale_signal_fields` (both should be 0), each exporter's version per board against `expected_version` (`OK` / `MISMATCH` / `NOT REPORTING`), and the modem detection method over time.
+  - **DAWN6G gateway health v2** (`gateway-health.json`): glitch drop counters and `stale_signal_fields` (both should be 0), each exporter's version per board against `expected_version` (`OK` / `MISMATCH` / `NOT REPORTING`), and the modem detection method over time.
   - **Radio & Network Data v2** (`radio-network.json`): radio KPIs, cellular-path TWAMP, glitch stalls and events, modem state, GPS map.
   - They can't be saved from the UI (`allowUiUpdates: false`): to change one, export the JSON, commit it and copy it to wservices; Grafana reloads it within 30 s (`DEPLOYMENT.md` step 5).
   - **At each release, bump `expected_version` in `gateway-health.json` to the new tag**, or the versions table shows every exporter as `MISMATCH`.

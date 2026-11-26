@@ -1294,7 +1294,11 @@
   ],
   "preload": false,
   "schemaVersion": 41,
-  "tags": [],
+  "tags": [
+     "network",
+     "current",
+     "radio"
+  ],
   "templating": {
     "list": [
       {

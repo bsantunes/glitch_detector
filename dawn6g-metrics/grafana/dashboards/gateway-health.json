@@ -640,6 +640,7 @@
   "schemaVersion": 41,
   "tags": [
     "dawn6g",
+    "current",
     "health"
   ],
   "templating": {
@@ -693,7 +694,7 @@
   },
   "timepicker": {},
   "timezone": "utc",
-  "title": "DAWN6G gateway health",
+  "title": "DAWN6G gateway health v2",
   "uid": "dawn6g-gateway-health",
   "version": 6
 }
