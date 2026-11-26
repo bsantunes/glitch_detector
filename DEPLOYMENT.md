@@ -174,7 +174,9 @@ scp -P <port> openwrt/gps-exporter.init    root@<waveos-ip>:/etc/init.d/gps-expo
 
 Only the four exporters run as services. Don't enable `modem-tool`/`twamp-tool`
 alongside them (6global had both running from an old install: a second
-modem poller and a second TWAMP sender).
+modem poller and a second TWAMP sender; so did `dawn6g` until 2026-11-26). Their
+`STOP=4` is a single digit, so `/etc/init.d/<x> disable` leaves a stale
+`/etc/rc.d/K4<x>` link behind (rc.common only removes `K??<x>`); delete it by hand.
 
 What the exporters run beyond the defaults (matching `dawn6g`/`6global`):
 
@@ -233,7 +235,8 @@ chmod 600 /opt/dawn/modem-exporter.env
 chmod +x /opt/dawn/modem-tool /opt/dawn/modem-exporter /opt/dawn/twamp-tool /opt/dawn/twamp-exporter /opt/dawn/glitch-exporter /opt/dawn/gps-exporter
 chmod +x /etc/init.d/modem-tool /etc/init.d/modem-exporter /etc/init.d/twamp-tool /etc/init.d/twamp-exporter /etc/init.d/glitch-exporter /etc/init.d/gps-exporter
 
-for svc in modem-tool modem-exporter twamp-tool twamp-exporter glitch-exporter gps-exporter; do
+# only the four exporters run as services; the -tool binaries are for interactive use
+for svc in modem-exporter twamp-exporter glitch-exporter gps-exporter; do
   /etc/init.d/$svc enable
   /etc/init.d/$svc start
 done

@@ -1040,7 +1040,7 @@
         "percentChangeColorMode": "standard",
         "reduceOptions": {
           "calcs": [
-            "lastNotNull"
+            "mean"
           ],
           "fields": "",
           "values": false
@@ -1057,7 +1057,7 @@
           "refId": "A"
         }
       ],
-      "title": "Loss packet",
+      "title": "Packet loss (mean over range)",
       "type": "stat"
     },
     {
